@@ -1,0 +1,88 @@
+# =============================================================================
+# 距离标签补充数据配置
+# =============================================================================
+# 为什么要这个文件：
+#   ACDC 只提供语义分割，没有车辆检测框，也没有距离标注。
+#   而本项目的两个核心输出 ——「前车/来车距离」和「接管边界判断」——
+#   都依赖「目标在哪、有多远」。这部分监督信号必须由外部数据来源补上。
+#
+# 这是一个**已知的域差异（domain gap）风险点**：
+#   训练距离头的图像可能和 ACDC 的恶劣天气场景分布不同。
+#   处理办法写在本文件末尾的 mitigation 段，不要跳过。
+# =============================================================================
+
+base: default.yaml
+
+distance_supplement:
+  # --- 数据来源 ---
+  # 支持多源混合。每个源独立配置，因为它们的标注精度和坐标系都不同。
+  sources:
+
+    - name: kitti
+      enabled: true
+      # KITTI 有精确的 LiDAR 深度与 3D 框，是距离标签质量最好的来源
+      # 但只有白天晴朗场景 —— 这正是域差异的来源
+      root: data/external/kitti
+      license: "CC BY-NC-SA 3.0（仅研究用途）"
+      depth_source: lidar            # lidar | stereo | monocular
+      has_3d_boxes: true
+      label_type: absolute_distance  # 直接给绝对距离，不需要估计
+
+    - name: nuscenes
+      enabled: false                 # 数据量大（~300GB），按需开启
+      root: data/external/nuscenes
+      license: "CC BY-NC-SA 4.0（禁止商业用途）"
+      depth_source: lidar
+      has_3d_boxes: true
+      label_type: absolute_distance
+
+    - name: self_collected
+      enabled: false                 # 自己有行车记录仪数据时开启
+      root: data/external/self
+      depth_source: monocular
+      has_3d_boxes: false
+      label_type: estimated_distance
+      # 自采数据没有真值，只能靠单目深度估计，置信度必须标低
+      confidence: 0.3
+
+  # --- 距离口径（最容易出错的地方，必须写死）---
+  reference_frame:
+    # 距离算到「自车」还是「相机」？两者差一个安装偏移，混用会导致系统性偏差。
+    # 本项目统一用「自车后轴中心到目标框底边中心」。
+    origin: ego_rear_axle
+    target_point: bbox_bottom_center
+    unit: meter
+    # 相机到自车后轴中心的偏移（米），校准后填入
+    camera_to_ego: [0.0, 0.0, 1.5]   # [x, y, z]
+
+  # --- 有效距离范围 ---
+  # 超出范围的标签直接丢弃，而不是让模型去拟合它学不会的部分：
+  # 单目测距在 >80m 的误差会大到失去意义，硬训只会拖累近距精度。
+  valid_range_m: [2.0, 80.0]
+
+  # --- 距离分桶（评测时必须分桶报告，不能只给一个总体 MAE）---
+  buckets_m:
+    near:   [2, 15]
+    medium: [15, 40]
+    far:    [40, 80]
+
+  # --- 无效样本处理（在 datasets/acdc_distance.py 里实现）---
+  invalid_handling:
+    # 没有距离标注的 ACDC 帧：标记 valid=False 并让损失 mask 掉，
+    # **绝对不要填 0** —— 0 会被当成「距离 0 米」，把模型教坏
+    fill_value: null
+    mask_in_loss: true
+    # 检测框截断比例超过这个阈值就判定为无效（框不完整，底边中心算不准）
+    max_truncation_ratio: 0.3
+    # 框高度小于这个像素值判定为无效（太小，测距误差爆炸）
+    min_bbox_height_px: 20
+
+  # --- 缓解域差异的手段（很重要，面试会问「你怎么保证距离在雨天也准」）---
+  mitigation:
+    # 1. 用 ACDC 的真实恶劣天气图像做输入，只用外部数据的距离做监督
+    #    —— 视觉域是 ACDC 的，几何监督是外部的，这是本项目的关键设计
+    use_acdc_images_as_input: true
+    # 2. 训练时对输入施加恶劣天气增强，缩小视觉域差异
+    weather_aug_on_source: true
+    # 3. 报告里必须分天气子集分别给出距离误差，如实呈现跨域退化程度
+    report_per_weather_subset: true

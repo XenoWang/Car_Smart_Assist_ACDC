@@ -1,0 +1,55 @@
+# =============================================================================
+# PyTorch 栈 —— 单独一份，因为国内镜像源会把 torch 换成 CPU 版本
+# =============================================================================
+#
+# 为什么必须单独拆出来：
+#   国内镜像（清华 TUNA / 阿里云等）同步的是 PyPI 官方源，而 PyPI 上的 torch
+#   是 **CPU-only** 构建。用镜像装 torch 不会报错，但装完 torch.cuda.is_available()
+#   会返回 False，而且因为版本号看起来一样（2.8.0），排查起来很费时间。
+#   所以下面用 --index-url 把索引指向 PyTorch 官方 CUDA 索引，这份文件不要加 -i 参数。
+#
+# 本机环境（已核实）：
+#   GPU        NVIDIA GeForce RTX 5070  (Blackwell, compute capability 12.0 / sm_120)
+#   驱动       610.74   (CUDA UMD 13.3)
+#   nvcc       12.9.41
+#   Python     3.12.10
+#   平台       Windows 11
+#
+# 版本选择依据：
+#   torch 2.8.0+cu129 的 arch_list 包含 sm_120，这是 RTX 5070 能跑起来的硬性前提。
+#   已在本机 /e/torch/.venv 中实测通过：device 识别正常、matmul 正常。
+#   torchvision 0.23.0 与 torchaudio 2.8.0 是与 torch 2.8.0 配套的版本，三者必须同装。
+#
+# 安装：
+#     pip install -r requirements/requirements-torch.txt
+#
+# 如果上面这条在解析依赖时报找不到某个包（torch 官方索引对少量传递依赖收录不全），
+# 用下面这条兜底 —— 保留官方索引为主源，镜像只作为补充：
+#     pip install -r requirements/requirements-torch.txt \
+#         --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 装完务必自检：
+#     python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_arch_list())"
+#   期望看到：2.8.0+cu129  True  [... 'sm_120']
+# =============================================================================
+
+--index-url https://download.pytorch.org/whl/cu129
+
+torch==2.8.0+cu129
+torchvision==0.23.0+cu129
+torchaudio==2.8.0+cu129
+
+# -----------------------------------------------------------------------------
+# 关于「复用已有环境」的说明（留档，便于以后回溯决策）：
+#
+#   本机 /e/torch/.venv 和 /e/BERT_Finetune/.venv 中已存在完全相同的
+#   torch 2.8.0+cu129 / torchvision 0.23.0+cu129 / torchaudio 2.8.0+cu129。
+#   也就是说这套版本本身是可复用的，不需要换版本。
+#
+#   但仍建议在本项目的 .venv 里按本文件重装一遍：跨项目共用环境会让
+#   「这个项目到底依赖什么」变得不可查，简历项目里环境隔离是会被问到的点。
+#   是否复用由你决定，两种做法在功能上等价。
+#
+#   如果未来要升级 torch：先确认新版本的 arch_list 里仍有 sm_120，
+#   否则 RTX 5070 会退化到 PTX JIT 编译，首次运行极慢。
+# -----------------------------------------------------------------------------

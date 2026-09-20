@@ -1,0 +1,94 @@
+# =============================================================================
+# Stage 1 训练配置
+# =============================================================================
+# 用法：
+#   python scripts/train_perception.py --config configs/train/perception.yaml
+#   python scripts/train_perception.py --config configs/train/perception.yaml --dry-run
+#   python scripts/train_perception.py --config configs/train/perception.yaml --resume
+# =============================================================================
+
+base: ../default.yaml
+data: ../data/acdc.yaml
+model: ../model/perception_multitask.yaml
+
+train:
+  # --- 轮次与步数 ---
+  epochs: 60
+  # 提前结束：验证指标连续 N 轮不提升就停。ACDC 只有 4006 张图，
+  # 过拟合来得快，早停比调小 epoch 更稳妥。
+  early_stopping:
+    enabled: true
+    monitor: val/handover_macro_f1   # 监控接管边界的 F1，而非总 loss
+    mode: max
+    patience: 10
+    min_delta: 0.001
+
+  # --- 优化器 ---
+  optimizer:
+    name: adamw
+    # 骨干网用较小 lr（已在 ImageNet 上预训练好了），新初始化的头用大 lr。
+    # 这一项设错会让训练要么学不动要么崩掉，是最常踩的坑之一。
+    lr: 6.0e-5                # 头部的学习率
+    backbone_lr_mult: 0.1     # 骨干网 = lr * 0.1
+    weight_decay: 0.01
+    # weight decay 不施加在 norm 层与 bias 上（施加了会拖慢收敛且无正则收益）
+    no_decay_on_norm_and_bias: true
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  # --- 学习率调度 ---
+  scheduler:
+    name: cosine
+    warmup_epochs: 3          # 多任务模型初期梯度方向混乱，warmup 几乎是必需的
+    warmup_start_factor: 0.01
+    min_lr_factor: 0.01       # 最终 lr = lr * 0.01
+
+  # --- 混合精度与显存 ---
+  amp:
+    enabled: true
+    dtype: bfloat16
+  # 显存不够时优先调大梯度累积，而不是减小 batch —— 后者会让 BN 统计失真
+  gradient_accumulation_steps: 2
+  # 梯度检查点：用时间换显存，显存实在不够时打开（会掉速约 30%）
+  gradient_checkpointing: false
+  # 只在 12GB 显存确实撑不住时才逐个尝试：
+  #   batch_size 4 -> 2 -> 1，或 gradient_checkpointing: true
+  # 不要一上来就 batch_size=1，那样训练极不稳定且跑得慢
+
+  # --- 验证 ---
+  validation:
+    # 每多少轮做一次完整验证。验证集本身不大，每轮验证也不算浪费。
+    every_n_epochs: 1
+    # 训练中途只算轻量指标（loss + acc），完整指标（mIoU、分桶 MAE）留给
+    # scripts/evaluate.py，避免拖慢训练
+    full_metrics: false
+
+  # --- 检查点 ---
+  checkpoint:
+    save_dir: artifacts/checkpoints/perception
+    # 保存最好的 N 个（按 early_stopping.monitor 排序）
+    save_top_k: 3
+    save_last: true           # 最近一个，用于 --resume
+    # 监控指标，决定哪个 checkpoint 是 "best"
+    monitor: val/handover_macro_f1
+    mode: max
+
+  # --- 日志 ---
+  log_every_n_steps: 20
+  # 每隔多少轮把预测可视化一次（分割叠加图 + 检测框 + 距离标注）
+  # 别关掉这个 —— 训练中途看一眼预测图，比盯着 loss 曲线有用得多
+  visualize_every_n_epochs: 5
+  visualize_n_samples: 4
+
+  # --- 复现性 ---
+  seed: 42
+  deterministic: false
+
+# =============================================================================
+# 分阶段训练建议（写下来避免"一上来就全量训练然后调不动"）
+# =============================================================================
+# Phase 0  验证通路   epochs=2,  只有分割头     —— 确认数据、显存、日志都正常
+# Phase 1  暖机       epochs=10, 全部头, fixed 权重，lr=1e-4
+# Phase 2  主训练     epochs=60, 切 uncertainty 权重，lr=6e-5
+# Phase 3  微调       epochs=15, lr=1e-5，关掉天气增强，贴近真实评测分布
+# =============================================================================

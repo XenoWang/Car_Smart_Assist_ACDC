@@ -1,0 +1,24 @@
+# 统一编辑器行为。重点解决 Windows 上的 CRLF 问题：
+# 如果不锁 LF，git diff 会显示整个文件被改写，review 时完全看不出真实变更。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json,toml}]
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是有意义的换行，不能trim掉
+trim_trailing_whitespace = false
+
+[Makefile]
+indent_style = tab
+
+[*.{bat,cmd,ps1}]
+end_of_line = crlf

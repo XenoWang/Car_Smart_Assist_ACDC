@@ -1,0 +1,90 @@
+# =============================================================================
+# ACDC 数据配置
+# =============================================================================
+# 数据集：ACDC — Adverse Conditions Dataset with Correspondences (ETH Zurich, ICCV 2021)
+#   官网   https://acdc.vision.ee.ethz.ch/
+#   规模   4006 张图像，覆盖 fog / night / rain / snow 四类恶劣天气
+#   标注   语义分割 + panoptic + 图像间对应关系
+#   注意   **原生没有车辆距离/检测框标注** —— 距离任务必须由外部数据补充，
+#          见 configs/data/distance_supplement.yaml 与 docs/label_spec.md
+#
+# 许可是研究用途且禁止再分发，所以 data/ 整个目录已在 .gitignore 中。
+# 公开仓库里只能写「怎么获取」，不能附带数据本身。
+# =============================================================================
+
+base: default.yaml
+
+data:
+  name: acdc
+  root: data
+
+  # --- 四个恶劣天气子集 ---
+  # 各子集样本量不均，直接混合训练会让模型偏向样本多的子集，
+  # 因此采样器必须做平衡（见 data/samplers/weather_balanced.py）
+  subsets:
+    - fog
+    - night
+    - rain
+    - snow
+
+  # --- 划分 ---
+  split:
+    # ACDC 官方并不提供固定 train/val 划分，需要自己按 scene 切
+    # 关键约束：同一个 scene（连续视频帧）不能跨集合，否则会因帧间高度相似
+    #           导致验证指标虚高 —— 这是这类数据集最经典的泄漏源
+    strategy: by_scene
+    train: 0.70
+    val: 0.15
+    test: 0.15
+    # 划分结果落盘保存，保证每次实验用的是同一套划分，可复现
+    split_file: data/processed/acdc/split.json
+
+  # --- 图像 ---
+  image:
+    # 训练分辨率。ACDC 原图 1920x1080
+    train_size: [1024, 512]   # [宽, 高]，2:1 是分割常用的折中
+    eval_size: [2048, 1024]
+    # 保持长宽比 + padding，优于直接拉伸（拉伸会让测距的几何关系失效）
+    keep_aspect_ratio: true
+
+  # --- 标签 ---
+  labels:
+    num_classes: 19            # 映射到 Cityscapes 的 19 类体系，便于复用预训练权重
+    ignore_index: 255
+    # 官方调色板，保证可视化颜色在不同实验间一致
+    use_official_palette: true
+    mapping_file: src/car_smart_assist/data/label_mapping.py
+
+  # --- 增强 ---
+  augmentation:
+    train:
+      random_resize: { scale_range: [0.5, 2.0] }
+      random_crop:   { size: [1024, 512] }
+      horizontal_flip: { p: 0.5 }
+      photometric:
+        brightness_contrast: { p: 0.5, limit: 0.2 }
+        hue_saturation:      { p: 0.3, limit: 0.1 }
+      # 天气增强：用于做「同分布 vs 跨分布」的鲁棒性对比实验
+      weather:
+        enabled: false          # 默认关闭。开启前先跑一次基线，否则说不清提升来自哪里
+        fog:   { p: 0.0, intensity: [0.1, 0.5] }
+        rain:  { p: 0.0, intensity: [0.1, 0.4] }
+        snow:  { p: 0.0, intensity: [0.1, 0.3] }
+        night: { p: 0.0, gamma_range: [1.5, 3.0] }
+    # 验证/测试不做任何随机增强，只做 resize 与归一化
+    val:
+      resize_only: true
+
+  # --- 归一化：训练与推理必须用同一套，否则指标会对不上 ---
+  normalization:
+    mean: [0.485, 0.456, 0.406]   # ImageNet 统计量，与骨干网预训练一致
+    std:  [0.229, 0.224, 0.225]
+
+  # --- DataLoader ---
+  loader:
+    batch_size: 4                 # 12GB 显存 + 1024x512 + 多任务头，从 4 起步再往上试
+    num_workers: 4                # Windows 上过大反而慢（进程启动开销高）
+    pin_memory: true
+    persistent_workers: true
+    drop_last: true               # 多任务训练里丢掉不完整的最后一个 batch，避免 loss 抖动
+    prefetch_factor: 2

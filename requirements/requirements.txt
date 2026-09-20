@@ -1,0 +1,65 @@
+# =============================================================================
+# 核心运行时依赖 —— 这一份全部可以用国内镜像源加速
+# =============================================================================
+# 安装（清华 TUNA 镜像）：
+#     pip install -r requirements/requirements-torch.txt        # 先装 torch，见该文件说明
+#     pip install -r requirements/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 注意顺序：先 torch 后本文件。反过来的话，本文件里的依赖不会覆盖 torch，
+# 但如果你后续手滑重装 torch，会把 CPU 版装回来。
+#
+# 本文件里没有 torch / torchvision / torchaudio —— 它们必须走官方 CUDA 索引，
+# 原因见 requirements/requirements-torch.txt 顶部注释。
+# =============================================================================
+
+# --- 基础数值与 IO ---
+numpy>=1.26,<3                 # torch 2.8 兼容 numpy 2.x；上界防 numpy 3 的破坏性变更
+pandas>=2.2                    # 数据集统计、标签表处理
+Pillow>=10.2                   # ACDC 图像读写
+PyYAML>=6.0                    # configs/ 下所有 yaml 配置的解析
+tqdm>=4.66                     # 进度条
+rich>=13.7                     # 漂亮的日志与表格输出（CLI 与训练日志都用）
+
+# --- 配置校验 ---
+pydantic>=2.7                  # config/schema.py 用；配置错误要在加载期就炸，不要拖到训练中
+
+# --- 计算机视觉 / 数据增强 ---
+opencv-python>=4.9             # 图像几何操作、可视化叠加图
+albumentations>=1.4            # 几何/光度增强流水线；weather_aug 的雨雾雪模拟也基于它
+einops>=0.7                    # 骨干网与 head 里的张量重排，比 permute 可读得多
+
+# --- 模型与训练 ---
+timm>=1.0                      # SegFormer / ConvNeXt 等预训练骨干网来源
+transformers>=4.53             # Stage 2 的 VLM/LLM 加载与推理；也是 Stage 1 骨干网的备选来源
+datasets>=3.0                  # 指令数据集的加载与缓存
+accelerate>=1.0                # 设备放置、混合精度、多卡（本项目主要用它的单卡能力）
+peft>=0.13                     # Stage 2 的 LoRA / QLoRA 微调
+bitsandbytes>=0.45             # 4-bit 量化，12GB 显存跑 VLM 的关键
+                               #   ↳ Windows 支持从 0.45 起。装不上就删掉这行 + peft 里的量化配置，
+                               #     Stage 2 退化为纯 LoRA（显存占用上升，但功能不减）
+
+# --- 评测指标 ---
+scikit-learn>=1.5              # 混淆矩阵、F1、ECE 校准等
+matplotlib>=3.8                # 报告配图：误差-距离曲线、混淆矩阵热图、抽检样本拼图
+nltk>=3.8                      # BLEU；首次使用需要 nltk.download('punkt')
+
+# --- 训练监控 ---
+tensorboard>=2.16              # 训练曲线；输出到 artifacts/logs/
+
+# --- 安全相关，锁住上界（这些库 API 变动频繁，会静默改掉指标口径）---
+torchmetrics>=1.4,<2           # 备选的指标实现；若自行实现指标则可不装
+
+# =============================================================================
+# 刻意没有列进来的包（装不上 / 不适用，别浪费时间试）：
+#
+#   flash-attn        Linux only，Windows 上要自行编译，且 RTX 5070 的 sm_120 支持尚不稳定。
+#                     本项目用不上 —— 12GB 显存下算力瓶颈不在 attention kernel。
+#   onnxruntime-gpu   需要和 CUDA 版本严格对齐，放到 requirements-dev.txt 里，
+#                     只在你真要跑 export_onnx.py 时再装。
+#   xformers          已被 PyTorch 原生 SDPA 取代，不要装。
+# =============================================================================
+#
+# 建议：首次安装成功跑通 training 之后，立刻冻结一份精确版本，保证实验可复现：
+#     pip freeze > requirements/requirements.lock.txt
+# 之后所有实验都以 lock 文件为准，本文件只作为「允许的版本范围」的来源。
+# =============================================================================

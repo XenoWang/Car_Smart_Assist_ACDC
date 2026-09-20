@@ -1,0 +1,86 @@
+# =============================================================================
+# 推理与评测配置
+# =============================================================================
+# 用法：
+#   python scripts/evaluate.py --config configs/inference/default.yaml --stage all
+#   python -m car_smart_assist.cli.main infer --config configs/inference/default.yaml
+# =============================================================================
+
+base: ../default.yaml
+data: ../data/acdc.yaml
+model: ../model/perception_multitask.yaml
+advisory: ../model/advisory_llm.yaml
+
+inference:
+  # --- 权重 ---
+  # 留 null 则自动取 artifacts/checkpoints/*/best 下最新的一个。
+  # 显式指定可以避免「评测时不小心用了别的实验的权重」这类低级但致命的错误。
+  perception_checkpoint: null
+  advisory_checkpoint: null
+
+  device: auto
+  dtype: bfloat16
+  # --- 批处理 ---
+  batch_size: 8                # 纯推理没有激活值存留，batch 可以比训练大得多
+  num_workers: 4
+
+  # --- 预处理一致性（重要）---
+  # 推理必须复用训练时的归一化参数与 resize 策略。
+  # 这两处不一致是「训练指标很好、推理效果很差」最常见的原因，
+  # 所以这里不允许独立配置，只能引用 data 配置。
+  preprocessing:
+    inherit_from_data_config: true
+    # 若确实需要覆盖（比如部署时输入分辨率不同），在这里显式写明并说明原因
+    override: null
+
+  # --- 分割后处理 ---
+  segmentation:
+    # 多尺度 + 翻转推理（TTA），能稳定涨 1-2 个点，代价是推理时间翻数倍。
+    # 评测时可以开，demo 时必须关（实时性要求）。
+    tta:
+      enabled: false
+      scales: [0.75, 1.0, 1.25]
+      flip: true
+    # 去掉面积过小的连通域（分割碎斑），提高视觉质量
+    min_region_size: 64
+
+  # --- 检测后处理 ---
+  detection:
+    score_threshold: 0.3
+    nms_iou_threshold: 0.5
+    max_detections: 20
+
+  # --- 评测范围 ---
+  evaluation:
+    splits: [val, test]
+    # 分天气子集分别出指标。这是本项目最该展示的结果：
+    # 「在 snow 上比在 fog 上差多少」直接体现对跨域泛化的理解深度。
+    per_weather_subset: true
+    # 距离必须分桶报告，总体 MAE 会掩盖「近处准、远处崩」的事实
+    distance_buckets: true
+    # 导出失败案例（预测与标注差异最大的 N 条）到 artifacts/reports/failures/
+    export_failure_cases: true
+    n_failure_cases: 20
+
+  # --- 报告 ---
+  report:
+    formats: [json, markdown]
+    output_dir: artifacts/reports
+    # 报告里附带的图
+    figures:
+      - confusion_matrix        # 接管边界与路况分类的混淆矩阵
+      - distance_error_curve    # 误差随距离变化的曲线，按天气分组
+      - pr_curve                # 接管边界的 precision-recall 曲线 + 阈值扫描
+      - failure_gallery         # 失败案例拼图
+      - qualitative_samples     # 好例子拼图（报告里不能只有坏例子）
+    # 是否在报告中对比历史结果
+    compare_previous: true
+
+  # --- 性能计时 ---
+  # 分开计「预处理 / Stage1 感知 / Stage2 生成」，因为这三者优化手段完全不同。
+  # 只给一个总耗时的性能说明在面试里没什么说服力。
+  profiling:
+    enabled: true
+    warmup_iterations: 10      # 前几次推理包含 CUDA 初始化与 kernel 编译，必须剔除
+    measure_iterations: 50
+    report_percentiles: [50, 95, 99]

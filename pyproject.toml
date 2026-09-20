@@ -1,0 +1,136 @@
+# =============================================================================
+# 工程元数据与工具配置
+# =============================================================================
+# 依赖不在本文件声明，而是放在 requirements/ 下（分镜像源可加速 / 需官方索引两份）。
+# 这是有意的：torch 的 CUDA 版本会随机器变化，写死在 pyproject 里会让
+# `pip install -e .` 把 CPU 版 torch 拽进来。
+# 因此本项目采用「pip install -e . --no-deps + 手动装 requirements」的方式。
+# =============================================================================
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "car-smart-assist"
+dynamic = ["version"]
+description = "面向恶劣天气/复杂路况的两阶段驾驶辅助：ACDC 多任务感知 + 自然语言司机提示"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+keywords = [
+    "autonomous-driving",
+    "adverse-weather",
+    "semantic-segmentation",
+    "monocular-distance-estimation",
+    "vision-language-model",
+    "driving-safety",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# 见文件头说明：依赖由 requirements/ 管理，这里刻意为空。
+dependencies = []
+
+[project.optional-dependencies]
+# 仅用于开发期把包以可编辑模式装进环境：
+#     pip install -e . --no-deps
+dev = []
+
+[project.scripts]
+car-smart-assist = "car_smart_assist.cli.main:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "car_smart_assist.version.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# =============================================================================
+# ruff —— lint 与 format
+# =============================================================================
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "PTH",  # flake8-use-pathlib —— Windows/Unix 路径分隔符差异的坑，提前挡住
+    "NPY",  # numpy 相关检查
+]
+ignore = [
+    "E501",  # 行长由 formatter 管，不重复告警
+]
+
+[tool.ruff.lint.per-file-ignores]
+"notebooks/*" = ["E402", "F401"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"   # 关键：Windows 上强制 LF，避免 CRLF 污染 diff
+
+# =============================================================================
+# mypy —— 只在核心模块强制类型注解
+# =============================================================================
+[tool.mypy]
+python_version = "3.12"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = false   # 全项目强制太吵，逐步收紧
+ignore_missing_imports = true
+files = ["src"]
+
+# 这几个模块是全项目的正确性地基（测距口径、决策规则、跨阶段契约），要求全注解
+[[tool.mypy.overrides]]
+module = [
+    "car_smart_assist.perception.geometry.*",
+    "car_smart_assist.advisory.policy.*",
+    "car_smart_assist.advisory.schema",
+    "car_smart_assist.config.schema",
+]
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# =============================================================================
+# pytest
+# =============================================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "slow: 慢速测试（端到端集成），可用 -m 'not slow' 跳过",
+    "gpu: 需要 CUDA 设备的测试，CI 上应当跳过",
+]
+# CI 无 GPU 时用：pytest -m "not slow and not gpu"
+
+# =============================================================================
+# coverage
+# =============================================================================
+[tool.coverage.run]
+source = ["src/car_smart_assist"]
+omit = ["*/tests/*", "*/cli/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]

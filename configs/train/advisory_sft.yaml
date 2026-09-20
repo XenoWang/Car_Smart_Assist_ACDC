@@ -1,0 +1,103 @@
+# =============================================================================
+# Stage 2 训练配置：司机提示生成（QLoRA 指令微调）
+# =============================================================================
+# 显存现实（RTX 5070, 12GB）：
+#   3B 模型 4-bit 量化  ≈ 2.5-3.5GB
+#   LoRA 适配器 + 优化器 ≈ 0.3GB
+#   激活值（batch=1, 短序列）≈ 2-4GB
+#   → 总计约 6-8GB，可行，但 batch_size 只能给 1，靠梯度累积凑等效批量
+#
+# 先跑 baseline 再微调：
+#   在不训练的情况下直接用基座模型 + 提示词跑一遍评测，作为 baseline。
+#   如果微调后的指标没超过 baseline，说明这个模型/数据组合不成立，
+#   这时候该改数据而不是继续调超参 —— 这一步跳过的人最后都在浪费时间。
+# =============================================================================
+
+base: ../default.yaml
+data: ../data/acdc.yaml
+model: ../model/advisory_llm.yaml
+
+train:
+  # --- 数据 ---
+  dataset:
+    train_file: data/processed/instruction/train.jsonl
+    val_file:   data/processed/instruction/val.jsonl
+    # 每条样本的图像处理分辨率上限。VLM 的图像 token 数直接吃显存，
+    # 这个值调大会让显存爆掉，且对「前方有车、约 30 米」这类判断帮助有限。
+    max_image_pixels: 501760   # 约 896x560
+    max_length: 1024           # 指令 + 回复的总 token 上限
+
+  epochs: 8                    # QLoRA 微调轮次不宜多，3-8 轮即可，多了会过拟合风格
+  batch_size: 1
+  gradient_accumulation_steps: 16   # 等效批量 16
+  # 指令数据集句子长度差异大，按 token 数分批比按条数分批效率高
+  length_grouped_batching: true
+
+  # --- LoRA ---
+  lora:
+    r: 16                      # 秩。16 是常用起点；提示生成是相对简单的任务，再大收益有限
+    lora_alpha: 32             # 一般取 2*r
+    lora_dropout: 0.05
+    bias: none
+    task_type: CAUSAL_LM
+    # 只挂注意力层；挂上 MLP 层会明显增加显存，本任务收益不大
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+
+  # --- 优化器 ---
+  optimizer:
+    name: adamw_8bit           # 8-bit 优化器，省显存
+    lr: 2.0e-4                 # LoRA 的学习率比全参微调高 1-2 个数量级
+    weight_decay: 0.0          # LoRA 参数少，加 wd 收益甚微
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: cosine
+    warmup_ratio: 0.03
+
+  amp:
+    enabled: true
+    dtype: bfloat16
+
+  validation:
+    every_n_epochs: 1
+    # 监控指标的选择理由见 evaluation/metrics/instruction.py：
+    # 文本相似度不是重点，「该建议接管而没建议」的比例才是。
+    monitor: val/takeover_miss_rate
+    mode: min                  # 漏报率越低越好
+    # 但漏报率过低时可能变成「什么都喊接管」，所以同时看误报率做人工判断
+    secondary_monitor: val/false_alarm_rate
+
+  checkpoint:
+    save_dir: artifacts/checkpoints/advisory
+    save_top_k: 2
+    save_last: true
+    monitor: val/takeover_miss_rate
+    mode: min
+    # LoRA 权重体积很小（几十 MB），但仍是产物，不进版本库
+    merge_on_save: false       # 不合并进基座，保持适配器独立，便于切换基座对比
+
+  log_every_n_steps: 10
+  # 每隔若干轮抽几条生成结果打到日志里 —— 文本任务的 loss 曲线几乎说明不了问题，
+  # 必须直接看输出文本
+  sample_generation_every_n_epochs: 1
+  sample_generation_n: 5
+
+  seed: 42
+
+# =============================================================================
+# 评测方式说明（写在配置里，因为这是这个 Stage 最容易被糊弄过去的地方）
+# =============================================================================
+# 自动指标（BLEU / ROUGE）在驾驶提示这个任务上**很不可靠**：
+#   "前方车辆约30米，建议减速" 和 "前方约30米有车，请减速"
+#   BLEU 分会很低，但语义完全等价，且都是正确答案。
+#
+# 所以评测以三层为主：
+#   1. 规则化检查（自动）：是否包含距离数值、是否包含动作词、长度是否超标、是否命中禁词
+#   2. 安全性指标（自动）：漏报率（该说没说）、误报率（不该说却说了）
+#   3. 人工抽检（必须做）：分层抽 50 条，人工判「这条提示能不能照做」
+# 报告里三层都要给，只给 BLEU 会被一眼看穿。
+# =============================================================================

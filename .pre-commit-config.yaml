@@ -1,0 +1,49 @@
+# 提交前自动检查。安装：
+#     pip install pre-commit
+#     pre-commit install
+#
+# 价值不在于「代码更漂亮」，而在于挡住后面这几类会真正污染实验结论的低级错误：
+#   - 误提交 .pt 权重或大数据文件
+#   - 手滑把 yaml 改坏导致配置静默回退默认值
+#   - 提交笔记本时带上了巨大的输出单元格
+default_language_version:
+  python: python3.12
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        args: ["--maxkb=2048"]        # 权重与数据文件不该进库
+      - id: check-yaml
+      - id: check-json
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+        args: ["--fix=lf"]            # 强制 LF，跨平台协作必开
+      - id: detect-private-key
+      - id: check-merge-conflict
+
+  # ruff：lint + format，一站式
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ["--fix", "--exit-non-zero-on-fix"]
+      - id: ruff-format
+
+  # 类型检查只在核心模块生效（配置见 pyproject.toml 的 mypy.overrides）
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        additional_dependencies: ["numpy>=1.26", "pydantic>=2.7", "types-PyYAML"]
+        files: ^src/car_smart_assist/(perception/geometry|advisory/policy|advisory/schema|config/schema)
+
+  # 清除 notebook 输出，避免 diff 里塞满图片和 base64
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.7.1
+    hooks:
+      - id: nbstripout
+        files: \.ipynb$

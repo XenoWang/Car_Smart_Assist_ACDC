@@ -1,0 +1,69 @@
+# =============================================================================
+# 全局基础配置 —— 所有其他配置都继承本文件
+# =============================================================================
+# 继承方式（见 car_smart_assist/config/loader.py）：
+#     子配置里写 `base: default.yaml`，然后只覆盖需要改的字段。
+# 目的：路径、随机种子、日志、设备这类东西只定义一次，
+#       避免三个配置里写了三个不一样的 data_root。
+# =============================================================================
+
+project:
+  name: car-smart-assist
+  # 每次实验的产物目录命名会带上这个 tag，便于区分不同方向的实验
+  experiment_tag: baseline
+  description: "ACDC 复杂路况感知 + 司机提示生成"
+
+# --- 随机性：单一入口，禁止在代码里另外设种子 ---
+reproducibility:
+  seed: 42
+  # 严格确定性会明显掉速，只在做「A/B 对比实验」时打开
+  deterministic: false
+
+# --- 设备 ---
+device:
+  # auto -> 优先 cuda，不可用则退回 cpu 并显式告警（不要静默降级）
+  target: auto
+  # RTX 5070 为 sm_120，torch 2.8.0+cu129 已原生支持；
+  # 打开此项会在启动时校验 arch_list，缺 sm_120 就直接报错而不是跑到一半变慢
+  verify_arch: true
+  amp:
+    enabled: true
+    # bf16 在 Blackwell 上原生支持且不需要 GradScaler，优先用它
+    dtype: bf16
+  cudnn_benchmark: true
+
+# --- 路径：全部相对项目根目录解析 ---
+paths:
+  data_root: data
+  raw: data/raw
+  interim: data/interim
+  processed: data/processed
+  artifacts: artifacts
+  checkpoints: artifacts/checkpoints
+  logs: artifacts/logs
+  predictions: artifacts/predictions
+  reports: artifacts/reports
+
+# --- 日志 ---
+logging:
+  level: INFO
+  # 控制台输出是否带颜色；重定向到文件时自动关闭
+  colorize: true
+  # 记录到文件的文件名格式
+  file_pattern: "train_{time}.log"
+  # 每隔多少 step 打一次训练指标
+  log_every_n_steps: 50
+
+# --- 指标上报 ---
+tracking:
+  # 可选：tensorboard / none。保持可选是为了让项目在没有图形界面时也能跑
+  backend: tensorboard
+  log_dir: artifacts/logs
+
+# --- 数值安全 ---
+numerics:
+  # 梯度裁剪，防偶发爆炸；多任务训练里这个几乎是必需的
+  grad_clip_norm: 1.0
+  # 检测到 NaN/Inf 时直接中断而不是继续污染权重
+  detect_anomaly: false
+  fail_on_nan: true

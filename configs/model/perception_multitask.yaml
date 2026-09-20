@@ -1,0 +1,130 @@
+# =============================================================================
+# Stage 1：多任务感知模型配置
+# =============================================================================
+# 一个共享骨干 + 四个任务头。共享而非四个独立模型，理由：
+#   (a) 显存与推理延迟 —— 车载场景不可能同时跑四个网络
+#   (b) 交叉增益 —— 路况与接管边界、分割与检测之间有强相关性
+# 代价是任务间可能相互干扰（负迁移），所以 loss 权重是本文件最需要调的参数。
+# =============================================================================
+
+base: default.yaml
+
+model:
+  name: perception_multitask
+  arch: multitask
+
+  # --- 共享骨干 ---
+  backbone:
+    name: segformer
+    # 12GB 显存下的选择权衡：
+    #   mit_b0 ~3.7M  最快，指标一般
+    #   mit_b1 ~14M   推荐起点 —— 精度与显存的最佳平衡
+    #   mit_b2 ~27M   显存吃紧，需要把 batch_size 降到 2
+    variant: mit_b1
+    pretrained: true
+    # 预训练权重来源：imagenet 是稳的；cityscapes 上预训练对分割更有利，
+    # 但要求标签空间对齐（本项目已映射到 Cityscapes 19 类）
+    pretrained_source: imagenet
+    # 冻结骨干的前 N 个 stage。ACDC 只有 4006 张图，全量微调容易过拟合
+    freeze_stages: 0
+    out_indices: [0, 1, 2, 3]      # 输出四层特征金字塔，供不同 scale 的头使用
+
+  # --- 任务头 ---
+  heads:
+
+    # 语义分割：为其他任务提供场景上下文，也是最有把握做好的任务
+    segmentation:
+      enabled: true
+      type: linear_fpn
+      num_classes: 19
+      ignore_index: 255
+      feature_level: 3             # 用最高层特征（1/32）
+      loss_weight: 1.0
+      # 类别极不均衡（道路/天空占绝大多数像素），必须加权
+      class_weighting: median_frequency
+
+    # 路况分类：标签直接来自 ACDC 天气子集，是本项目标签质量最好的任务
+    road_condition:
+      enabled: true
+      type: pooling_cls            # 全局池化 + 线性层，轻量
+      num_classes: 4               # fog / night / rain / snow
+      # 注意这是多标签还是单标签取决于 ACDC 的口径：
+      # 官方每个子集是互斥的，但实际场景可能同时下雪又起雾。
+      # 先用单标签（softmax），后续如果发现漏判再改成多标签（BCE）。
+      multilabel: false
+      loss_weight: 0.5
+
+    # 接管边界：本项目最核心、也最需要说清楚的任务
+    handover:
+      enabled: true
+      type: pooling_cls
+      # 分级而非二分类。理由：实际驾驶中「马上要接管」和「还早」是完全不同的提示，
+      # 二分类会丢掉这个信息，导致提示要么太早（烦人）要么太晚（危险）。
+      num_levels: 3                # 0=可继续辅助驾驶  1=接近边界需注意  2=应立即接管
+      loss_weight: 1.0
+      # 漏报代价远高于误报：该接管而没提醒是安全问题，误报只是打扰。
+      # 非对称加权，具体倍数在 labels 段调
+      asymmetric_weighting: true
+      loss_level_weights: [1.0, 2.0, 4.0]   # 等级 2 的样本权重最高
+      # 标签定义见 docs/handover_policy.md —— 这不是数据集自带的，是本项目自己构造的
+      label_source: constructed
+      labels_file: data/processed/handover/labels.json
+
+    # 车辆检测（前车 / 来车）
+    vehicle_detection:
+      enabled: true
+      type: anchor_free_single_scale
+      num_classes: 2               # 0=同向（前车）  1=对向（来车）
+      # 同向/对向的区分对「该怎么提示」至关重要：
+      # 前车距离近 -> 减速；来车距离近 -> 注意会车，两者的建议完全不同
+      loss_weight: 0.5
+      score_threshold: 0.3
+      nms_iou_threshold: 0.5
+      max_detections: 20
+      # 监督来源是外部数据集（KITTI 等），不是 ACDC，存在域差异，权重给低一些
+      label_source: external
+
+    # 距离回归：挂在检测框上
+    distance:
+      enabled: true
+      type: box_mlp_regression
+      # 预测 log(distance) 而不是 distance：
+      # 距离是正值且跨越两个数量级，直接回归会被远处的大数值主导，
+      # log 空间下误差分布均匀得多，近处精度明显提升。
+      predict_log: true
+      loss_weight: 1.0
+      loss_type: silu_huber        # 对离群标注鲁棒（距离标签里总有几帧是错的）
+      # 输出不确定度（heteroscedastic），供 Stage 2 做保守决策：
+      # 模型自己说「这帧我没把握」时，提示策略应当更保守
+      predict_uncertainty: true
+      # 按距离分桶加权，避免近处样本数占优导致远处完全没学到
+      bucket_weighting: true
+
+  # --- 多任务损失组合 ---
+  # 四个任务的 loss 量纲差异很大（分割是逐像素、距离是逐框），
+  # 直接相加会让某个任务被淹没。这里提供两种策略。
+  loss_balancing:
+    strategy: uncertainty           # fixed | uncertainty | gradnorm
+    # fixed 模式下的手工权重（仅 strategy=fixed 时生效）
+    fixed_weights:
+      segmentation: 1.0
+      road_condition: 0.5
+      handover: 1.0
+      vehicle_detection: 0.5
+      distance: 1.0
+    # uncertainty 模式：让模型自己学各任务的权重，不需要手调，但训练初期不稳定，
+    # 建议前 2 个 epoch 先用 fixed，再切到 uncertainty
+    uncertainty_warmup_epochs: 2
+
+# =============================================================================
+# 消融实验预设（写在这里是为了让「做过哪些对比」可复现，而不是靠记忆）
+# =============================================================================
+ablations:
+  # 用法：python scripts/train_perception.py --config configs/train/perception.yaml \
+  #           --set model.heads.distance.enabled=false --set project.experiment_tag=no_distance
+  - tag: no_segmentation        # 去掉分割头，看其他任务掉多少
+  - tag: no_handover            # 去掉接管头（对照组）
+  - tag: no_distance            # 去掉距离头
+  - tag: fixed_loss_weights     # 用固定权重，对比 uncertainty 自动加权
+  - tag: backbone_b0_vs_b1      # 骨干容量对比
+  - tag: weather_aug_on         # 恶劣天气增强的增益
