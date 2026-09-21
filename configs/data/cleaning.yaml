@@ -1,0 +1,103 @@
+# =============================================================================
+# 数据清洗配置
+# =============================================================================
+# 阈值集中在这里，清洗代码里不出现硬编码数字。
+# 调整阈值前先用当前值跑一遍，看报告里的分布，再决定往哪边挪。
+# =============================================================================
+
+base: default.yaml
+
+cleaning:
+  # --- 输出 ---
+  output:
+    report_dir: artifacts/reports/cleaning
+    # 有效样本清单：数据集类读它做过滤，是清洗的实际交付物
+    manifest_dir: data/processed/manifests
+    # 每条问题在报告里最多保留多少条明细（防止一个批量问题刷爆报告）
+    max_samples_per_issue: 50
+
+  # --- 检查开关：按需关闭，便于分步排查 ---
+  checks:
+    image_integrity: true          # 能否解码、是否截断
+    image_statistics: true         # 尺寸、退化（纯色/极低方差）
+    acdc_image_mask_pairing: true  # 图像与 5 个标注变体是否配套
+    acdc_mask_validity: true       # 掩码是否全为 ignore、类别是否越界
+    detection_annotations: true    # bbox 越界、零面积、引用不存在的图像
+    kitti_triplets: true           # image / label / calib 三者是否齐全
+    duplicates_exact: true         # 精确重复（文件内容哈希）
+    duplicates_near: false         # 近重复（dHash），开销较大，默认关
+    statistical_outliers: false    # sklearn 离群检测，默认关，见下方说明
+
+  # --- 图像完整性 ---
+  integrity:
+    # 检查 PIL 能否完整解码（不只是打开文件头）
+    full_decode: true
+    # 解码时是否强制读取像素数据（能抓到截断文件，但慢一些）
+    force_load: true
+
+  # --- 尺寸与退化 ---
+  image_statistics:
+    # 小于此边长的图像判为异常
+    min_side_px: 64
+    # 宽高比超出此范围判为异常（超大或超窄的图多半是坏的）
+    aspect_ratio_range: [0.5, 6.0]
+    # 像素标准差低于此值判为退化图（纯色或近似纯色）
+    # ACDC 实测最低也有几十，设 2.0 能抓住真正退化的而不会误报夜景
+    min_pixel_std: 2.0
+    # 方差检查只在前 N 张上做会漏；全量做，但用灰度降采样加速
+    std_check_downsample: 4
+
+  # --- ACDC 掩码 ---
+  mask_validity:
+    ignore_index: 255
+    num_classes: 19
+    # 掩码中有效像素占比低于此值判为可疑（几乎全是 ignore）
+    min_valid_pixel_ratio: 0.05
+    # 掩码中城市道路/天空这类大类占比超过此值且只有一个类判为可疑
+    # （真实驾驶场景不可能是单一类别，多半是标注错误）
+    single_class_ratio: 0.995
+    # 允许的类别 ID 上界（Cityscapes 类别 ID 最大到 33，-1 是 ignore）
+    max_class_id: 33
+
+  # --- 检测标注 ---
+  detection:
+    # bbox 允许超出图像边界的比例（截断目标合法，完全在外面才可疑）
+    max_out_of_bounds_ratio: 0.5
+    # 最小框面积（像素），小于此值判为噪声标注
+    min_bbox_area_px: 4
+    # 最小框边长
+    min_bbox_side_px: 2
+    # 是否校验 segmentation 的 RLE 可解码（需要 pycocotools，未装则自动跳过并记 INFO）
+    validate_rle: false
+
+  # --- KITTI ---
+  kitti:
+    # 逐帧尺寸与内参都不同，这是 KITTI 的固有特性，不是缺陷。
+    # 此项为 true 时只把尺寸分布记入报告（INFO），不判为错误。
+    report_size_variation: true
+    # 每帧的 calib 必须存在且 P2 可解析
+    require_calib: true
+    # calib 中的 P2 主点位置若偏离图像中心超过此比例，判为可疑（WARNING）
+    principal_point_tolerance: 0.08
+
+  # --- 重复检测 ---
+  duplicates:
+    # 精确重复：对文件内容做哈希。用前 N MB 足够区分（全量哈希 16GB 太慢）
+    exact_hash_bytes: 262144      # 256 KB
+    # 近重复：dHash 汉明距离阈值，越小越严格。8x8 hash 下 5 是常见宽松值
+    near_hash_size: 8
+    near_hamming_threshold: 5
+
+  # --- 统计离群（需要 scikit-learn，默认关闭）---
+  # ⚠️ 说明：这一项抓的是「能正常解码、但统计特征异常」的图像，
+  #    例如曝光异常、内容异常的帧。它不是完整性检查的替代品。
+  #    默认关闭，因为误报率较高，适合人工过一遍报告时开着看。
+  statistical_outliers:
+    features: [brightness_mean, brightness_std, entropy, edge_density, colorfulness]
+    method: isolation_forest       # isolation_forest | robust_zscore
+    contamination: 0.01            # 预期异常比例，调大误报变多
+    random_state: 42
+
+  # --- 全量扫描的并行度 ---
+  # 15k+ 文件 IO 密集，多进程能显著加速；Windows 上进程启动开销大，4 是折中
+  num_workers: 4
