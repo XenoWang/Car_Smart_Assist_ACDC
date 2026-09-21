@@ -99,34 +99,82 @@ class TestProbeImage:
 
 
 class TestDimensionsAndDegeneracy:
+    """内容类检查的契约：只告警，不排除。
+
+    这一组测试守住项目的核心安全约束 —— ACDC 的大雾/夜路图像
+    不能被当作「退化图」自动剔除。
+    """
+
     CFG = {
         "min_side_px": 64,
         "aspect_ratio_range": [0.5, 6.0],
         "min_pixel_std": 2.0,
     }
 
-    def _run(self, results):
+    def _run(self, results, cfg=None):
         rep = pp.CleaningReport()
         pp._check_dimensions_and_degeneracy(
-            results, rep, self.CFG, check="t", label="t"
+            results, rep, cfg or self.CFG, check="t", label="t"
         )
         return rep
+
+    def _probe_from_array(self, tmp_path: Path, name: str, arr) -> dict:
+        p = tmp_path / name
+        Image.fromarray(arr.astype("uint8")).save(p)
+        return pp._probe_image((str(p), True, True, 1))
+
+    # --- 基线 ---
 
     def test_normal_image_passes(self, tmp_image):
         r = pp._probe_image((str(tmp_image("n.png", (320, 240))), True, True, 1))
         rep = self._run([r])
-        assert not [i for i in rep.issues if i.severity is pp.Severity.ERROR]
+        assert not rep.issues
+        assert rep.status_of(r["path"]) is pp.SampleStatus.VALID
 
-    def test_uniform_image_flagged_degenerate(self, tmp_image):
+    # --- 核心契约：内容异常不排除 ---
+
+    def test_uniform_image_is_warning_not_excluded(self, tmp_image):
+        """纯色图会被标出，但**不能**被排除 —— 决定权留给人。"""
         r = pp._probe_image((str(tmp_image("u.png", (320, 240), uniform=True)), True, True, 1))
         rep = self._run([r])
-        assert any("退化图" in i.message for i in rep.issues)
-        assert rep.status_of(r["path"]) is pp.SampleStatus.INVALID
+        assert any(i.severity is pp.Severity.WARNING for i in rep.issues)
+        assert not [i for i in rep.issues if i.severity is pp.Severity.ERROR]
+        assert rep.status_of(r["path"]) is pp.SampleStatus.SUSPECT
 
-    def test_tiny_image_flagged(self, tmp_image):
+    def test_dark_night_image_not_excluded(self, tmp_path: Path):
+        """模拟 ACDC 里最暗的那类夜路帧：平均亮度约 7、方差约 13。
+
+        实测 ACDC 最暗帧：mean=6.54, std=12.96。这类图必须原样保留。
+        """
+        rng = np.random.default_rng(0)
+        arr = rng.integers(0, 4, (240, 320, 3))          # 极暗底
+        arr[100:140, 140:200] = rng.integers(60, 90, (40, 60, 3))  # 几处车灯/反光
+        r = self._probe_from_array(tmp_path, "night.png", arr)
+
+        assert r["brightness_mean"] < 40, "构造的夜路图不够暗，测试无效"
+        rep = self._run([r])
+        assert rep.status_of(r["path"]) is pp.SampleStatus.VALID, "夜路图被误判了"
+
+    def test_foggy_low_contrast_image_not_excluded(self, tmp_path: Path):
+        """模拟浓雾帧：整体亮、对比度低，但仍有微小结构。
+
+        方差会低于普通图，但不能被排除 —— 浓雾是 ACDC 的四个子集之一。
+        """
+        rng = np.random.default_rng(1)
+        arr = np.full((240, 320, 3), 200.0)
+        arr += rng.normal(0, 6.0, arr.shape)             # 低对比度纹理
+        arr[180:200, 100:220] -= 12                      # 隐约的路面
+        r = self._probe_from_array(tmp_path, "fog.png", arr)
+
+        assert r["brightness_std"] < 20, "构造的雾图对比度不够低，测试无效"
+        rep = self._run([r])
+        assert rep.status_of(r["path"]) is pp.SampleStatus.VALID, "浓雾图被误判了"
+
+    def test_tiny_image_is_warning_not_excluded(self, tmp_image):
         r = pp._probe_image((str(tmp_image("tiny.png", (16, 16))), True, True, 1))
         rep = self._run([r])
         assert any("尺寸过小" in i.message for i in rep.issues)
+        assert rep.status_of(r["path"]) is pp.SampleStatus.SUSPECT
 
     def test_extreme_aspect_ratio_flagged(self, tmp_image):
         r = pp._probe_image((str(tmp_image("wide.png", (800, 80))), True, True, 1))
@@ -140,9 +188,60 @@ class TestDimensionsAndDegeneracy:
             for i in range(3)
         ]
         rep = self._run(rs)
-        info = [i for i in rep.issues if i.severity is pp.Severity.INFO]
-        assert any("种图像尺寸" in i.message for i in info)
+        assert any(
+            i.severity is pp.Severity.INFO and "种图像尺寸" in i.message for i in rep.issues
+        )
         assert not [i for i in rep.issues if i.severity is pp.Severity.ERROR]
+
+    # --- 逃生阀：显式配置才允许自动排除 ---
+
+    def test_severity_can_be_raised_to_error_explicitly(self, tmp_image):
+        """配置里显式写 error 时才排除 —— 保证这是有意为之而非默认行为。"""
+        cfg = {**self.CFG, "severity": {"low_std": "error"}}
+        r = pp._probe_image((str(tmp_image("u.png", (320, 240), uniform=True)), True, True, 1))
+        rep = self._run([r], cfg=cfg)
+        assert rep.status_of(r["path"]) is pp.SampleStatus.INVALID
+
+    def test_illegal_severity_falls_back_to_warning(self, tmp_image):
+        cfg = {**self.CFG, "severity": {"low_std": "banana"}}
+        r = pp._probe_image((str(tmp_image("u2.png", (320, 240), uniform=True)), True, True, 1))
+        rep = self._run([r], cfg=cfg)
+        assert rep.status_of(r["path"]) is pp.SampleStatus.SUSPECT
+
+    def test_candidate_counts_recorded(self, tmp_image):
+        """候选数必须进 stats —— 报告要能回答「有多少张被标出来了」。"""
+        rs = [
+            pp._probe_image((str(tmp_image(f"c{i}.png", (320, 240), uniform=True)), True, True, 1))
+            for i in range(3)
+        ]
+        rep = self._run(rs)
+        assert rep.stats["t_low_variance_candidates"] == 3
+
+
+class TestExclusionContract:
+    """整个模块的排除契约：只有「数据不可用」才进 invalid。"""
+
+    def test_only_decode_failure_produces_error(self, tmp_path: Path):
+        """汇总一遍：解码失败 → ERROR；内容异常 → 不产生 ERROR。"""
+        rep = pp.CleaningReport()
+
+        # (a) 不可解码 —— 必须 ERROR
+        broken = tmp_path / "broken.png"
+        broken.write_bytes(b"\x89PNG\r\n\x1a\n" + b"junk" * 50)
+        r_bad = pp._probe_image((str(broken), True, True, 1))
+        if not r_bad["ok"]:
+            rep.error("integrity", r_bad["path"], "无法解码")
+
+        # (b) 正常图 —— 不能 ERROR
+        good = tmp_path / "good.png"
+        Image.fromarray(
+            np.random.default_rng(0).integers(0, 256, (240, 320, 3), dtype=np.uint8)
+        ).save(good)
+        r_ok = pp._probe_image((str(good), True, True, 1))
+
+        assert r_bad["ok"] is False and r_ok["ok"] is True
+        assert rep.status_of(r_bad["path"]) is pp.SampleStatus.INVALID
+        assert rep.status_of(r_ok["path"]) is pp.SampleStatus.VALID
 
 
 # ---------------------------------------------------------------------------

@@ -47,6 +47,16 @@
   `gt_trainval.zip` 2006 张语义标注、`gt_detection_trainval.zip`、`gt_panoptic_trainval.zip`
 
 ### Changed
+- **清洗策略修正：内容类判断不再排除样本。** 原先「灰度方差 < 2.0」被当作 ERROR 直接排除，
+  但该判据无法区分「采集失败的全黑帧」与「合法的大雾/夜路帧」—— 而后者正是 ACDC 的核心内容。
+  按方差阈值自动排除会系统性删掉最该被学会的数据，且报告上只显示「排除 N 张退化图」，
+  看不出问题。
+  现改为：**只有「数据不可用」才排除**（无法解码、配套文件缺失、结构不一致），
+  **「图像不寻常」一律只告警**（方差偏低、尺寸偏小、宽高比异常、疑似重复、统计离群）。
+  内容类检查的严重度可在 `configs/data/cleaning.yaml` 的
+  `image_statistics.severity` 显式改为 error，但需先人工抽查确认。
+  已加回归测试（`TestDimensionsAndDegeneracy` / `TestExclusionContract`），
+  并用「注入回归 → 测试必须失败」验证过保护有效。
 - **方向标签方案改为「ACDC 序列时序推导」。** 解压后确认 ACDC 检测标注
   不含任何朝向/3D 信息（字段仅 `area,bbox,category_id,id,image_id,iscrowd,segmentation`），
   原先配置的 `strategy: yaw_angle` 在 ACDC 上无法执行。改为在同一视频序列内跟踪目标、

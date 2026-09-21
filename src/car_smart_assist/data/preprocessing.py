@@ -14,11 +14,27 @@
        清洗的产物是清单与报告，不是被删掉的文件。原始数据保持只读。
        理由：raw 层是不可再生资产 —— ACDC 是审批制获取的，误删的代价
        不是「重新下载一次」能弥补的。对训练而言，按清单过滤与物理删除等价。
-    2. **区分三类严重度，不要把正常现象报成错误。**
-       ERROR   必须从训练集剔除（损坏、引用缺失、尺寸不匹配）
-       WARNING 可疑，需人工确认（bbox 大量越界、单类掩码）
-       INFO    记录备查，不影响使用（KITTI 尺寸天然不统一）
-       把 KITTI 的四尺寸分布报成 ERROR 会让报告失去信噪比。
+    2. **只有「数据不可用」才排除；「图像不寻常」一律不排除。**（最重要的一条）
+       ERROR   （→ 进 invalid 清单，被数据集类过滤）
+           · 图像无法解码 / 截断
+           · 必需的配套文件缺失（ACDC 掩码、KITTI 的 calib）
+           · 结构不一致（掩码尺寸 ≠ 图像尺寸、类别 ID 越界、标注引用不存在的图像）
+           判据是「这条数据**无法**用于训练」。
+       WARNING （→ 进 suspect 清单，仍然参与训练，仅提示复核）
+           · 灰度方差偏低、尺寸偏小、宽高比异常、疑似重复、统计离群、bbox 过小
+           判据是「这张图**看起来**不寻常」，决定权必须留给人。
+       INFO    记录备查，不影响使用（如 KITTI 尺寸天然不统一）
+
+       ⚠️ 这条区分的必要性：ACDC 的核心内容就是大雾、夜路、暴雨、雪天。
+       浓雾画面接近均匀灰白、夜路画面整体偏暗，都会压低灰度方差 ——
+       如果按方差阈值自动排除，会**系统性删掉最该被学会的那部分数据**，
+       而且报告上只会显示「排除 N 张退化图」，看起来像个正常结论，没人会察觉。
+       实测全量 23011 张图：ACDC 最低灰度方差 12.96、KITTI 46.61，
+       与默认阈值 2.0 相距甚远 —— 但这是这两份数据碰巧没有「糊成一片」的帧，
+       换数据集/加自采数据后不成立。所以默认按 WARNING 处理，不赌运气。
+
+       内容类检查的严重度可在 cleaning.yaml 的 image_statistics.severity 里改，
+       但改之前请先看报告里的实际分布并人工抽查 —— 不要直接调阈值硬排除。
     3. 阈值一律从 configs/data/cleaning.yaml 读，代码里不出现魔数。
     4. 报告里必须同时写明「检查了什么」和「跳过了什么」，
        避免「跑过了 = 数据干净」的错觉。跳过的项要给出跳过原因。
@@ -36,7 +52,7 @@ import json
 import logging
 import math
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -76,6 +92,19 @@ class SampleStatus(str, Enum):
     VALID = "valid"
     SUSPECT = "suspect"    # 有 WARNING，可用但需留意
     INVALID = "invalid"    # 有 ERROR，不可用
+
+
+# severity 字符串 -> 枚举。配置里用字符串写，代码里用枚举判断。
+_SEVERITY_BY_NAME: dict[str, Severity] = {
+    "error": Severity.ERROR,
+    "warning": Severity.WARNING,
+    "info": Severity.INFO,
+}
+
+
+def _severity(cfg: dict[str, Any], key: str, default: Severity) -> Severity:
+    """从配置读严重度，非法值回退到 default。"""
+    return _SEVERITY_BY_NAME.get(str(cfg.get(key, default.value)).lower(), default)
 
 
 # =============================================================================
@@ -372,12 +401,34 @@ def _check_dimensions_and_degeneracy(
     check: str,
     label: str,
 ) -> None:
-    """基于探测结果检查尺寸异常与退化图，并把尺寸分布记入 stats。"""
+    """基于探测结果检查尺寸异常与退化图，并把尺寸分布记入 stats。
+
+    ⚠️ 本函数的三项检查**全部是内容判断**，默认严重度都是 WARNING，
+    即默认**不会**把任何样本标为 INVALID。
+
+    原因：这些指标衡量的是「图像看起来是否寻常」，不是「数据是否可用」。
+    大雾天画面接近均匀灰白、夜路画面整体偏暗，都会压低灰度标准差 ——
+    而这两种场景恰恰是 ACDC 的核心内容，把它们当作「退化图」剔除会
+    直接破坏数据集的分布，让模型在恶劣天气上的评估失去意义。
+
+    实测参考（全量 23011 张）：ACDC 最低灰度标准差 12.96、KITTI 46.61，
+    与默认阈值 2.0 相距甚远，但那是这两份数据恰好没有「糊成一片」的帧，
+    换数据集后不一定成立。因此这里把决定权交给配置与人，而不是默认排除。
+
+    需要更激进的策略时，在 cleaning.yaml 的 image_statistics.severity 里
+    把对应项改成 error —— 但改之前请先看报告里的实际分布，并人工抽查被标出的图。
+    """
     min_side = cfg.get("min_side_px", 64)
     lo, hi = cfg.get("aspect_ratio_range", [0.5, 6.0])
     min_std = cfg.get("min_pixel_std", 2.0)
 
+    sev_cfg = cfg.get("severity", {})
+    sev_min_side = _severity(sev_cfg, "min_side", Severity.WARNING)
+    sev_aspect = _severity(sev_cfg, "aspect_ratio", Severity.WARNING)
+    sev_low_std = _severity(sev_cfg, "low_std", Severity.WARNING)
+
     size_dist: Counter[tuple[int, int]] = Counter()
+    n_small = n_aspect = n_flat = 0
     for r in results:
         if not r["ok"]:
             continue
@@ -385,15 +436,37 @@ def _check_dimensions_and_degeneracy(
         size_dist[(w, h)] += 1
 
         if min(w, h) < min_side:
-            report.error(check, r["path"], f"尺寸过小: {w}x{h}（下限 {min_side}）")
+            n_small += 1
+            report.add(
+                check, sev_min_side, r["path"],
+                f"尺寸过小: {w}x{h}（下限 {min_side}）。"
+                "注意：尺寸小不等于损坏，需人工确认是否为原始采集缺陷",
+            )
 
         ar = w / h if h else 0.0
         if not (lo <= ar <= hi):
-            report.warn(check, r["path"], f"宽高比异常: {ar:.2f}（允许 {lo}–{hi}）")
+            n_aspect += 1
+            report.add(check, sev_aspect, r["path"], f"宽高比异常: {ar:.2f}（允许 {lo}–{hi}）")
 
         std = r.get("brightness_std")
         if std is not None and std < min_std:
-            report.error(check, r["path"], f"退化图（近纯色）: 灰度标准差 {std:.3f} < {min_std}")
+            n_flat += 1
+            report.add(
+                check, sev_low_std, r["path"],
+                f"灰度标准差偏低: {std:.3f} < {min_std}。"
+                "⚠️ 低方差**不等于**损坏 —— 浓雾、纯雪地、极暗夜路都会如此。"
+                "默认只告警不排除；若要排除请确认人工看过该图",
+            )
+
+    report.stats[f"{label}_low_variance_candidates"] = n_flat
+    report.stats[f"{label}_small_image_candidates"] = n_small
+    report.stats[f"{label}_odd_aspect_candidates"] = n_aspect
+    if n_flat:
+        logger.warning(
+            "%s: %d 张图灰度方差偏低。这些**未必**是坏图（浓雾/雪地/夜路均会如此），"
+            "当前按 WARNING 处理、不排除。建议人工抽查后再决定。",
+            label, n_flat,
+        )
 
     top = size_dist.most_common(8)
     report.stats[f"{label}_size_distribution"] = {
