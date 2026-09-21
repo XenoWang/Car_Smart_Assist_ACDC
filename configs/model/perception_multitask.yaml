@@ -74,15 +74,49 @@ model:
     vehicle_detection:
       enabled: true
       type: anchor_free_single_scale
-      num_classes: 2               # 0=同向（前车）  1=对向（来车）
-      # 同向/对向的区分对「该怎么提示」至关重要：
-      # 前车距离近 -> 减速；来车距离近 -> 注意会车，两者的建议完全不同
+      #
+      # 类别 = ACDC 原生的 8 类，用 Cityscapes ID。
+      # 实测 train 集分布：car 6657 / person 1692 / truck 537 / bicycle 392 /
+      #                    motorcycle 250 / rider 227 / train 212 / bus 168
+      #
+      # 注意：「目标类别」与「前车/来车」是两个独立维度 ——
+      # 「这是不是车」和「它在同向还是对向车道」是两件事，不能塞进同一个分类头。
+      num_classes: 8
+      class_ids: [24, 25, 26, 27, 28, 31, 32, 33]   # Cityscapes ID，原生即是这些值
+      # 关于 train(31)：这是**铁路列车**，不是"训练集"的笔误。
+      # 城市驾驶场景出现 212 个实例存疑，实现阶段核对原图后决定并入还是丢弃。
+      # 见 docs/label_spec.md 4.4
+      #
+      # label_source: acdc —— ACDC v2 自带检测框（2006 张图，COCO 格式），
+      # 检测不需要跨域监督，域差异问题因此只剩「距离」一个输出维度。
+      label_source: acdc
+      #
+      # ⚠️ 方向（前车/来车）在 ACDC 里完全不存在，且 ACDC **无任何朝向/3D 信息**
+      # （标注字段仅 area/bbox/category_id/id/image_id/iscrowd/segmentation）。
+      # 所以早期写的 strategy: yaw_angle 在 ACDC 上是执行不了的 —— 那是 KITTI 的能力。
+      #
+      # 改为：从 ACDC 的视频序列**离线推导**方向标签 ——
+      # 在同一 sequence 内跟踪目标，按其横向运动判断同向还是对向。
+      # 关键：时序只用于造标签，**推理仍是单帧**，不引入 RNN，不维护帧间状态。
+      # 阈值必须人工标定后再填，见 docs/label_spec.md 4.1
+      direction:
+        enabled: true
+        source: sequence_tracking
+        num_classes: 2               # 0=同向(leading)  1=对向(oncoming)
+        unknown_label: -1            # 不参与方向损失，仍参与框回归
+        tracker:
+          min_track_len: 5           # 轨迹短于此长度不用于判方向
+          max_age: 30                # 丢失多少帧后终止轨迹
+          iou_match_threshold: 0.3
+        # ⚠️ 以下阈值必须用人工核对样本标定后填入，不要拍脑袋定一个就开训
+        lateral_shift_threshold_px: null
+        min_confidence: 0.6
+        unknown_policy: exclude_from_direction_loss
+        labels_file: data/processed/acdc/direction_labels.jsonl
       loss_weight: 0.5
       score_threshold: 0.3
       nms_iou_threshold: 0.5
       max_detections: 20
-      # 监督来源是外部数据集（KITTI 等），不是 ACDC，存在域差异，权重给低一些
-      label_source: external
 
     # 距离回归：挂在检测框上
     distance:

@@ -134,19 +134,39 @@ make check-env
 
 ### 4. 数据准备
 
+**ACDC** —— 没有免注册的下载途径，必须申请（详见 [docs/dataset.md](docs/dataset.md#51-acdc需注册申请)）：
+
+1. 在 https://acdc.vision.ee.ethz.ch/register 注册并确认邮箱
+2. 登录后同意使用条款
+3. 在 https://acdc.vision.ee.ethz.ch/packages 申请
+   `rgb_anon_trainvaltest.zip`（15.6 GB）、`gt_trainval.zip`、`gt_detection_trainval.zip`
+4. 审批通过后放到 `data/raw/acdc/`，用脚本校验 md5 并解压
+
+**KITTI** —— 免注册 AWS S3 直链：
+
 ```bash
-# 从 https://acdc.vision.ee.ethz.ch/ 注册获取 ACDC（需同意使用条款）
-python scripts/download_acdc.py --config configs/data/acdc.yaml
+BASE=https://s3.eu-central-1.amazonaws.com/avg-kitti
+cd data/raw/distance
+for f in data_object_image_2.zip data_object_label_2.zip data_object_calib.zip; do
+  curl -L -C - -O "$BASE/$f"
+done
+cd "e:/Car_Smart_Assist_ACDC"
+unzip -q 'data/raw/distance/data_object_*.zip' -d data/external/kitti
+```
 
-# 从 https://www.cvlibs.net/datasets/kitti/ 获取 KITTI，放到 data/external/kitti/
-# （用于补充距离与检测标签 —— ACDC 不提供这两类标注）
+> KITTI 只用于补充**距离**标签 —— ACDC v2 自带检测框，
+> 只有距离这一项是 ACDC 没有的。不要下 `data_object_velodyne.zip`（27.4 GB），
+> 距离可直接从 `label_2` 的 3D 位置取，用不上点云。
 
-python scripts/prepare_acdc.py         --config configs/data/acdc.yaml
+**预处理：**
+
+```bash
+python scripts/prepare_acdc.py          --config configs/data/acdc.yaml
 python scripts/build_distance_labels.py --config configs/data/distance_supplement.yaml
 python scripts/analyze_dataset.py
 ```
 
-**第 4 步不要跳过。** 先看统计数据确认数据没问题，再开训。
+**最后一步不要跳过。** 先看统计数据确认数据没问题，再开训。
 
 ### 5. 训练与评测
 
@@ -253,9 +273,14 @@ Car_Smart_Assist_ACDC/
   缓解手段与残余风险在同一文档中说明。
 - **单目测距在远处不可靠。** 有效范围标定为 2–80 m，且必须在报告里分桶呈现
   误差 —— 总体 MAE 会掩盖「近处准、远处崩」的事实。
-- **恶劣天气下的测距存在域差异退化。** 距离监督来自 KITTI/nuScenes（以晴天为主），
+- **恶劣天气下的测距存在域差异退化。** 距离监督来自 KITTI（以晴天为主），
   用于 ACDC 的雨雾雪场景时会有退化。本项目不声称在恶劣天气下达到晴天同等精度，
   并会分天气子集报告退化程度。
+- **「前车 / 来车」的方向标签是推导出来的，不是标注的。** ACDC 的检测框和
+  KITTI 的类别都不区分方向，必须由朝向角或车道几何推导（见
+  [`docs/label_spec.md`](docs/label_spec.md#41-方向推导两个数据集都不给必须自己算)）。
+  推导置信度低的目标会标为 unknown 并排除出方向损失 ——
+  方向判断错误会导致完全相反的驾驶建议，因此宁可不对方向表态。
 - **无时序建模。** 单帧推理无法获得相对速度，因此无法计算 TTC，
   策略层只能使用距离绝对值与保守先验。
 - **不覆盖的场景**：车辆机械故障、传感器遮挡、非视觉信号（交警手势、施工指示）、

@@ -1,18 +1,23 @@
 # =============================================================================
 # 数据与产物：这两类东西体积大、可再生、且可能含许可限制，一律不进版本库
 # =============================================================================
-# ACDC 数据集有使用条款，重新分发可能违规 —— 这是必须忽略 data/ 的核心理由，
+# ACDC 数据集有使用条款，重新分发可能违规 —— 这是必须忽略的核心理由，
 # 不只是「因为文件大」。
-data/raw/
-data/interim/
-data/processed/
-data/external/
+#
+# 用 `data/**` 而非逐个子目录列举：早期版本只列了 raw/interim/processed/external
+# 四个子目录，结果用户放在 data/ 根目录下的 16GB ACDC zip 不在忽略范围内，
+# 一次 `git add .` 就会把 16GB 提交进仓库。改成整体忽略，杜绝这类漏网。
+#
+# 三行的含义：
+#   data/**            忽略 data 下的一切
+#   !data/**/          但重新包含所有子目录（否则 git 无法递归进去找 .gitkeep）
+#   !data/**/.gitkeep  但重新包含 .gitkeep，保留目录骨架
+data/**
+!data/**/
 !data/**/.gitkeep
 
-artifacts/checkpoints/
-artifacts/logs/
-artifacts/predictions/
-artifacts/reports/
+artifacts/**
+!artifacts/**/
 !artifacts/**/.gitkeep
 
 # 模型权重（本地微调产物、下载的预训练权重）

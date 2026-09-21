@@ -25,12 +25,17 @@
 
 **目标**：数据能喂进模型，且口径清楚。
 
-- [ ] 下载并校验 ACDC，四个天气子集完整
+- [x] 下载并校验 KITTI（S3 直链，免注册）—— 7481 训练帧已验证
+- [ ] 注册申请并下载 ACDC 四个包，校验 md5，解压到 `data/raw/acdc/`
+- [ ] **解压后确认 ACDC 检测标注的实际格式**（类别清单、是否含 3D 信息）
+      —— 在此之前不要假定它与 KITTI 类别体系一致
 - [ ] 实现 `data/label_mapping.py`，映射到 Cityscapes 19 类
 - [ ] 按 scene 切分 train/val/test，落盘 `split.json`
 - [ ] 实现 `acdc_seg.py`，分割任务可独立跑通
-- [ ] 获取 KITTI（或 nuScenes），落到 `data/external/`
+- [ ] **实现「前车 / 来车」方向推导**（ACDC 与 KITTI 都不提供，见 `label_spec.md` 4.1）
+- [ ] **实现 KITTI `DontCare` 的排除逻辑**（占目标数 26%，当背景用会压低召回率）
 - [ ] 实现 `perception/geometry/pinhole.py` 与 `roi_depth.py`，含单元测试
+      —— 注意 ACDC(1920×1080) 与 KITTI(1224×370) 长宽比不同，内参不能共用一套
 - [ ] 实现 `build_distance_labels.py`，产出带 `valid` 标志的距离标签
 - [ ] 实现接管边界标签构造，口径写死到 `docs/handover_policy.md`
 - [ ] 跑 `analyze_dataset.py`，产出统计与抽样图
@@ -41,6 +46,9 @@
 **风险**：距离标签的构造是整个项目最大的不确定性。
 如果 KITTI 与 ACDC 的域差异大到无法接受，需要在这里就决定是否
 退回「只做分割 + 路况分类」的简化版本。**不要拖到训练之后才发现。**
+
+> 已提前消解的一项风险：ACDC v2 自带检测框，检测不必再跨域。
+> 域差异现在只影响「距离」这一个输出维度，而不是「目标在哪 + 有多远」两项。
 
 ---
 

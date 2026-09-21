@@ -19,8 +19,8 @@ data:
   root: data
 
   # --- 四个恶劣天气子集 ---
-  # 各子集样本量不均，直接混合训练会让模型偏向样本多的子集，
-  # 因此采样器必须做平衡（见 data/samplers/weather_balanced.py）
+  # 各子集样本量基本均衡（train 每类 400，val 100 或 106，test 每类 500），
+  # 但 night 的 val 多 6 张，做严格分层实验时注意这点差异
   subsets:
     - fog
     - night
@@ -28,16 +28,32 @@ data:
     - snow
 
   # --- 划分 ---
+  # 更正（解压后核实）：ACDC **自带官方 train/val/test 划分**，按 sequence 切好。
+  # 早期配置写的是「官方不提供划分，自己按 70/15/15 切」—— 那是错的。
+  #
+  # 必须用官方划分，理由：
+  #   1. 用自造划分的结果无法与已发表论文对比，项目的指标失去参照系
+  #   2. 官方划分已保证同一 sequence 不跨集合，帧间泄漏问题官方已处理
+  #   3. test 集标注官方不公开（只给 image_info），想自己切也无从评估
   split:
-    # ACDC 官方并不提供固定 train/val 划分，需要自己按 scene 切
-    # 关键约束：同一个 scene（连续视频帧）不能跨集合，否则会因帧间高度相似
-    #           导致验证指标虚高 —— 这是这类数据集最经典的泄漏源
-    strategy: by_scene
-    train: 0.70
-    val: 0.15
-    test: 0.15
-    # 划分结果落盘保存，保证每次实验用的是同一套划分，可复现
-    split_file: data/processed/acdc/split.json
+    source: official           # official | custom
+    # 官方划分的实测数量（详见 docs/dataset.md 4.1）
+    counts:
+      train: { fog: 400, night: 400, rain: 400, snow: 400 }        # 合计 1600
+      val:   { fog: 100, night: 106, rain: 100, snow: 100 }        # 合计 406
+      test:  { fog: 500, night: 500, rain: 500, snow: 500 }        # 合计 2000
+    # 正常天气参考图（train_ref / val_ref / test_ref），与恶劣天气图一一对应。
+    # 用于做跨天气泛化实验，不参与主训练
+    use_reference_images: false
+    # 有语义标注的仅 2006 张（train 1600 + val 406），test 标注官方不公开
+    annotated_counts: { train: 1600, val: 406 }
+    # 仅在 source=custom 时生效；默认不启用
+    custom:
+      strategy: by_scene
+      train: 0.70
+      val: 0.15
+      test: 0.15
+    split_file: data/processed/acdc/split.json  # 记录实际使用的划分，保证可复现
 
   # --- 图像 ---
   image:
