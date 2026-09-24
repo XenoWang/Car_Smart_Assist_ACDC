@@ -116,10 +116,13 @@ visibility:
     weight_decay: 0.0        # AE 上加 wd 会让重建变糊，反而抹掉高频信号
     optimizer: adamw
     amp: true
-    dtype: bfloat16
+    dtype: bfloat16          # bfloat16 | float16（梯度缩放）| float32；bf16 不支持时保留 GPU 改用 fp32
     # 轻微光度抖动，模拟曝光差异。**不允许**模糊/降对比度/加雾 ——
     # 把退化当增强喂进去等于教 AE「退化也是正常的」，判别力会被自己毁掉。
     augment: true
+    augmentation:
+      contrast_range: [0.9, 1.1]       # 光度对比度倍率，围绕灰度 0.5 调整
+      brightness_range: [-0.03, 0.03] # [0,1] 图像上的亮度偏移
 
     # --- 去噪自编码器（正则化，抑制过拟合）---
     # 只给**输入**加高斯噪声，重建目标仍是无噪原图。
@@ -265,4 +268,6 @@ visibility:
     gallery_size: 32
 
   # --- 设备 ---
+  # auto：检测当前 PyTorch/驱动能否使用 CUDA，有可用 GPU 时优先 CUDA，否则 CPU。
+  # 可显式设 cpu 或 cuda:0；强制 CUDA 但不可用时会报错，不会静默改用 CPU。
   device: auto

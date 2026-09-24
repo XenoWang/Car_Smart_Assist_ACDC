@@ -30,7 +30,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from car_smart_assist.perception.visibility import VisibilityTrainer, resolve_device  # noqa: E402
+from car_smart_assist.perception.visibility import VisibilityTrainer  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/model/visibility.yaml")
     p.add_argument("--epochs", type=int, default=None, help="覆盖配置中的轮数")
     p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--device", default=None, help="cpu | cuda | auto")
+    p.add_argument("--device", default=None, help="auto（优先 CUDA GPU）| cpu | cuda | cuda:0")
     p.add_argument("--log-level", default="INFO")
 
     g = p.add_mutually_exclusive_group()
@@ -84,18 +84,10 @@ def main() -> int:
 
     resume = "none" if args.fresh else args.resume
 
-    dev = resolve_device(str(cfg.get("device", "auto")))
-    print(f"设备: {dev}")
-    if dev.type == "cuda":
-        import torch
-
-        print(f"  {torch.cuda.get_device_name(0)}  "
-              f"arch_list 含 sm_120: {'sm_120' in torch.cuda.get_arch_list()}")
-
     try:
         trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
     except ValueError as exc:
-        logging.getLogger(__name__).error("无法使用当前检查点：%s", exc)
+        logging.getLogger(__name__).error("无法初始化训练设备或检查点：%s", exc)
         return 2
     if trainer.resume_path is not None:
         print(f"续训来源: {trainer.resume_path}")

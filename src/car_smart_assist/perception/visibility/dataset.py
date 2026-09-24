@@ -27,6 +27,8 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
+from car_smart_assist.config.visibility import AUGMENTATION_DEFAULTS, MODEL_DEFAULTS
+
 logger = logging.getLogger(__name__)
 
 # ACDC 目录约定（见 docs/dataset.md 4.1）
@@ -297,18 +299,36 @@ class VisibilityImageDataset(Dataset):
     def __init__(
         self,
         paths: Sequence[Path],
-        input_size: tuple[int, int] = (144, 256),
+        input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         cache_path: str | Path | None = None,
         indices: Sequence[int] | None = None,
         augment: bool = False,
+        augmentation_cfg: dict | None = None,
     ) -> None:
         self.paths = [Path(p) for p in paths]
         self.input_size = tuple(input_size)
         self.augment = augment
+        augmentation = {**AUGMENTATION_DEFAULTS, **(augmentation_cfg or {})}
+        self.contrast_range = tuple(float(v) for v in augmentation["contrast_range"])
+        self.brightness_range = tuple(float(v) for v in augmentation["brightness_range"])
+        for name, bounds in (
+            ("contrast_range", self.contrast_range),
+            ("brightness_range", self.brightness_range),
+        ):
+            if len(bounds) != 2 or not np.isfinite(bounds).all() or bounds[0] > bounds[1]:
+                raise ValueError(f"augmentation.{name} 必须为两个有限数值，且下限不大于上限")
+        if self.contrast_range[0] < 0:
+            raise ValueError("augmentation.contrast_range 不能为负数")
         self.indices = list(indices) if indices is not None else None
         self.cache_path = Path(cache_path) if cache_path is not None else None
         # 注意：这里是**每个进程各自打开**的，不是共享对象
         self._cache: np.ndarray | None = None
+
+    def __getstate__(self) -> dict:
+        """即使主进程预览过样本，spawn worker 时也只传缓存路径。"""
+        state = self.__dict__.copy()
+        state["_cache"] = None
+        return state
 
     def _cache_arr(self) -> np.ndarray | None:
         """惰性打开缓存。首次调用发生在 worker 进程内。"""
@@ -340,15 +360,17 @@ class VisibilityImageDataset(Dataset):
         # 显式拷贝而非 ascontiguousarray：
         # memmap 是只读的，torch.from_numpy 会共享内存并发出
         # 「non-writable tensor」警告；后续 div_ 又是原地操作，语义上不该写回缓存。
-        x = torch.from_numpy(np.array(img, dtype=np.float32)).div_(255.0)   # -> [0, 1]
+        # 直接拷贝成连续 CHW float32，避免先分配 HWC float32 再复制排列。
+        x = torch.from_numpy(
+            np.array(img.transpose(2, 0, 1), dtype=np.float32, order="C", copy=True)
+        ).div_(255.0)
 
         if self.augment:
             # 仅光度：轻微亮度/对比度抖动，模拟曝光差异，不改变「看得清」这一属性
-            x = (x - 0.5) * float(torch.empty(1).uniform_(0.9, 1.1)) + 0.5
-            x = x + float(torch.empty(1).uniform_(-0.03, 0.03))
-            x = x.clamp_(0.0, 1.0)
+            x.sub_(0.5).mul_(float(torch.empty(1).uniform_(*self.contrast_range))).add_(0.5)
+            x.add_(float(torch.empty(1).uniform_(*self.brightness_range))).clamp_(0.0, 1.0)
 
-        return x.permute(2, 0, 1).contiguous()                        # -> (3, H, W)
+        return x                                                   # -> (3, H, W)
 
     def path_of(self, i: int) -> Path:
         idx = self.indices[i] if self.indices is not None else i

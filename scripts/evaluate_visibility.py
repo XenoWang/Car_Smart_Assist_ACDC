@@ -42,6 +42,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from car_smart_assist.config.visibility import MODEL_DEFAULTS  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
     VisibilityScorer,
@@ -450,7 +451,7 @@ def main() -> int:
     cfg = raw.get("visibility", raw)
     dcfg, rcfg = cfg.get("data", {}), cfg.get("report", {})
 
-    size = tuple(cfg.get("model", {}).get("input_size", (144, 256)))
+    size = tuple(cfg.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
     acdc_root = root / dcfg.get("acdc_root", "data/raw/acdc")
 
     ckpt = Path(args.checkpoint) if args.checkpoint else (

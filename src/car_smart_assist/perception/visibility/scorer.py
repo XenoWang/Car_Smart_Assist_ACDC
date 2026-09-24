@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -35,13 +36,25 @@ import numpy as np
 import torch
 from PIL import Image
 
+from car_smart_assist.config.visibility import MODEL_DEFAULTS, SCORING_DEFAULTS
 from car_smart_assist.perception.visibility.autoencoder import (
     ConvAutoencoder,
     build_autoencoder,
     reconstruction_error,
+    reconstruction_mean,
 )
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=16)
+def _high_frequency_mask(height: int, width: int, cutoff: float) -> np.ndarray:
+    """缓存频域高频掩膜，避免每帧重新创建坐标网格与开方数组。"""
+    fy = (2.0 * np.fft.fftfreq(height))[:, None]
+    fx = (2.0 * np.fft.fftfreq(width))[None, :]
+    mask = np.hypot(fy, fx) > cutoff
+    mask.setflags(write=False)
+    return mask
 
 
 # =============================================================================
@@ -102,21 +115,26 @@ def compute_information_features(
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy)
     feature_cfg = (scoring_cfg or {}).get("features", {})
-    edge_threshold = float(feature_cfg.get("edge_gradient_threshold", 0.04))
+    edge_threshold = float(feature_cfg.get(
+        "edge_gradient_threshold", SCORING_DEFAULTS["features"]["edge_gradient_threshold"]
+    ))
     edge_density = float((mag > edge_threshold).mean())
 
     # --- 高频能量占比 ---
     # 用径向掩膜把频谱分成低频(内 50% 半径)与高频(外 50%)两部分。
     # 雾、雨、模糊、黑暗的共同效应就是高频塌陷 —— 这是四类退化里最一致的信号。
-    f = np.fft.fftshift(np.fft.fft2(gray - gray.mean()))
+    f = np.fft.fft2(gray - gray.mean())
     power = np.abs(f) ** 2
     h, w = gray.shape
-    cy, cx = h // 2, w // 2
-    yy, xx = np.ogrid[:h, :w]
-    radius = np.sqrt(((yy - cy) / max(h / 2, 1)) ** 2 + ((xx - cx) / max(w / 2, 1)) ** 2)
     total = power.sum()
-    hf_cutoff = float(feature_cfg.get("hf_cutoff_ratio", 0.50))
-    hf_ratio = float(power[radius > hf_cutoff].sum() / total) if total > 0 else 0.0
+    hf_cutoff = float(feature_cfg.get("hf_cutoff_ratio", SCORING_DEFAULTS["features"]["hf_cutoff_ratio"]))
+    if total > 0:
+        high_frequency = np.sum(
+            power, where=_high_frequency_mask(h, w, hf_cutoff)
+        )
+        hf_ratio = float(high_frequency / total)
+    else:
+        hf_ratio = 0.0
 
     return InformationFeatures(
         contrast=contrast,
@@ -160,7 +178,7 @@ class VisibilityScore:
 # =============================================================================
 
 # 参考尺度。取值来自对 ACDC 全量的实测分位数（见 configs/model/visibility.yaml
-# 的 calibration 段），不是拍脑袋定的。改这里要同步改配置与报告。
+# 的标定说明）。兼容默认值集中在 config/visibility.py，运行参数在 YAML 调整。
 #
 # ⚠️ 单位约定（这里踩过一次坑，务必看清）：
 #   compute_information_features 会先把图像归一化到 [0, 1] 再算特征，
@@ -169,12 +187,7 @@ class VisibilityScore:
 #   早期版本误按 0-255 量纲填了 64.0，导致 contrast 归一化后恒为 ~0.004，
 #   几何平均被整体拽到接近 0 —— 所有图的信息量分数一起塌陷、阈值全线失效，
 #   而表面上不会报任何错。tests/unit/test_visibility.py 里有针对这一点的测试。
-_FEATURE_SCALES: dict[str, float] = {
-    "contrast": 0.25,       # 灰度标准差，[0,1] 量纲；ACDC 中位数约 0.24
-    "entropy": 8.0,         # 灰度直方图熵，[0,1] 灰度下理论上界为 8（log2 256）
-    "edge_density": 0.15,   # 边缘像素占比，本身即 [0,1] 比例
-    "hf_ratio": 0.05,       # 高频能量占比，本身即 [0,1] 比例
-}
+_FEATURE_SCALES: dict[str, float] = dict(SCORING_DEFAULTS["feature_scales"])
 
 
 def normalize_features(
@@ -199,18 +212,13 @@ def normalize_features(
 #   edge_density  0.25  模糊的主判据（且分级良好：0.759→0.135）
 #   hf_ratio      0.10  仅作辅助。它**在轻度模糊时就饱和**（0.25~1.0 强度下
 #                       恒为 0.024），不具备分级能力，因此不给高权重
-_INFO_WEIGHTS: dict[str, float] = {
-    "contrast": 0.40,
-    "entropy": 0.25,
-    "edge_density": 0.25,
-    "hf_ratio": 0.10,
-}
+_INFO_WEIGHTS: dict[str, float] = dict(SCORING_DEFAULTS["aggregation"]["weights"])
 # 广义平均的阶数：p<0 时趋近最小值
-_INFO_P: float = -1.0
+_INFO_P: float = SCORING_DEFAULTS["aggregation"]["power"]
 # 单维下限。防止某一维取到接近 0 时在 p<0 的幂运算中绝对支配总分 ——
 # 那会让「一个饱和的噪声维度」把分数钉死，反而制造误报。
 # 取 0.10 的含义：任何一维最多只能把总分压到约 1/(0.1·w) 的量级。
-_INFO_EPS: float = 0.10
+_INFO_EPS: float = SCORING_DEFAULTS["aggregation"]["feature_floor"]
 
 
 def information_score(
@@ -306,7 +314,7 @@ class VisibilityScorer:
         model: ConvAutoencoder,
         calibration: CalibrationStats | None = None,
         device: str | torch.device = "cpu",
-        input_size: tuple[int, int] = (144, 256),
+        input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         scoring_cfg: dict[str, Any] | None = None,
     ) -> None:
         self.model = model.to(device).eval()
@@ -346,24 +354,30 @@ class VisibilityScorer:
             model,
             calibration,
             device=device,
-            input_size=tuple(model_cfg.get("input_size", (144, 256))),
+            input_size=tuple(model_cfg.get("input_size", MODEL_DEFAULTS["input_size"])),
             scoring_cfg=effective_scoring_cfg,
         )
 
     # --- 打分 ---
 
-    def _to_tensor(self, img: np.ndarray) -> torch.Tensor:
-        # 显式拷贝而非 ascontiguousarray：来自 memmap 的数组是只读的，
-        # torch.from_numpy 会共享内存并抛出 non-writable tensor 警告，
-        # 而随后的 div_ 是原地操作。dataset.py 里有同样处理。
-        x = torch.from_numpy(np.array(img, dtype=np.float32)).div_(255.0)
-        return x.permute(2, 0, 1).unsqueeze(0).to(self.device)
+    def _to_tensor_batch(self, images: Sequence[np.ndarray]) -> torch.Tensor:
+        """一次完成 batch 堆叠、通道转换、类型转换和设备传输。"""
+        # np.stack 会生成可写的 uint8 连续数组；随后在一次 dtype/内存格式
+        # 转换中直接得到 NCHW float32，避免逐图分配张量再 torch.cat。
+        batch = np.stack(images, axis=0)
+        x = torch.from_numpy(batch).permute(0, 3, 1, 2).to(
+            dtype=torch.float32, memory_format=torch.contiguous_format
+        )
+        x.div_(255.0)
+        return x.to(self.device)
 
     @torch.no_grad()
     def score_tensors(self, x: torch.Tensor) -> list[tuple[float, float]]:
         """对一批张量算 (recon_mean, recon_p90_block)。"""
         block_grid = tuple(
-            self.scoring_cfg.get("reconstruction_error", {}).get("block_grid", (3, 3))
+            self.scoring_cfg.get("reconstruction_error", {}).get(
+                "block_grid", SCORING_DEFAULTS["reconstruction_error"]["block_grid"]
+            )
         )
         errs = reconstruction_error(self.model, x.to(self.device), block_grid=block_grid)
         return [(e.mean, e.p90_block) for e in errs]
@@ -372,7 +386,7 @@ class VisibilityScorer:
         """对一组已解码的 (H,W,3) uint8 数组打分。"""
         if not images:
             return []
-        batch = torch.cat([self._to_tensor(im) for im in images], dim=0)
+        batch = self._to_tensor_batch(images)
         recon = self.score_tensors(batch)
 
         cal = self.calibration
@@ -411,10 +425,10 @@ class VisibilityScorer:
 
     def calibrate(self, images: Sequence[np.ndarray]) -> CalibrationStats:
         """用一组正常天气图重新计算校准统计。"""
-        recon = self.score_tensors(
-            torch.cat([self._to_tensor(im) for im in images], dim=0)
-        )
-        vals = np.array([m for m, _ in recon], dtype=np.float64)
+        if not images:
+            raise ValueError("校准至少需要一张正常天气参考图")
+        means = reconstruction_mean(self.model, self._to_tensor_batch(images))
+        vals = np.asarray(means.cpu().tolist(), dtype=np.float64)
         stats = CalibrationStats(
             mean=float(vals.mean()),
             std=float(vals.std()),

@@ -53,14 +53,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-DEFAULT_KERNEL_SIZES: tuple[int, ...] = (3, 5, 7)
+from car_smart_assist.config.visibility import MODEL_DEFAULTS, SCORING_DEFAULTS
+
+DEFAULT_KERNEL_SIZES: tuple[int, ...] = MODEL_DEFAULTS["kernel_sizes"]
 
 
 class MultiScaleBlock(nn.Module):
@@ -111,7 +114,7 @@ class MultiScaleBlock(nn.Module):
         kernel_sizes: Sequence[int] = DEFAULT_KERNEL_SIZES,
         dilations: Sequence[int] | None = None,
         stride: int = 2,
-        use_bottleneck: bool = True,
+        use_bottleneck: bool = MODEL_DEFAULTS["use_bottleneck"],
     ) -> None:
         super().__init__()
         self.kernel_sizes = tuple(kernel_sizes)
@@ -154,7 +157,7 @@ class MultiScaleBlock(nn.Module):
                 dilation=d,
                 bias=False,
             )
-            for k, d in zip(self.kernel_sizes, self.dilations)
+            for k, d in zip(self.kernel_sizes, self.dilations, strict=True)
         )
 
         fused_in = branch_ch * n_branch
@@ -203,15 +206,15 @@ class ConvAutoencoder(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 3,
-        base_channels: int = 32,
-        latent_dim: int = 256,
-        input_size: tuple[int, int] = (144, 256),
-        encoder_type: str = "multiscale",
+        in_channels: int = MODEL_DEFAULTS["in_channels"],
+        base_channels: int = MODEL_DEFAULTS["base_channels"],
+        latent_dim: int = MODEL_DEFAULTS["latent_dim"],
+        input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
+        encoder_type: str = MODEL_DEFAULTS["encoder_type"],
         kernel_sizes: Sequence[int] = DEFAULT_KERNEL_SIZES,
         dilations: Sequence[int] | None = None,
-        use_bottleneck: bool = True,
-        pre_latent_channels: int = 32,
+        use_bottleneck: bool = MODEL_DEFAULTS["use_bottleneck"],
+        pre_latent_channels: int = MODEL_DEFAULTS["pre_latent_channels"],
     ) -> None:
         super().__init__()
         self.input_size = tuple(input_size)
@@ -340,10 +343,18 @@ class ReconstructionError:
 
 
 @torch.no_grad()
+def reconstruction_mean(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    """返回 batch 每张图的逐像素重建 MSE，不计算分块分位数等附加统计。"""
+    model.eval()
+    recon = model(x)
+    return F.mse_loss(recon, x, reduction="none").mean(dim=(1, 2, 3))
+
+
+@torch.no_grad()
 def reconstruction_error(
     model: ConvAutoencoder,
     x: torch.Tensor,
-    block_grid: tuple[int, int] = (3, 3),
+    block_grid: tuple[int, int] = SCORING_DEFAULTS["reconstruction_error"]["block_grid"],
 ) -> list[ReconstructionError]:
     """计算一批图像的重建误差。
 
@@ -360,23 +371,19 @@ def reconstruction_error(
     recon = model(x)
     # (B, 1, H, W)：先对通道取平均，保证误差量纲与颜色无关
     err = F.mse_loss(recon, x, reduction="none").mean(dim=1, keepdim=True)
+    if err.shape[0] == 0:
+        return []
 
-    out: list[ReconstructionError] = []
-    b, _, h, w = err.shape
-    for i in range(b):
-        e = err[i, 0]
-        gh, gw = block_grid
-        # 用自适应池化做分块：块大小不整除时自动取整，且比手工切片快
-        blocks = F.adaptive_avg_pool2d(e.view(1, 1, h, w), (gh, gw)).flatten()
-        out.append(
-            ReconstructionError(
-                mean=float(e.mean()),
-                p90_block=float(torch.quantile(blocks, 0.9)) if blocks.numel() > 1 else float(blocks[0]),
-                max_block=float(blocks.max()),
-                std_block=float(blocks.std()) if blocks.numel() > 1 else 0.0,
-            )
-        )
-    return out
+    gh, gw = block_grid
+    # 整个 batch 一次池化和统计。逐张转 float 会在 GPU 上触发多次同步；
+    # 向量化后只把四列统计量一次性拷回 CPU。
+    blocks = F.adaptive_avg_pool2d(err, (gh, gw)).flatten(1)
+    means = err.mean(dim=(1, 2, 3))
+    p90 = torch.quantile(blocks, 0.9, dim=1)
+    maxima = blocks.max(dim=1).values
+    stds = blocks.std(dim=1) if blocks.shape[1] > 1 else torch.zeros_like(means)
+    rows = torch.stack((means, p90, maxima, stds), dim=1).cpu().tolist()
+    return [ReconstructionError(*(float(value) for value in row)) for row in rows]
 
 
 def effective_kernel_size(kernel_sizes: Sequence[int], dilations: Sequence[int]) -> tuple[int, ...]:
@@ -385,19 +392,22 @@ def effective_kernel_size(kernel_sizes: Sequence[int], dilations: Sequence[int])
     用于在报告与日志里说明「这一组配置实际看多大范围」，
     避免只看 kernel_sizes 而误判感受野。
     """
-    return tuple(d * (k - 1) + 1 for k, d in zip(kernel_sizes, dilations))
+    return tuple(
+        d * (k - 1) + 1 for k, d in zip(kernel_sizes, dilations, strict=True)
+    )
 
 
 def build_autoencoder(cfg: dict[str, Any]) -> ConvAutoencoder:
     """按配置构建 AE。配置项见 configs/model/visibility.yaml。"""
+    cfg = {**MODEL_DEFAULTS, **cfg}
     return ConvAutoencoder(
-        in_channels=int(cfg.get("in_channels", 3)),
-        base_channels=int(cfg.get("base_channels", 32)),
-        latent_dim=int(cfg.get("latent_dim", 256)),
-        input_size=tuple(cfg.get("input_size", (144, 256))),
-        encoder_type=str(cfg.get("encoder_type", "multiscale")),
-        kernel_sizes=tuple(cfg.get("kernel_sizes", DEFAULT_KERNEL_SIZES)),
+        in_channels=int(cfg["in_channels"]),
+        base_channels=int(cfg["base_channels"]),
+        latent_dim=int(cfg["latent_dim"]),
+        input_size=tuple(cfg["input_size"]),
+        encoder_type=str(cfg["encoder_type"]),
+        kernel_sizes=tuple(cfg["kernel_sizes"]),
         dilations=tuple(cfg["dilations"]) if cfg.get("dilations") is not None else None,
-        use_bottleneck=bool(cfg.get("use_bottleneck", True)),
-        pre_latent_channels=int(cfg.get("pre_latent_channels", 32)),
+        use_bottleneck=bool(cfg["use_bottleneck"]),
+        pre_latent_channels=int(cfg["pre_latent_channels"]),
     )

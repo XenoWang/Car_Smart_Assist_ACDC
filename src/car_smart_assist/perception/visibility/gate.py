@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from car_smart_assist.config.visibility import GATE_DEFAULTS
 from car_smart_assist.perception.visibility.scorer import VisibilityScore
 
 logger = logging.getLogger(__name__)
@@ -49,13 +50,13 @@ class GateThresholds:
     """判定阈值。默认值需用真实数据标定，见 configs/model/visibility.yaml。"""
 
     # 信息量分数低于此值 -> 直接判 BLIND（画面里几乎没有可用信息）
-    info_blind: float = 0.34
+    info_blind: float = GATE_DEFAULTS["thresholds"]["info_blind"]
     # 信息量分数低于此值 -> 至少判 DEGRADED
-    info_degraded: float = 0.50
+    info_degraded: float = GATE_DEFAULTS["thresholds"]["info_degraded"]
     # 重建 z 分数高于此值 -> 至少判 DEGRADED
-    z_degraded: float = 3.0
+    z_degraded: float = GATE_DEFAULTS["thresholds"]["z_degraded"]
     # 重建 z 分数高于此值**且**信息量低于 info_degraded -> 判 BLIND
-    z_blind: float = 8.0
+    z_blind: float = GATE_DEFAULTS["thresholds"]["z_blind"]
 
     # ⚠️ 是否用重建误差参与判定。**默认关闭**，这是实测结论，不是保守设置。
     #
@@ -78,16 +79,16 @@ class GateThresholds:
     # 所以现在判定只依赖信息量特征，重建误差仍然计算并写进报告供人工观察，
     # 但不参与决策。要重新启用需先证明它在新模型上具备判别力 ——
     # 见 scripts/evaluate_visibility.py 输出的逐组 recon_z 分布。
-    use_recon_z: bool = False
+    use_recon_z: bool = GATE_DEFAULTS["thresholds"]["use_recon_z"]
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> GateThresholds:
         return cls(
-            info_blind=float(cfg.get("info_blind", 0.34)),
-            info_degraded=float(cfg.get("info_degraded", 0.50)),
-            z_degraded=float(cfg.get("z_degraded", 3.0)),
-            z_blind=float(cfg.get("z_blind", 8.0)),
-            use_recon_z=bool(cfg.get("use_recon_z", False)),
+            info_blind=float(cfg.get("info_blind", cls.info_blind)),
+            info_degraded=float(cfg.get("info_degraded", cls.info_degraded)),
+            z_degraded=float(cfg.get("z_degraded", cls.z_degraded)),
+            z_blind=float(cfg.get("z_blind", cls.z_blind)),
+            use_recon_z=bool(cfg.get("use_recon_z", cls.use_recon_z)),
         )
 
 
@@ -100,7 +101,7 @@ class VisibilityVerdict:
     triggered: list[str] = field(default_factory=list)
     information: float = float("nan")
     recon_z: float = float("nan")
-    degraded_confidence_multiplier: float = 0.6
+    degraded_confidence_multiplier: float = GATE_DEFAULTS["degraded_confidence_multiplier"]
     # 供上游日志与人工复核：完整的打分明细
     score: VisibilityScore | None = None
 
@@ -145,8 +146,8 @@ class VisibilityGate:
     def __init__(
         self,
         thresholds: GateThresholds | None = None,
-        require_calibration: bool = True,
-        degraded_confidence_multiplier: float = 0.6,
+        require_calibration: bool = GATE_DEFAULTS["require_calibration"],
+        degraded_confidence_multiplier: float = GATE_DEFAULTS["degraded_confidence_multiplier"],
     ) -> None:
         self.thresholds = thresholds or GateThresholds()
         self.require_calibration = require_calibration
@@ -158,9 +159,9 @@ class VisibilityGate:
     def from_config(cls, cfg: dict[str, Any]) -> VisibilityGate:
         return cls(
             thresholds=GateThresholds.from_config(cfg.get("thresholds", {})),
-            require_calibration=bool(cfg.get("require_calibration", True)),
+            require_calibration=bool(cfg.get("require_calibration", GATE_DEFAULTS["require_calibration"])),
             degraded_confidence_multiplier=float(
-                cfg.get("degraded_confidence_multiplier", 0.6)
+                cfg.get("degraded_confidence_multiplier", GATE_DEFAULTS["degraded_confidence_multiplier"])
             ),
         )
 

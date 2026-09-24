@@ -64,6 +64,7 @@ from PIL import Image
 
 from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
+from car_smart_assist.config.visibility import MODEL_DEFAULTS
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
     VisibilityLevel,
@@ -139,7 +140,7 @@ class InferencePipeline:
         gate: VisibilityGate | None = None,
         generator: AdvisoryGenerator | None = None,
         predictor: Any | None = None,
-        gate_input_size: tuple[int, int] = (144, 256),
+        gate_input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         cfg: dict[str, Any] | None = None,
     ) -> None:
         self.scorer = scorer
@@ -178,7 +179,7 @@ class InferencePipeline:
         root = Path(project_root)
         tcfg = visibility_cfg.get("train", {})
         model_cfg = visibility_cfg.get("model", {})
-        size = tuple(model_cfg.get("input_size", (144, 256)))
+        size = tuple(model_cfg.get("input_size", MODEL_DEFAULTS["input_size"]))
 
         ckpt = (
             Path(checkpoint)
@@ -193,8 +194,9 @@ class InferencePipeline:
             scorer = VisibilityScorer.from_checkpoint(
                 ckpt, device=resolve_device(device or str(visibility_cfg.get("device", "auto"))),
                 cfg=model_cfg,
-                scoring_cfg=visibility_cfg.get("scoring", {}),
+                scoring_cfg=visibility_cfg.get("scoring"),
             )
+            size = scorer.input_size
             logger.info("能见度门控已接入: %s", ckpt)
         elif require_visibility:
             raise FileNotFoundError(
@@ -254,6 +256,8 @@ class InferencePipeline:
         self, images: Sequence[np.ndarray | Image.Image | str | Path]
     ) -> list[PipelineResult]:
         """批量推理。门控阶段真正批量执行；感知阶段按 predictor 的接口走。"""
+        if len(images) == 0:
+            return []
         arrays = [_to_array(im) for im in images]
         results = [PipelineResult() for _ in arrays]
 
@@ -277,10 +281,13 @@ class InferencePipeline:
                 r.skipped["gate"] = "未接入能见度门控（scorer 为 None）"
         elif not verdicts:
             for r in results:
-                r.skipped["gate"] = "门控未产出结果"
+                r.skipped.setdefault("gate", "门控未产出结果")
 
         # --- ② 感知（仅对未被阻断的帧）---
         for i, r in enumerate(results):
+            if self.scorer is not None and "gate" in r.skipped:
+                r.skipped["perception"] = "能见度门控失败，已跳过感知"
+                continue
             if r.blocked:
                 r.skipped["perception"] = "能见度判定为 BLIND，感知结果不可信，已跳过"
                 r.skipped["advisory_perception_path"] = "同上"

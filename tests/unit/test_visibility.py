@@ -35,6 +35,7 @@ from car_smart_assist.perception.visibility import (
 from car_smart_assist.perception.visibility.autoencoder import (
     DEFAULT_KERNEL_SIZES,
     effective_kernel_size,
+    reconstruction_mean,
 )
 from car_smart_assist.perception.visibility.dataset import (
     VisibilityImageDataset,
@@ -809,6 +810,45 @@ class TestReconstructionError:
         e = reconstruction_error(Identity(), torch.rand(1, 3, 144, 256))[0]
         assert e.mean == pytest.approx(0.0, abs=1e-9)
 
+    def test_reconstruction_mean_matches_per_image_mse(self):
+        class ScaledIdentity(torch.nn.Module):
+            def forward(self, x):
+                return x * 0.8
+
+        x = torch.rand(4, 3, 31, 47)
+        actual = reconstruction_mean(ScaledIdentity(), x)
+        expected = torch.nn.functional.mse_loss(
+            x * 0.8, x, reduction="none"
+        ).mean(dim=(1, 2, 3))
+        torch.testing.assert_close(actual, expected)
+
+    def test_vectorized_stats_match_per_sample_reference(self):
+        class ScaledIdentity(torch.nn.Module):
+            def forward(self, x):
+                return x * 0.8
+
+        x = torch.rand(3, 3, 31, 47)
+        actual = reconstruction_error(ScaledIdentity(), x, block_grid=(2, 3))
+        err = torch.nn.functional.mse_loss(x * 0.8, x, reduction="none").mean(1)
+        expected = []
+        for image_error in err:
+            blocks = torch.nn.functional.adaptive_avg_pool2d(
+                image_error[None, None], (2, 3)
+            ).flatten()
+            expected.append(
+                (
+                    float(image_error.mean()),
+                    float(torch.quantile(blocks, 0.9)),
+                    float(blocks.max()),
+                    float(blocks.std()),
+                )
+            )
+        for got, want in zip(actual, expected, strict=True):
+            assert got.mean == pytest.approx(want[0])
+            assert got.p90_block == pytest.approx(want[1])
+            assert got.max_block == pytest.approx(want[2])
+            assert got.std_block == pytest.approx(want[3])
+
 
 # ---------------------------------------------------------------------------
 # 信息量特征
@@ -894,6 +934,25 @@ class TestInformationFeatures:
             scoring_cfg={"aggregation": {"feature_floor": 0.9}},
         )
         assert score == pytest.approx(0.9)
+
+    def test_frequency_mask_matches_shifted_reference(self):
+        image = structured_image(31, 47)
+        gray = (image.astype(np.float32) / 255.0) @ np.array(
+            [0.299, 0.587, 0.114], dtype=np.float32
+        )
+        shifted = np.fft.fftshift(np.fft.fft2(gray - gray.mean()))
+        power = np.abs(shifted) ** 2
+        h, w = gray.shape
+        cy, cx = h // 2, w // 2
+        yy, xx = np.ogrid[:h, :w]
+        radius = np.sqrt(
+            ((yy - cy) / max(h / 2, 1)) ** 2
+            + ((xx - cx) / max(w / 2, 1)) ** 2
+        )
+        expected = power[radius > 0.5].sum() / power.sum()
+
+        actual = compute_information_features(image).hf_ratio
+        assert actual == pytest.approx(float(expected), abs=1e-7)
 
 
 # ---------------------------------------------------------------------------

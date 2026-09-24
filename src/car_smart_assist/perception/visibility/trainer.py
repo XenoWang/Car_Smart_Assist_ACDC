@@ -46,9 +46,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+from car_smart_assist.config.visibility import MODEL_DEFAULTS, training_config
 from car_smart_assist.perception.visibility.autoencoder import (
     build_autoencoder,
-    reconstruction_error,
+    reconstruction_mean,
 )
 from car_smart_assist.perception.visibility.dataset import VisibilityImageDataset
 from car_smart_assist.perception.visibility.scorer import CalibrationStats
@@ -85,10 +86,33 @@ class TrainHistory:
 
 
 def resolve_device(spec: str = "auto") -> torch.device:
-    """把配置里的设备描述解析成 torch.device。"""
-    if spec == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(spec)
+    """auto 优先使用当前 PyTorch 可用的 CUDA GPU；显式 CUDA 不可用时明确报错。"""
+    spec = str(spec).strip().lower()
+    automatic = spec == "auto"
+    if automatic:
+        if not torch.cuda.is_available():
+            logger.warning(
+                "CUDA 不可用，自动使用 CPU（PyTorch=%s，CUDA runtime=%s）。"
+                "GPU 训练需要当前 .venv 中的 CUDA 版 PyTorch 和可用的 NVIDIA 驱动。",
+                torch.__version__, torch.version.cuda,
+            )
+            return torch.device("cpu")
+        spec = "cuda"
+    device = torch.device(spec)
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("指定了 CUDA，但当前 .venv 的 PyTorch 无可用 CUDA GPU；请检查驱动和 PyTorch，或使用 device=auto/cpu")
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        count = torch.cuda.device_count()
+        if index >= count:
+            raise ValueError(f"指定了 cuda:{index}，但当前仅检测到 {count} 个 CUDA GPU")
+        logger.info(
+            "训练/推理设备: cuda:%d — %s（PyTorch CUDA %s）",
+            index, torch.cuda.get_device_name(index), torch.version.cuda,
+        )
+    else:
+        logger.info("训练/推理设备: %s（显式配置）", device)
+    return device
 
 
 def _atomic_save(payload: dict[str, Any], path: Path) -> None:
@@ -174,6 +198,8 @@ class VisibilityTrainer:
         self.resume_path = resolve_resume_spec(resume, self.ckpt_dir)
         self.history = TrainHistory()
         self.calibration: CalibrationStats | None = None
+        self.scaler: torch.amp.GradScaler | None = None
+        self._pending_scaler_state: dict | None = None
         self.split_signature: str | None = None
         # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
@@ -241,7 +267,7 @@ class VisibilityTrainer:
                 "请先确认 ACDC 已解压，见 docs/dataset.md 5.1"
             )
 
-        size = tuple(self.model_cfg.get("input_size", (144, 256)))
+        size = tuple(self.model_cfg.get("input_size", MODEL_DEFAULTS["input_size"]))
         cache_name = dcfg.get("cache_path")
         cache_path = (self.root / cache_name) if cache_name else None
 
@@ -284,8 +310,10 @@ class VisibilityTrainer:
         ).hexdigest()
 
         # 只有训练子集做增强。验证和校准均使用原图，保持评价口径一致。
+        tcfg = training_config(self.cfg.get("train", {}))
         train_ds = VisibilityImageDataset(
-            paths, size, cache_path=cache_path, indices=train_idx, augment=True
+            paths, size, cache_path=cache_path, indices=train_idx,
+            augment=bool(tcfg["augment"]), augmentation_cfg=tcfg.get("augmentation"),
         )
         val_ds = VisibilityImageDataset(
             paths, size, cache_path=cache_path, indices=val_idx, augment=False
@@ -326,6 +354,7 @@ class VisibilityTrainer:
             "scoring_cfg": self.scoring_cfg,
             "optimizer_state": opt.state_dict() if opt is not None else None,
             "scheduler_state": sched.state_dict() if sched is not None else None,
+            "scaler_state": self.scaler.state_dict() if self.scaler is not None else None,
             "epoch": epoch,
             "history": self.history.to_dict(),
             "train_loss": self.history.train_loss,
@@ -337,6 +366,7 @@ class VisibilityTrainer:
             "config_snapshot": {
                 "data": self.cfg.get("data", {}),
                 "model": self.model_cfg,
+                "train": training_config(self.cfg.get("train", {})),
             },
             "split_signature": self.split_signature,
         }
@@ -344,7 +374,8 @@ class VisibilityTrainer:
     def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
-        ckpt = torch.load(self.resume_path, map_location=self.device, weights_only=False)
+        # 模型和优化器的 load_state_dict 负责迁移，避免完整检查点先占用显存。
+        ckpt = torch.load(self.resume_path, map_location="cpu", weights_only=False)
 
         if ckpt.get("split_signature") != self.split_signature:
             raise ValueError(
@@ -353,6 +384,7 @@ class VisibilityTrainer:
             )
 
         self.model.load_state_dict(ckpt["model_state"])
+        self._pending_scaler_state = ckpt.get("scaler_state")
         if ckpt.get("optimizer_state") is not None:
             opt.load_state_dict(ckpt["optimizer_state"])
         else:
@@ -382,13 +414,13 @@ class VisibilityTrainer:
 
     def fit(self) -> TrainHistory:
         """执行无监督训练（必要时先恢复已有检查点）。"""
-        tcfg = self.cfg.get("train", {})
+        tcfg = training_config(self.cfg.get("train", {}))
         dcfg = self.cfg.get("data", {})
         # test 子集不在训练里构建 —— 它只由评估脚本使用
         train_ds, val_ds, calib_ds, _ = self._build_datasets()
 
         nw = int(dcfg.get("num_workers", 4))
-        bs = int(tcfg.get("batch_size", 32))
+        bs = int(tcfg["batch_size"])
         train_loader = DataLoader(
             train_ds, batch_size=bs, shuffle=True, num_workers=nw,
             pin_memory=self.device.type == "cuda", drop_last=False,
@@ -402,13 +434,15 @@ class VisibilityTrainer:
             pin_memory=self.device.type == "cuda",
         )
 
+        if str(tcfg["optimizer"]).lower() != "adamw":
+            raise ValueError("当前能见度训练仅支持 optimizer=adamw")
         opt = torch.optim.AdamW(
             self.model.parameters(),
-            lr=float(tcfg.get("lr", 1e-3)),
-            weight_decay=float(tcfg.get("weight_decay", 0.0)),
+            lr=float(tcfg["lr"]),
+            weight_decay=float(tcfg["weight_decay"]),
         )
 
-        epochs = int(tcfg.get("epochs", 40))
+        epochs = int(tcfg["epochs"])
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, epochs))
 
         # --- 恢复 ---
@@ -428,18 +462,32 @@ class VisibilityTrainer:
             elif tcfg.get("resume_extra_epochs"):
                 epochs = start_epoch + int(tcfg["resume_extra_epochs"])
 
-        use_amp = bool(tcfg.get("amp", True)) and self.device.type == "cuda"
-        amp_dtype = torch.bfloat16 if str(tcfg.get("dtype", "bfloat16")) == "bfloat16" else torch.float16
-        clip = float(tcfg.get("grad_clip_norm", 1.0))
+        use_amp = bool(tcfg["amp"]) and self.device.type == "cuda"
+        dtype = str(tcfg["dtype"])
+        if dtype not in ("bfloat16", "float16", "float32"):
+            raise ValueError("train.dtype 可选 bfloat16 / float16 / float32")
+        amp_dtype = torch.bfloat16 if dtype == "bfloat16" else torch.float16
+        if dtype == "float32":
+            use_amp = False
+        if use_amp and dtype == "bfloat16":
+            with torch.cuda.device(self.device):
+                if not torch.cuda.is_bf16_supported():
+                    logger.warning("当前 GPU 不支持 bfloat16，继续使用 GPU float32 训练")
+                    use_amp = False
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp and dtype == "float16")
+        if scaler.is_enabled() and self._pending_scaler_state:
+            scaler.load_state_dict(self._pending_scaler_state)
+        self.scaler = scaler
+        clip = float(tcfg["grad_clip_norm"])
         # 去噪自编码器：只给**输入**加噪，重建目标仍是无噪的原图。
         # 这是重建类任务上最有效的正则化手段之一，且不像 weight decay 那样
         # 把输出推向「保守的模糊均值」（那会恰好抹掉我们要检测的高频信号）。
-        denoise_sigma = float(tcfg.get("denoise_sigma", 0.0))
+        denoise_sigma = float(tcfg["denoise_sigma"])
         if denoise_sigma > 0:
             logger.info("去噪自编码器已启用：输入加高斯噪声 sigma=%.3f（目标保持干净）", denoise_sigma)
-        es = tcfg.get("early_stopping", {})
-        patience = int(es.get("patience", 8)) if es.get("enabled", True) else epochs
-        min_delta = float(es.get("min_delta", 1e-5))
+        es = tcfg["early_stopping"]
+        patience = int(es["patience"]) if es["enabled"] else epochs
+        min_delta = float(es["min_delta"])
 
         last_path = self.ckpt_dir / "last.pt"
         best_path = self.ckpt_dir / "best.pt"
@@ -459,7 +507,8 @@ class VisibilityTrainer:
         since_best = 0
         for epoch in range(start_epoch + 1, epochs + 1):
             self.model.train()
-            run, n = 0.0, 0
+            run = torch.zeros((), dtype=torch.float64, device=self.device)
+            n = 0
             for x in train_loader:
                 clean = x.to(self.device, non_blocking=True)
                 # 去噪目标：输入被污染，重建目标仍是 clean
@@ -472,15 +521,19 @@ class VisibilityTrainer:
                 ):
                     recon = self.model(noisy)
                     loss = nn.functional.mse_loss(recon.float(), clean.float())
-                loss.backward()
+                scaler.scale(loss).backward()
                 if clip > 0:
+                    scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
                 batch_n = len(clean)
-                run += float(loss.detach()) * batch_n
+                run.add_(loss.detach().to(torch.float64), alpha=batch_n)
                 n += batch_n
+            if n == 0:
+                raise ValueError("训练数据为空，无法计算训练损失")
             sched.step()
-            train_loss = run / max(n, 1)
+            train_loss = float(run) / n
             self.history.train_loss.append(train_loss)
 
             val_loss = self._eval_loss(val_loader)
@@ -515,14 +568,12 @@ class VisibilityTrainer:
 
         # 回滚到验证集选出的最优权重，再用独立校准集计算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
-        if best_path.exists():
-            ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
-            self.model.load_state_dict(ckpt["model_state"])
-            logger.info("已回滚到 epoch %d 的最优权重", ckpt.get("epoch", -1))
+        best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
+        self.model.load_state_dict(best_payload["model_state"])
+        logger.info("已回滚到 epoch %d 的最优权重", best_payload.get("epoch", -1))
         self.model.to(self.device).eval()
         self.calibration = self._calibrate(calib_loader)
 
-        best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
         best_payload["scoring_cfg"] = self.scoring_cfg
         best_payload["calibration"] = self.calibration.to_dict()
         best_payload["history"] = self.history.to_dict()
@@ -538,13 +589,17 @@ class VisibilityTrainer:
     @torch.no_grad()
     def _eval_loss(self, loader: DataLoader) -> float:
         self.model.eval()
-        run, n = 0.0, 0
+        run = torch.zeros((), dtype=torch.float64, device=self.device)
+        n = 0
         for x in loader:
             x = x.to(self.device, non_blocking=True)
             batch_n = len(x)
-            run += float(nn.functional.mse_loss(self.model(x).float(), x.float())) * batch_n
+            loss = nn.functional.mse_loss(self.model(x).float(), x.float())
+            run.add_(loss.to(torch.float64), alpha=batch_n)
             n += batch_n
-        return run / max(n, 1)
+        if n == 0:
+            raise ValueError("验证数据为空，无法计算验证损失")
+        return float(run) / n
 
     @torch.no_grad()
     def _calibrate(self, loader: DataLoader) -> CalibrationStats:
@@ -552,13 +607,8 @@ class VisibilityTrainer:
         self.model.eval()
         vals: list[float] = []
         for x in loader:
-            block_grid = tuple(
-                self.scoring_cfg.get("reconstruction_error", {}).get("block_grid", (3, 3))
-            )
-            errs = reconstruction_error(
-                self.model, x.to(self.device), block_grid=block_grid
-            )
-            vals.extend(e.mean for e in errs)
+            means = reconstruction_mean(self.model, x.to(self.device))
+            vals.extend(means.cpu().tolist())
         arr = np.asarray(vals, dtype=np.float64)
         stats = CalibrationStats(
             mean=float(arr.mean()),

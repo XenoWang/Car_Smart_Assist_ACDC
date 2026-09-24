@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from PIL import Image  # noqa: E402
 
+from car_smart_assist.config.visibility import MODEL_DEFAULTS  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
     VisibilityLevel,
@@ -215,7 +216,7 @@ def main() -> int:
 
     # --- 参考图与划分只准备一次，七组共用 ---
     dcfg = base.get("data", {})
-    size = tuple(base.get("model", {}).get("input_size", (144, 256)))
+    size = tuple(base.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
     ref_paths = list_ref_images(root / dcfg.get("acdc_root", "data/raw/acdc"))
     if not ref_paths:
         logger.error("未找到正常天气参考图")

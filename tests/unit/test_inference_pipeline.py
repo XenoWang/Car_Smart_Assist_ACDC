@@ -169,23 +169,31 @@ class TestGateBlocksPerception:
         assert r.advisory.risk_level is RiskLevel.CRITICAL
 
     def test_scorer_failure_emits_takeover_fallback(self):
+        predictor = StubPredictor()
         pipe = InferencePipeline(
             scorer=BrokenScorer(),
             gate=VisibilityGate(GateThresholds(), require_calibration=False),
+            predictor=predictor,
         )
         result = pipe.run(frame())
         assert "gate" in result.skipped
+        assert "synthetic scorer failure" in result.skipped["gate"]
+        assert predictor.seen_shapes == []
+        assert result.perception is None
         assert result.advisory.should_takeover is True
         assert result.advisory.source == "fallback"
 
     def test_short_batch_scores_fail_closed_for_every_frame(self):
+        predictor = StubPredictor()
         pipe = InferencePipeline(
             scorer=ShortScorer(),
             gate=VisibilityGate(GateThresholds(), require_calibration=False),
+            predictor=predictor,
         )
         results = pipe.run_batch([frame(), frame()])
         assert all("gate" in result.skipped for result in results)
         assert all(result.advisory.should_takeover for result in results)
+        assert predictor.seen_shapes == []
 
 
 # ---------------------------------------------------------------------------
