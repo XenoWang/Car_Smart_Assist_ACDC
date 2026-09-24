@@ -20,19 +20,17 @@ visibility:
   data:
     acdc_root: data/raw/acdc
 
-    # --- 三划分（train / calib / test）---
+    # --- 四划分（train / val / calib / test）---
     #
-    # 为什么必须三分，而不是 train / calib 两分：
-    #   反复用同一套 calib 迭代（挑轮数、挑阈值、挑超参），calib 会被间接拟合 ——
-    #   这就是验证集泄漏。跑上十次之后 calib 上的指标已经不代表泛化能力。
-    #   所以必须留一份**从头到尾不参与任何决定**的 test：
-    #   它只在最终报告里出现，迭代一百次也污染不到它。
+    # val 只用于早停和选择 best；calib 只用于最终零校准；test 只用于最终报告。
+    # 三个留出集必须按序列互斥，避免视频相邻帧泄漏。
     train_ratio: 0.80
-    calib_ratio: 0.10        # 早停 + 零校准统计；参与选择，会被间接拟合
-    test_ratio: 0.10         # **只用于最终报告**，trainer.py 根本不构建它
+    val_ratio: 0.05          # 最佳权重选择 + 早停
+    calib_ratio: 0.05        # 只用于最终零校准，不参与挑选权重
+    test_ratio: 0.10         # 只用于最终报告
 
     # --- 划分模式 ---
-    # fixed  : 固定种子，每次训练同一套划分。跨运行可比，阈值标定稳定。**默认**
+    # fixed  : 固定种子，每次训练同一套划分。跨运行可比。**默认**
     # random : 每次训练换一套随机划分。
     #
     # ⚠️ 为什么不默认 random：两次运行的指标会测在**不同数据**上，于是
@@ -160,10 +158,32 @@ visibility:
     - tag: dilated_larger_rf    # 有效感受野 3/5/9，比默认更大且更省（方案 C）
       set: {model.kernel_sizes: [3, 3, 3], model.dilations: [1, 2, 4]}
 
+  # --- 特征打分参数 ---
+  # 这些参数与下方 thresholds 共用一套打分尺度；调整后必须重新评估并重标阈值。
+  scoring:
+    features:
+      edge_gradient_threshold: 0.04  # 输入灰度归一化到 [0,1] 后的梯度幅值阈值
+      hf_cutoff_ratio: 0.50           # 频谱半径分界：外侧视作高频
+    feature_scales:
+      contrast: 0.25
+      entropy: 8.0
+      edge_density: 0.15
+      hf_ratio: 0.05
+    aggregation:
+      weights:
+        contrast: 0.40
+        entropy: 0.25
+        edge_density: 0.25
+        hf_ratio: 0.10
+      power: -1.0                     # 广义平均阶数；负数会更关注塌陷的特征维
+      feature_floor: 0.10             # 避免单维接近零后完全支配总分
+    reconstruction_error:
+      block_grid: [3, 3]              # 分块误差统计网格（行、列）
+
   # --- 判定阈值 ---
   #
-  # ⚠️⚠️ 这些数值**与 scorer.py 里的 _INFO_WEIGHTS / _INFO_P / _INFO_EPS 强耦合**。
-  #     改动那三个聚合参数会改变整个分数尺度，旧阈值立即失效，必须重新标定。
+  # ⚠️⚠️ 这些数值与上方 scoring 配置强耦合。
+  #     改动特征尺度或聚合参数会改变分数尺度，旧阈值立即失效，必须重新标定。
   #
   # 标定依据（实测，非估计）：
   #
@@ -210,6 +230,8 @@ visibility:
   # 缺少零校准统计时是否拒绝给出 BLIND 判定（降级为 DEGRADED）
   # 保持 true：单靠信息量一路信号判 BLIND，误判代价太高
   require_calibration: true
+  # DEGRADED 时下游模型置信度缩放；VISIBLE 固定为 1，BLIND 固定为 0。
+  degraded_confidence_multiplier: 0.6
 
   # --- 合成退化（仅用于验证，不参与训练）---
   # 造出「确定无疑看不见」的样本来度量门控的召回率。

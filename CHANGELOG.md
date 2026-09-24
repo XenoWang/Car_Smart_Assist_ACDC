@@ -8,6 +8,27 @@
 
 ## [Unreleased]
 
+### 本轮开发版本更新（基于 0.0.1，尚未发布）
+
+#### Added
+- 能见度参考图改为 train / validation / calibration / test 四划分（默认 80% / 5% / 5% / 10%），
+  按视频序列互斥；validation 负责早停与 best 权重选择，calibration 只计算正常误差分布，
+  test 留给最终评估。
+- 将能见度特征阈值、归一化尺度、聚合权重与阶数、分块误差网格，以及 DEGRADED 置信度乘子
+  放入 `configs/model/visibility.yaml` 的配置字典；训练检查点保存打分配置，推理入口支持显式配置覆盖。
+
+#### Changed
+- `best.pt` 现在按 validation 重建损失选择，回滚到对应权重后再独立计算 calibration 统计。
+  train / validation 损失改为按样本数汇总；训练集不再丢弃不满一个 batch 的尾部样本。
+- 消融实验只用 validation 比较误报和合成退化召回，不再读取 test 图像；旧协议缓存结果会要求重跑。
+- 拟合评估改为在各切分内固定随机抽样，不再取排序后开头的样本。
+- 检查点加入数据切分签名，避免数据、分辨率或切分变化时沿用不匹配的早停历史。
+
+#### Fixed
+- 拒绝空的 train / validation / calibration / test 切分，避免空 validation 被误当成零损失并错误选为 best。
+- 旧格式检查点不再用于新流程续训（其最优权重可能由 calibration 选择）；训练入口提示用 `--fresh`，
+  旧 `best.pt` 仍可用于推理。
+
 ### Added
 - 初始化项目骨架：两阶段架构（Stage 1 多任务感知 / Stage 2 自然语言建议）的完整目录结构
 - 配置文件体系：`configs/` 下按 data / model / train / inference 分层，支持继承与命令行覆盖
@@ -58,6 +79,37 @@
   - `trainer.py`     无监督训练 + **检查点保存与续训**（原子写、last/best 双文件）
 - `scripts/train_visibility.py` / `scripts/evaluate_visibility.py`
 - `configs/model/visibility.yaml`
+
+### Added — 能见度门控接入推理管线
+- `inference/pipeline.py`  **完整实现**。管线结构改为「门控 -> 感知 -> 建议」三段，
+  门控是第一级判断：
+  - BLIND 时**跳过感知**，直接出门控驱动的接管请求（省算力，且避免
+    在看不见的帧上硬跑感知、把噪声当结果喂给决策层）
+  - DEGRADED/VISIBLE 才进入感知阶段
+  - **两个阶段用不同分辨率**：门控跑 144×256 降采样（能见度是全局属性，
+    且 AE 就是按这个尺寸训练的），感知必须用**原始分辨率**
+    （检测框与单目测距依赖原始像素尺度与内参，混用会让距离整体偏掉）
+  - 每阶段耗时分开记录；未接入的阶段记进 `skipped` 并说明原因，不假装跑过
+- `advisory/schema.py`  实现数据契约：`PerceptionResult` / `AdvisoryResult` /
+  `TargetObject`。两条关键约定：
+  - **未知距离用 `None` 而非 0** —— 0 米表示「贴脸」，与「不知道」是两回事，
+    混用会让下游把「没测出来」当成「很近」，恰好造成最危险的误判
+  - **`AdvisoryResult.text` 禁止为空**（构造期抛错）—— 宁可回退保守文案，
+    也不允许静默失声
+  - `effective_confidence()` 统一施加门控降级乘子，避免下游各自重复判断能见度
+- `advisory/generator.py`  实现**门控驱动的接管路径**（安全关键，不依赖任何未实现模块）。
+  感知驱动的常规路径明确 `NotImplementedError` —— 在安全链路上，
+  一个「看起来能跑但输出是编的」占位实现比缺实现危险得多
+- `advisory/prompt/templates.py`  司机文案模板 + `check_wording()` 可编程措辞自检
+- `scripts/run_pipeline.py`  端到端演示，含各天气子集与合成退化对照
+- `tests/unit/test_inference_pipeline.py`  40 个测试，锁住门控阻断、
+  分辨率分离、输入格式、数据契约、文案约束
+
+### Fixed
+- `tests/unit/test_pipeline.py` 与 `tests/integration/test_pipeline.py` **重名**，
+  pytest 在无 `__init__.py` 时无法区分同名测试模块，全量收集直接失败。
+  已重命名为 `test_inference_pipeline.py`
+  （单文件跑能过、全量跑才暴露，这类问题只有跑全量才会发现）
 
 ### Added — 消融实验驱动器
 - `scripts/run_visibility_ablations.py`：统一跑 config 里的 6 个预设 + 基线。
@@ -129,9 +181,6 @@
 ---
 
 ## 待办里程碑（Milestone 草案）
-
-> 这一段在开工后应逐步替换成真实的版本记录。先留着是因为它能说明项目是
-> 「有节奏推进」而不是「想到哪做到哪」。
 
 - **v0.1.0 — 数据管线**：ACDC 下载/预处理/统计可用，距离标签口径定稿
 - **v0.2.0 — Stage 1 感知**：多任务模型跑通，分割/分类/距离三组指标有基线

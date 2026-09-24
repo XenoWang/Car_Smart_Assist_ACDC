@@ -20,7 +20,6 @@ import pytest
 import torch
 
 from car_smart_assist.perception.visibility import (
-    ConvAutoencoder,
     GateThresholds,
     InformationFeatures,
     MultiScaleBlock,
@@ -33,14 +32,14 @@ from car_smart_assist.perception.visibility import (
     information_score,
     reconstruction_error,
 )
-from car_smart_assist.perception.visibility.dataset import (
-    sequence_of,
-    VisibilityImageDataset,
-    split_ref_indices,
-)
 from car_smart_assist.perception.visibility.autoencoder import (
     DEFAULT_KERNEL_SIZES,
     effective_kernel_size,
+)
+from car_smart_assist.perception.visibility.dataset import (
+    VisibilityImageDataset,
+    sequence_of,
+    split_ref_indices,
 )
 from car_smart_assist.perception.visibility.scorer import CalibrationStats
 from car_smart_assist.perception.visibility.trainer import (
@@ -48,7 +47,6 @@ from car_smart_assist.perception.visibility.trainer import (
     _atomic_save,
     resolve_resume_spec,
 )
-
 
 # ---------------------------------------------------------------------------
 # 工具
@@ -253,8 +251,8 @@ class TestCheckpointResume:
         opt1.step()
 
         t1.history.train_loss = [0.9, 0.8, 0.7]
-        t1.history.calib_loss = [0.95, 0.85, 0.75]
-        t1.history.best_calib_loss = 0.75
+        t1.history.val_loss = [0.95, 0.85, 0.75]
+        t1.history.best_val_loss = 0.75
         t1.history.best_epoch = 3
         t1.calibration = CalibrationStats(mean=0.01, std=0.003, p95=0.02, p99=0.03, n=10)
         expected = {k: v.clone() for k, v in t1.model.state_dict().items()}
@@ -270,7 +268,7 @@ class TestCheckpointResume:
         assert t2.history.start_epoch == 3
         assert t2.history.train_loss == [0.9, 0.8, 0.7]
         assert t2.history.best_epoch == 3
-        assert t2.history.best_calib_loss == pytest.approx(0.75)
+        assert t2.history.best_val_loss == pytest.approx(0.75)
         assert t2.history.resumed_from is not None
         assert t2.calibration is not None and t2.calibration.n == 10
         for k, v in expected.items():
@@ -280,11 +278,33 @@ class TestCheckpointResume:
 
     def test_payload_records_config_snapshot(self, tmp_path):
         cfg = self._cfg(tmp_path)
+        cfg["scoring"] = {"aggregation": {"power": -2.0}}
         t = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
         payload = t._make_payload(1, None, None, 0.1)
-        assert payload["format_version"] == 1
+        assert payload["format_version"] == 2
         assert payload["model_cfg"]["latent_dim"] == 8
+        assert payload["scoring_cfg"] == cfg["scoring"]
         assert "config_snapshot" in payload
+
+    def test_scorer_prefers_explicit_scoring_config_then_checkpoint(self, tmp_path):
+        from car_smart_assist.perception.visibility.scorer import VisibilityScorer
+
+        cfg = self._cfg(tmp_path)
+        cfg["scoring"] = {"aggregation": {"power": -2.0}}
+        trainer = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
+        checkpoint = tmp_path / "scorer.pt"
+        _atomic_save(trainer._make_payload(1, None, None, 0.1), checkpoint)
+
+        active_cfg = {"aggregation": {"power": -0.5}}
+        scorer = VisibilityScorer.from_checkpoint(
+            checkpoint, cfg=trainer.model_cfg, scoring_cfg=active_cfg
+        )
+        assert scorer.scoring_cfg == active_cfg
+
+        fallback_scorer = VisibilityScorer.from_checkpoint(
+            checkpoint, cfg=trainer.model_cfg
+        )
+        assert fallback_scorer.scoring_cfg == cfg["scoring"]
 
 
 class TestAblationPresetsAreValid:
@@ -344,35 +364,36 @@ class TestAblationPresetsAreValid:
 
 
 class TestSplitRefIndices:
-    """train / calib / test 三划分。
+    """train / val / calib / test 四划分。
 
     这里守两个属性：
-    1. 三分互不重叠、并集为全集 —— 重叠会造成训练集泄漏
+    1. 四分互不重叠、并集为全集 —— 重叠会造成训练集泄漏
     2. fixed 模式可复现、random 模式每次不同 —— 前者是可比性的前提
     """
 
-    def test_three_way_partition_is_disjoint_and_complete(self):
-        tr, ca, te = split_ref_indices(1000, 0.8, 0.1, 0.1, seed=42)
-        all_idx = np.concatenate([tr, ca, te])
+    def test_four_way_partition_is_disjoint_and_complete(self):
+        tr, va, ca, te = split_ref_indices(1000, 0.8, 0.05, 0.05, 0.1, seed=42)
+        all_idx = np.concatenate([tr, va, ca, te])
         assert len(all_idx) == len(set(all_idx.tolist())) == 1000
         assert set(all_idx.tolist()) == set(range(1000))
 
     def test_ratios_respected(self):
-        tr, ca, te = split_ref_indices(1000, 0.8, 0.1, 0.1, seed=0)
+        tr, va, ca, te = split_ref_indices(1000, 0.8, 0.05, 0.05, 0.1, seed=0)
         assert len(tr) == 800
-        assert len(ca) == 100
+        assert len(va) == 50
+        assert len(ca) == 50
         assert len(te) == 100
 
     def test_indices_sorted(self):
         """排序让 memmap 访问局部性更好，也便于与缓存行对齐。"""
-        tr, ca, te = split_ref_indices(500, 0.8, 0.1, 0.1, seed=1)
-        for arr in (tr, ca, te):
+        tr, va, ca, te = split_ref_indices(500, 0.8, 0.05, 0.05, 0.1, seed=1)
+        for arr in (tr, va, ca, te):
             assert np.all(np.diff(arr) > 0)
 
     def test_fixed_mode_is_reproducible(self):
         a = split_ref_indices(300, seed=7, mode="fixed")
         b = split_ref_indices(300, seed=7, mode="fixed")
-        for x, y in zip(a, b):
+        for x, y in zip(a, b, strict=True):
             assert np.array_equal(x, y)
 
     def test_different_seeds_give_different_splits(self):
@@ -401,7 +422,10 @@ class TestSplitRefIndices:
 
         校准集参与阈值标定，若测试集与它重叠，报出的泛化指标就是乐观的。
         """
-        tr, ca, te = split_ref_indices(1000, 0.8, 0.1, 0.1, seed=42)
+        tr, va, ca, te = split_ref_indices(1000, 0.8, 0.05, 0.05, 0.1, seed=42)
+        assert not (set(va.tolist()) & set(ca.tolist()))
+        assert not (set(va.tolist()) & set(te.tolist()))
+        assert not (set(va.tolist()) & set(tr.tolist()))
         assert not (set(ca.tolist()) & set(te.tolist()))
         assert not (set(tr.tolist()) & set(te.tolist()))
 
@@ -413,39 +437,57 @@ class TestSplitRefIndices:
         ACDC 参考图来自视频，相邻帧近乎重复。一旦跨集合，
         校准集里就有训练样本的复制品，泛化指标虚高。
         """
-        groups = [f"seq{i // 10}" for i in range(100)]  # 10 个序列，每组 10 帧
-        tr, ca, te = split_ref_indices(100, 0.8, 0.1, 0.1, seed=0, groups=groups)
+        groups = [f"seq{i // 5}" for i in range(100)]  # 20 个序列，每组 5 帧
+        tr, va, ca, te = split_ref_indices(
+            100, 0.8, 0.05, 0.05, 0.1, seed=0, groups=groups
+        )
 
         g_tr = {groups[i] for i in tr}
+        g_va = {groups[i] for i in va}
         g_ca = {groups[i] for i in ca}
         g_te = {groups[i] for i in te}
+        assert not (g_tr & g_va), "序列同时出现在训练与验证集"
+        assert not (g_va & g_ca), "序列同时出现在验证与校准集"
+        assert not (g_va & g_te), "序列同时出现在验证与测试集"
         assert not (g_tr & g_ca), "序列同时出现在训练与校准集"
         assert not (g_tr & g_te), "序列同时出现在训练与测试集"
         assert not (g_ca & g_te), "序列同时出现在校准与测试集"
-        assert g_tr | g_ca | g_te == {f"seq{i}" for i in range(10)}
+        assert g_tr | g_va | g_ca | g_te == {f"seq{i}" for i in range(20)}
 
     def test_group_split_is_disjoint_and_complete(self):
-        groups = [f"s{i % 7}" for i in range(200)]
-        tr, ca, te = split_ref_indices(200, 0.8, 0.1, 0.1, seed=3, groups=groups)
-        all_idx = np.concatenate([tr, ca, te])
+        groups = [f"s{i // 5}" for i in range(200)]
+        tr, va, ca, te = split_ref_indices(
+            200, 0.8, 0.05, 0.05, 0.1, seed=3, groups=groups
+        )
+        all_idx = np.concatenate([tr, va, ca, te])
         assert len(all_idx) == len(set(all_idx.tolist())) == 200
         assert set(all_idx.tolist()) == set(range(200))
 
     def test_group_split_approximates_target_ratios(self):
         groups = [f"s{i // 20}" for i in range(1000)]  # 50 个等大组
-        tr, ca, te = split_ref_indices(1000, 0.8, 0.1, 0.1, seed=5, groups=groups)
-        for got, want in ((len(tr), 800), (len(ca), 100), (len(te), 100)):
+        tr, va, ca, te = split_ref_indices(
+            1000, 0.8, 0.05, 0.05, 0.1, seed=5, groups=groups
+        )
+        for got, want in ((len(tr), 800), (len(va), 50), (len(ca), 50), (len(te), 100)):
             assert abs(got - want) <= 40, f"划分大小偏离较多: {got} vs {want}"
 
     def test_group_length_mismatch_raises(self):
         with pytest.raises(ValueError, match="groups 长度"):
             split_ref_indices(10, groups=["a", "b"])
 
+    def test_group_split_requires_four_nonempty_partitions(self):
+        with pytest.raises(ValueError, match="至少需要 4 个不同序列"):
+            split_ref_indices(10, groups=["a", "a", "b", "b", "c", "c", "c", "c", "c", "c"])
+
+    def test_image_split_rejects_too_few_samples_for_ratios(self):
+        with pytest.raises(ValueError, match="不足以按当前比例"):
+            split_ref_indices(10, 0.8, 0.05, 0.05, 0.1)
+
     def test_group_split_reproducible(self):
         groups = [f"s{i // 5}" for i in range(100)]
-        a = split_ref_indices(100, seed=9, groups=groups)
-        b = split_ref_indices(100, seed=9, groups=groups)
-        for x, y in zip(a, b):
+        a = split_ref_indices(100, 0.8, 0.05, 0.05, 0.1, seed=9, groups=groups)
+        b = split_ref_indices(100, 0.8, 0.05, 0.05, 0.1, seed=9, groups=groups)
+        for x, y in zip(a, b, strict=True):
             assert np.array_equal(x, y)
 
     def test_sequence_of_extracts_sequence_name(self):
@@ -838,6 +880,21 @@ class TestInformationFeatures:
             s = information_score(compute_information_features(img))
             assert 0.0 <= s <= 1.0
 
+    def test_scoring_parameters_can_be_overridden_from_config(self):
+        image = structured_image()
+        features = compute_information_features(
+            image,
+            {"features": {"edge_gradient_threshold": 2.0, "hf_cutoff_ratio": 0.0}},
+        )
+        assert features.edge_density == 0.0
+        assert features.hf_ratio == pytest.approx(1.0)
+
+        score = information_score(
+            compute_information_features(uniform_image(0)),
+            scoring_cfg={"aggregation": {"feature_floor": 0.9}},
+        )
+        assert score == pytest.approx(0.9)
+
 
 # ---------------------------------------------------------------------------
 # 合成退化
@@ -862,7 +919,7 @@ class TestDegradation:
             information_score(compute_information_features(degrade(base, kind, s, seed=0)[0]))
             for s in (0.0, 0.25, 0.5, 0.75, 1.0)
         ]
-        for a, b in zip(scores, scores[1:]):
+        for a, b in zip(scores, scores[1:], strict=False):
             assert a >= b - 1e-6, f"{kind} 信息量非单调: {scores}"
 
     def test_severity_zero_is_identity(self):
@@ -967,9 +1024,20 @@ class TestGateContract:
     # --- 阈值可配置 ---
 
     def test_thresholds_from_config(self):
-        g = VisibilityGate.from_config({"thresholds": {"info_blind": 0.5}})
+        g = VisibilityGate.from_config(
+            {
+                "thresholds": {"info_blind": 0.5},
+                "degraded_confidence_multiplier": 0.25,
+            }
+        )
         assert g.thresholds.info_blind == 0.5
         assert g.judge(make_score(info=0.4)).level is VisibilityLevel.BLIND
+
+    def test_degraded_confidence_multiplier_from_config(self):
+        g = VisibilityGate.from_config({"degraded_confidence_multiplier": 0.25})
+        verdict = g.judge(make_score(info=0.4))
+        assert verdict.level is VisibilityLevel.DEGRADED
+        assert verdict.confidence_multiplier == 0.25
 
     def test_verdict_is_serializable(self):
         d = self.gate.judge(make_score(info=0.9, z=0.1)).to_dict()

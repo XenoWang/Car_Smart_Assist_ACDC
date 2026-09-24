@@ -11,10 +11,9 @@
     这是数据集给的属性，不是我们标的。因此整个流程不引入标注成本。
 
 分割策略:
-    参考图按 90/10 分成 train / calibration。
-    校准集**绝不能参与训练** —— 它要用来定义「正常误差分布」，
-    若被训练过，AE 在它上面的误差会偏低，z 分数被系统性压缩，
-    阈值标定全部失真。
+    参考图分为 train / validation / calibration / test。
+    validation 只用于早停和选择 best checkpoint；calibration 只用于最终零校准；
+    test 只用于最终评估。三个留出集合按序列互斥。
 
 检查点语义（重要）:
     每次训练都在 checkpoint_dir 下维护两个文件：
@@ -27,15 +26,16 @@
     若 last.pt 已存在，自动载入权重、优化器与调度器状态，从下一轮接着训。
     要强制全新开始，传 resume='none' 或命令行加 --fresh。
 
-    这样设计的理由：能见度门控的验证集是固定的校准集，
+    这样设计的理由：能见度门控的验证集是固定的，
     每次重跑都从零开始既浪费算力，也让「加数据后再训一轮」这类迭代无法进行。
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +47,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from car_smart_assist.perception.visibility.autoencoder import (
-    ConvAutoencoder,
     build_autoencoder,
     reconstruction_error,
 )
@@ -64,9 +63,9 @@ class TrainHistory:
     """训练过程记录，用于报告与排查。"""
 
     train_loss: list[float] = field(default_factory=list)
-    calib_loss: list[float] = field(default_factory=list)
+    val_loss: list[float] = field(default_factory=list)
     best_epoch: int = -1
-    best_calib_loss: float = float("inf")
+    best_val_loss: float = float("inf")
     stopped_early: bool = False
     seconds: float = 0.0
     resumed_from: str | None = None
@@ -75,7 +74,7 @@ class TrainHistory:
     def to_dict(self) -> dict[str, Any]:
         return {
             "final_train_loss": self.train_loss[-1] if self.train_loss else None,
-            "best_calib_loss": self.best_calib_loss,
+            "best_val_loss": self.best_val_loss,
             "best_epoch": self.best_epoch,
             "stopped_early": self.stopped_early,
             "epochs_run": len(self.train_loss),
@@ -102,7 +101,7 @@ def _atomic_save(payload: dict[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
-    os.replace(tmp, path)
+    tmp.replace(path)
 
 
 def apply_config_overrides(cfg: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -167,6 +166,7 @@ class VisibilityTrainer:
         self.root = Path(project_root)
         self.device = resolve_device(str(cfg.get("device", "auto")))
         self.model_cfg = dict(cfg.get("model", {}))
+        self.scoring_cfg = copy.deepcopy(cfg.get("scoring", {}))
         tcfg = cfg.get("train", {})
         self.ckpt_dir = self.root / tcfg.get(
             "checkpoint_dir", "artifacts/checkpoints/visibility"
@@ -174,7 +174,8 @@ class VisibilityTrainer:
         self.resume_path = resolve_resume_spec(resume, self.ckpt_dir)
         self.history = TrainHistory()
         self.calibration: CalibrationStats | None = None
-        # 由 _build_datasets 填入：{'train': n, 'calib': n, 'test': n}
+        self.split_signature: str | None = None
+        # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
 
         # 续训时模型结构必须与检查点一致，否则权重加载会报形状不匹配。
@@ -182,6 +183,12 @@ class VisibilityTrainer:
         ckpt_model_cfg: dict[str, Any] | None = None
         if self.resume_path is not None:
             head = torch.load(self.resume_path, map_location="cpu", weights_only=False)
+            if int(head.get("format_version", 1)) < 2:
+                raise ValueError(
+                    f"检查点 {self.resume_path} 使用旧的 train/calib/test 划分策略，"
+                    "其 best 权重曾由校准集选出，不能用于独立校准流程。"
+                    "请使用 --fresh 从头训练；旧 best.pt 仍可用于当前推理。"
+                )
             ckpt_model_cfg = head.get("model_cfg")
             if ckpt_model_cfg and ckpt_model_cfg != self.model_cfg:
                 logger.warning(
@@ -207,8 +214,13 @@ class VisibilityTrainer:
 
     def _build_datasets(
         self,
-    ) -> tuple[VisibilityImageDataset, VisibilityImageDataset, list[Path], dict[str, int]]:
-        """构建 train / calib 两个数据集，并返回划分统计。
+    ) -> tuple[
+        VisibilityImageDataset,
+        VisibilityImageDataset,
+        VisibilityImageDataset,
+        list[Path],
+    ]:
+        """构建 train / validation / calibration 数据集。
 
         test 子集**不在这里构建** —— 它由评估脚本单独划分使用，
         训练过程从不接触它，保证「只用于报告」的语义不被破坏。
@@ -241,38 +253,62 @@ class VisibilityTrainer:
         # 训练集、它的邻居放进校准集 —— 校准集里混进了训练样本的复制品，
         # 测出来的泛化能力虚高。按序列整组划分才能反映真实的跨场景泛化。
         groups = [sequence_of(p) for p in paths] if dcfg.get("split_by_sequence", True) else None
-        train_idx, calib_idx, test_idx = split_ref_indices(
+        train_idx, val_idx, calib_idx, test_idx = split_ref_indices(
             len(paths),
             train_ratio=float(dcfg.get("train_ratio", 0.80)),
-            calib_ratio=float(dcfg.get("calib_ratio", 0.10)),
+            val_ratio=float(dcfg.get("val_ratio", 0.05)),
+            calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
             test_ratio=float(dcfg.get("test_ratio", 0.10)),
             seed=int(dcfg.get("split_seed", 42)),
             mode=str(dcfg.get("split_mode", "fixed")),
             groups=groups,
         )
 
-        # 训练子集单独开增强，校准子集必须保持原样 ——
-        # 增强过的图与原图误差分布不同，用它校准会引入偏差
+        split_payload = {
+            "paths": [
+                (
+                    p.relative_to(acdc_root).as_posix(),
+                    p.stat().st_size,
+                    p.stat().st_mtime_ns,
+                )
+                for p in paths
+            ],
+            "input_size": size,
+            "train": train_idx.tolist(),
+            "val": val_idx.tolist(),
+            "calib": calib_idx.tolist(),
+            "test": test_idx.tolist(),
+        }
+        self.split_signature = hashlib.sha256(
+            json.dumps(split_payload, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+        # 只有训练子集做增强。验证和校准均使用原图，保持评价口径一致。
         train_ds = VisibilityImageDataset(
             paths, size, cache_path=cache_path, indices=train_idx, augment=True
+        )
+        val_ds = VisibilityImageDataset(
+            paths, size, cache_path=cache_path, indices=val_idx, augment=False
         )
         calib_ds = VisibilityImageDataset(
             paths, size, cache_path=cache_path, indices=calib_idx, augment=False
         )
         stats = {
             "train": len(train_idx),
+            "val": len(val_idx),
             "calib": len(calib_idx),
             "test": len(test_idx),
         }
         logger.info(
-            "参考图 %d 张 -> 训练 %d / 校准 %d / 测试 %d（划分模式 %s，缓存 %s）\n"
-            "  测试集不参与训练与早停，仅由 scripts/evaluate_visibility.py 用于最终报告",
-            len(paths), stats["train"], stats["calib"], stats["test"],
+            "参考图 %d 张 -> 训练 %d / 验证 %d / 校准 %d / 测试 %d "
+            "（划分模式 %s，缓存 %s）\n"
+            "  验证集只用于选择权重，校准集只用于最终校准，测试集只用于最终报告",
+            len(paths), stats["train"], stats["val"], stats["calib"], stats["test"],
             dcfg.get("split_mode", "fixed"),
             "已启用" if cache_path is not None else "未启用（实时解码）",
         )
         self.split_stats = stats
-        return train_ds, calib_ds, paths
+        return train_ds, val_ds, calib_ds, paths
 
     # --- 检查点 ---
 
@@ -281,31 +317,40 @@ class VisibilityTrainer:
         epoch: int,
         opt: torch.optim.Optimizer | None,
         sched: Any,
-        calib_loss: float | None,
+        val_loss: float | None,
     ) -> dict[str, Any]:
         return {
-            "format_version": 1,
+            "format_version": 2,
             "model_state": self.model.state_dict(),
             "model_cfg": self.model_cfg,
+            "scoring_cfg": self.scoring_cfg,
             "optimizer_state": opt.state_dict() if opt is not None else None,
             "scheduler_state": sched.state_dict() if sched is not None else None,
             "epoch": epoch,
             "history": self.history.to_dict(),
             "train_loss": self.history.train_loss,
-            "calib_loss": self.history.calib_loss,
-            "best_calib_loss": self.history.best_calib_loss,
+            "val_loss": self.history.val_loss,
+            "best_val_loss": self.history.best_val_loss,
+            "current_val_loss": val_loss,
             "best_epoch": self.history.best_epoch,
             "calibration": self.calibration.to_dict() if self.calibration else None,
             "config_snapshot": {
                 "data": self.cfg.get("data", {}),
                 "model": self.model_cfg,
             },
+            "split_signature": self.split_signature,
         }
 
     def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
         ckpt = torch.load(self.resume_path, map_location=self.device, weights_only=False)
+
+        if ckpt.get("split_signature") != self.split_signature:
+            raise ValueError(
+                "检查点与当前数据/切分不匹配，不能比较历史验证损失或继续早停。"
+                "请确认数据和 split 配置未变，或使用 --fresh 重新训练。"
+            )
 
         self.model.load_state_dict(ckpt["model_state"])
         if ckpt.get("optimizer_state") is not None:
@@ -316,8 +361,8 @@ class VisibilityTrainer:
             sched.load_state_dict(ckpt["scheduler_state"])
 
         self.history.train_loss = list(ckpt.get("train_loss", []))
-        self.history.calib_loss = list(ckpt.get("calib_loss", []))
-        self.history.best_calib_loss = float(ckpt.get("best_calib_loss", float("inf")))
+        self.history.val_loss = list(ckpt.get("val_loss", []))
+        self.history.best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
         self.history.best_epoch = int(ckpt.get("best_epoch", -1))
         self.history.resumed_from = str(self.resume_path)
         epoch = int(ckpt.get("epoch", 0))
@@ -328,8 +373,8 @@ class VisibilityTrainer:
             self.calibration = CalibrationStats(**cal)
 
         logger.info(
-            "已载入检查点 %s：完成 %d 轮，历史最优校准损失 %.6f@%d",
-            self.resume_path, epoch, self.history.best_calib_loss, self.history.best_epoch,
+            "已载入检查点 %s：完成 %d 轮，历史最优验证损失 %.6f@%d",
+            self.resume_path, epoch, self.history.best_val_loss, self.history.best_epoch,
         )
         return epoch
 
@@ -340,13 +385,17 @@ class VisibilityTrainer:
         tcfg = self.cfg.get("train", {})
         dcfg = self.cfg.get("data", {})
         # test 子集不在训练里构建 —— 它只由评估脚本使用
-        train_ds, calib_ds, _ = self._build_datasets()
+        train_ds, val_ds, calib_ds, _ = self._build_datasets()
 
         nw = int(dcfg.get("num_workers", 4))
         bs = int(tcfg.get("batch_size", 32))
         train_loader = DataLoader(
             train_ds, batch_size=bs, shuffle=True, num_workers=nw,
-            pin_memory=self.device.type == "cuda", drop_last=True,
+            pin_memory=self.device.type == "cuda", drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_ds, batch_size=bs, shuffle=False, num_workers=nw,
+            pin_memory=self.device.type == "cuda",
         )
         calib_loader = DataLoader(
             calib_ds, batch_size=bs, shuffle=False, num_workers=nw,
@@ -408,8 +457,6 @@ class VisibilityTrainer:
 
         t0 = time.time()
         since_best = 0
-        completed = start_epoch
-
         for epoch in range(start_epoch + 1, epochs + 1):
             self.model.train()
             run, n = 0.0, 0
@@ -429,19 +476,18 @@ class VisibilityTrainer:
                 if clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
                 opt.step()
-                run += float(loss.detach())
-                n += 1
+                batch_n = len(clean)
+                run += float(loss.detach()) * batch_n
+                n += batch_n
             sched.step()
             train_loss = run / max(n, 1)
             self.history.train_loss.append(train_loss)
 
-            calib_loss = self._eval_loss(calib_loader)
-            self.history.calib_loss.append(calib_loss)
-            completed = epoch
-
-            improved = calib_loss < self.history.best_calib_loss - min_delta
+            val_loss = self._eval_loss(val_loader)
+            self.history.val_loss.append(val_loss)
+            improved = val_loss < self.history.best_val_loss - min_delta
             if improved:
-                self.history.best_calib_loss = calib_loss
+                self.history.best_val_loss = val_loss
                 self.history.best_epoch = epoch
                 since_best = 0
             else:
@@ -449,15 +495,15 @@ class VisibilityTrainer:
 
             # 每轮都写：last.pt 用于续训与崩溃恢复，best.pt 仅在创新低时更新。
             # 写 last.pt 时若尚未有 best，先用当前轮顶替，保证 best.pt 始终可用。
-            _atomic_save(self._make_payload(epoch, opt, sched, calib_loss), last_path)
+            _atomic_save(self._make_payload(epoch, opt, sched, val_loss), last_path)
             if improved or not best_path.exists():
-                _atomic_save(self._make_payload(epoch, opt, sched, calib_loss), best_path)
+                _atomic_save(self._make_payload(epoch, opt, sched, val_loss), best_path)
 
             if epoch % 5 == 0 or epoch == start_epoch + 1:
                 logger.info(
-                    "  epoch %3d/%d  train=%.6f  calib=%.6f  best=%.6f@%d%s",
-                    epoch, epochs, train_loss, calib_loss,
-                    self.history.best_calib_loss, self.history.best_epoch,
+                    "  epoch %3d/%d  train=%.6f  val=%.6f  best=%.6f@%d%s",
+                    epoch, epochs, train_loss, val_loss,
+                    self.history.best_val_loss, self.history.best_epoch,
                     "  *" if improved else "",
                 )
             if since_best >= patience:
@@ -467,7 +513,7 @@ class VisibilityTrainer:
 
         self.history.seconds = time.time() - t0
 
-        # 回滚到最优权重，并用**校准集**（未参与训练）重算零校准统计。
+        # 回滚到验证集选出的最优权重，再用独立校准集计算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
         if best_path.exists():
             ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
@@ -476,10 +522,16 @@ class VisibilityTrainer:
         self.model.to(self.device).eval()
         self.calibration = self._calibrate(calib_loader)
 
-        _atomic_save(
-            self._make_payload(completed, None, None, self.history.calib_loss[-1] if self.history.calib_loss else None),
-            best_path,
-        )
+        best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
+        best_payload["scoring_cfg"] = self.scoring_cfg
+        best_payload["calibration"] = self.calibration.to_dict()
+        best_payload["history"] = self.history.to_dict()
+        best_payload["train_loss"] = self.history.train_loss
+        best_payload["val_loss"] = self.history.val_loss
+        best_payload["best_val_loss"] = self.history.best_val_loss
+        best_payload["best_epoch"] = self.history.best_epoch
+        best_payload["current_val_loss"] = self.history.best_val_loss
+        _atomic_save(best_payload, best_path)
         logger.info("检查点已保存: %s（last: %s）", best_path, last_path)
         return self.history
 
@@ -489,8 +541,9 @@ class VisibilityTrainer:
         run, n = 0.0, 0
         for x in loader:
             x = x.to(self.device, non_blocking=True)
-            run += float(nn.functional.mse_loss(self.model(x).float(), x.float()))
-            n += 1
+            batch_n = len(x)
+            run += float(nn.functional.mse_loss(self.model(x).float(), x.float())) * batch_n
+            n += batch_n
         return run / max(n, 1)
 
     @torch.no_grad()
@@ -499,7 +552,12 @@ class VisibilityTrainer:
         self.model.eval()
         vals: list[float] = []
         for x in loader:
-            errs = reconstruction_error(self.model, x.to(self.device))
+            block_grid = tuple(
+                self.scoring_cfg.get("reconstruction_error", {}).get("block_grid", (3, 3))
+            )
+            errs = reconstruction_error(
+                self.model, x.to(self.device), block_grid=block_grid
+            )
             vals.extend(e.mean for e in errs)
         arr = np.asarray(vals, dtype=np.float64)
         stats = CalibrationStats(

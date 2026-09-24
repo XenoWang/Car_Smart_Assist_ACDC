@@ -19,8 +19,8 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import torch
@@ -92,15 +92,16 @@ def sequence_of(path: str | Path) -> str:
 def split_ref_indices(
     n: int,
     train_ratio: float = 0.80,
-    calib_ratio: float = 0.10,
+    val_ratio: float = 0.05,
+    calib_ratio: float = 0.05,
     test_ratio: float = 0.10,
     seed: int = 42,
     mode: str = "fixed",
     groups: Sequence[str] | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """把参考图划成 train / calib / test 三份。
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """把参考图划成 train / val / calib / test 四份。
 
-    为什么是三分而不是两分（train / calib）:
+    四个集合各自用途不同:
         反复用同一套 calib 迭代（挑轮数、挑阈值、挑超参），calib 会被间接拟合 ——
         这就是验证集泄漏。跑上十次之后，calib 上的指标已经不代表泛化能力了。
         所以必须留一份**从头到尾不参与任何决策**的 test：
@@ -128,18 +129,22 @@ def split_ref_indices(
             None 表示按图划分（仅用于没有序列信息的数据）。
 
     Returns:
-        (train_idx, calib_idx, test_idx)，均为**已排序**的索引数组。
+        (train_idx, val_idx, calib_idx, test_idx)，均为**已排序**的索引数组。
         排序是刻意的：缓存是按顺序 memmap 的，排序后的索引访问局部性更好。
     """
     if mode not in ("fixed", "random"):
         raise ValueError(f"未知 split_mode {mode!r}，可选: fixed | random")
 
-    total = train_ratio + calib_ratio + test_ratio
+    total = train_ratio + val_ratio + calib_ratio + test_ratio
     if abs(total - 1.0) > 1e-6:
         raise ValueError(
-            f"train/calib/test 比例之和应为 1.0，收到 {total:.4f}"
-            f"（{train_ratio} + {calib_ratio} + {test_ratio}）"
+            f"train/val/calib/test 比例之和应为 1.0，收到 {total:.4f}"
+            f"（{train_ratio} + {val_ratio} + {calib_ratio} + {test_ratio}）"
         )
+    if n < 4:
+        raise ValueError("至少需要 4 张参考图，才能为四个数据集各分配样本")
+    if min(train_ratio, val_ratio, calib_ratio, test_ratio) <= 0:
+        raise ValueError("train/val/calib/test 比例都必须大于 0")
 
     if mode == "random":
         seed = int(np.random.SeedSequence().entropy % (2**31))
@@ -153,12 +158,20 @@ def split_ref_indices(
     if groups is None:
         idx = rng.permutation(n)
         n_train = int(n * train_ratio)
+        n_val = int(n * val_ratio)
         n_calib = int(n * calib_ratio)
-        return (
+        splits = (
             np.sort(idx[:n_train]),
-            np.sort(idx[n_train : n_train + n_calib]),
-            np.sort(idx[n_train + n_calib :]),
+            np.sort(idx[n_train : n_train + n_val]),
+            np.sort(idx[n_train + n_val : n_train + n_val + n_calib]),
+            np.sort(idx[n_train + n_val + n_calib :]),
         )
+        if any(len(part) == 0 for part in splits):
+            raise ValueError(
+                f"{n} 张图不足以按当前比例创建非空 train/val/calib/test；"
+                "请增加数据或调整切分比例"
+            )
+        return splits
 
     # --- 按组划分 ---
     if len(groups) != n:
@@ -170,46 +183,67 @@ def split_ref_indices(
         by_group.setdefault(str(g), []).append(i)
 
     names = np.array(sorted(by_group))
+    if len(names) < 4:
+        raise ValueError(
+            f"按序列划分至少需要 4 个不同序列，当前只有 {len(names)} 个；"
+            "请增加序列或调整数据集划分方案"
+        )
     perm = rng.permutation(len(names))
 
     # 目标：按**图数**尽量贴近给定比例（组大小不一，按组数切会偏离很多）
     target_train = n * train_ratio
+    target_val = n * val_ratio
     target_calib = n * calib_ratio
     train_g: list[str] = []
+    val_g: list[str] = []
     calib_g: list[str] = []
     acc = 0
-    for k, gi in enumerate(perm):
+    for gi in perm:
         gname = names[gi]
         size = len(by_group[gname])
         if acc < target_train:
             train_g.append(gname)
             acc += size
-        elif acc < target_train + target_calib:
+        elif acc < target_train + target_val:
+            val_g.append(gname)
+            acc += size
+        elif acc < target_train + target_val + target_calib:
             calib_g.append(gname)
             acc += size
         else:
             break
-    used = set(train_g) | set(calib_g)
+    used = set(train_g) | set(val_g) | set(calib_g)
     test_g = [str(x) for x in names if str(x) not in used]
 
     def collect(gs: Sequence[str]) -> np.ndarray:
         out = [i for g in gs for i in by_group[g]]
         return np.sort(np.asarray(out, dtype=np.int64))
 
-    tr, ca, te = collect(train_g), collect(calib_g), collect(test_g)
+    tr = collect(train_g)
+    va = collect(val_g)
+    ca = collect(calib_g)
+    te = collect(test_g)
+    if any(len(part) == 0 for part in (tr, va, ca, te)):
+        raise ValueError(
+            "按序列划分产生了空的 train/val/calib/test 集；"
+            "请增加不同序列数量或调整切分比例"
+        )
     logger.info(
-        "按序列划分：%d 个序列 -> 训练 %d 组(%d 张) / 校准 %d 组(%d 张) / 测试 %d 组(%d 张)",
-        len(names), len(train_g), len(tr), len(calib_g), len(ca), len(test_g), len(te),
+        "按序列划分：%d 个序列 -> 训练 %d 组(%d 张) / 验证 %d 组(%d 张) / "
+        "校准 %d 组(%d 张) / 测试 %d 组(%d 张)",
+        len(names), len(train_g), len(tr), len(val_g), len(va),
+        len(calib_g), len(ca), len(test_g), len(te),
     )
     # 组大小不均时比例会有偏差，实测出来而不是假装精确
-    actual = np.array([len(tr), len(ca), len(te)]) / max(n, 1)
-    if np.abs(actual - np.array([train_ratio, calib_ratio, test_ratio])).max() > 0.05:
+    actual = np.array([len(tr), len(va), len(ca), len(te)]) / max(n, 1)
+    target = np.array([train_ratio, val_ratio, calib_ratio, test_ratio])
+    if np.abs(actual - target).max() > 0.05:
         logger.warning(
             "实际划分比例 %s 与目标 %s 偏差较大（序列大小不均所致）",
             np.round(actual, 3).tolist(),
-            [train_ratio, calib_ratio, test_ratio],
+            target.tolist(),
         )
-    return tr, ca, te
+    return tr, va, ca, te
 
 
 def ensure_cache(
@@ -218,7 +252,7 @@ def ensure_cache(
     """确保磁盘缓存存在，返回它的路径（不返回数组）。cache_path 为 None 时返回 None。
 
     单独抽出来是为了让**全量**参考图的缓存只构建一次，
-    再由 train / calibration 两个子集通过索引共享 —— 见 VisibilityImageDataset 的
+    再由 train / validation / calibration 子集通过索引共享 —— 见 VisibilityImageDataset 的
     indices 参数。
 
     返回路径而不是数组，是因为 DataLoader 的 worker 需要 pickle 数据集：

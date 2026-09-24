@@ -26,10 +26,10 @@
 from __future__ import annotations
 
 import logging
-import math
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 import torch
@@ -72,7 +72,9 @@ class InformationFeatures:
         }
 
 
-def compute_information_features(img: np.ndarray) -> InformationFeatures:
+def compute_information_features(
+    img: np.ndarray, scoring_cfg: dict[str, Any] | None = None
+) -> InformationFeatures:
     """从 (H, W, 3) uint8 或 float[0,1] 图像算信息量特征。
 
     实现在 numpy 上而非 torch：这些特征要为每一帧单独解释，
@@ -92,10 +94,16 @@ def compute_information_features(img: np.ndarray) -> InformationFeatures:
     p = p[p > 0]
     entropy = float(-(p * np.log2(p)).sum())
 
-    # --- 边缘密度：Sobel 幅值超过阈值的像素占比 ---
+    # --- 边缘密度：梯度幅值超过阈值的像素占比 ---
+    # 用 np.gradient（中心差分）而非 Sobel：Sobel 的 3×3 核自带平滑，
+    # 会把高频噪声也一并抹掉，而这里要的恰恰是「还剩多少高频结构」。
+    # 阈值来自 scoring_cfg；默认 0.04 是 [0,1] 灰度量纲下的值（≈ 10/255，与 preprocessing.py 的
+    # 0-255 量纲阈值 10.0 等价 —— 两边量纲不同但物理含义一致）。
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy)
-    edge_density = float((mag > 0.04).mean())
+    feature_cfg = (scoring_cfg or {}).get("features", {})
+    edge_threshold = float(feature_cfg.get("edge_gradient_threshold", 0.04))
+    edge_density = float((mag > edge_threshold).mean())
 
     # --- 高频能量占比 ---
     # 用径向掩膜把频谱分成低频(内 50% 半径)与高频(外 50%)两部分。
@@ -107,7 +115,8 @@ def compute_information_features(img: np.ndarray) -> InformationFeatures:
     yy, xx = np.ogrid[:h, :w]
     radius = np.sqrt(((yy - cy) / max(h / 2, 1)) ** 2 + ((xx - cx) / max(w / 2, 1)) ** 2)
     total = power.sum()
-    hf_ratio = float(power[radius > 0.5].sum() / total) if total > 0 else 0.0
+    hf_cutoff = float(feature_cfg.get("hf_cutoff_ratio", 0.50))
+    hf_ratio = float(power[radius > hf_cutoff].sum() / total) if total > 0 else 0.0
 
     return InformationFeatures(
         contrast=contrast,
@@ -168,13 +177,16 @@ _FEATURE_SCALES: dict[str, float] = {
 }
 
 
-def normalize_features(f: InformationFeatures) -> dict[str, float]:
+def normalize_features(
+    f: InformationFeatures, scales: dict[str, float] | None = None
+) -> dict[str, float]:
     """把各特征除以参考尺度并截断到 [0,1]。"""
+    scales = scales or _FEATURE_SCALES
     return {
-        "contrast": min(1.0, f.contrast / _FEATURE_SCALES["contrast"]),
-        "entropy": min(1.0, f.entropy / _FEATURE_SCALES["entropy"]),
-        "edge_density": min(1.0, f.edge_density / _FEATURE_SCALES["edge_density"]),
-        "hf_ratio": min(1.0, f.hf_ratio / _FEATURE_SCALES["hf_ratio"]),
+        "contrast": min(1.0, f.contrast / scales["contrast"]),
+        "entropy": min(1.0, f.entropy / scales["entropy"]),
+        "edge_density": min(1.0, f.edge_density / scales["edge_density"]),
+        "hf_ratio": min(1.0, f.hf_ratio / scales["hf_ratio"]),
     }
 
 
@@ -204,8 +216,9 @@ _INFO_EPS: float = 0.10
 def information_score(
     f: InformationFeatures,
     weights: dict[str, float] | None = None,
-    p: float = _INFO_P,
-    eps: float = _INFO_EPS,
+    p: float | None = None,
+    eps: float | None = None,
+    scoring_cfg: dict[str, Any] | None = None,
 ) -> float:
     """把归一化后的特征合成单一信息量分数（加权广义平均）。
 
@@ -244,8 +257,12 @@ def information_score(
 
     权重默认见 _INFO_WEIGHTS（contrast/entropy/edge_density 主导，hf_ratio 仅辅助）。
     """
-    n = normalize_features(f)
-    w = weights or _INFO_WEIGHTS
+    cfg = scoring_cfg or {}
+    aggregate_cfg = cfg.get("aggregation", {})
+    n = normalize_features(f, cfg.get("feature_scales"))
+    w = weights or aggregate_cfg.get("weights") or _INFO_WEIGHTS
+    p = float(aggregate_cfg.get("power", _INFO_P) if p is None else p)
+    eps = float(aggregate_cfg.get("feature_floor", _INFO_EPS) if eps is None else eps)
     w_sum = sum(w.values())
     acc = 0.0
     for k, weight in w.items():
@@ -281,6 +298,7 @@ class VisibilityScorer:
             只能看原始误差 —— 那种情况下不应该做判定，因此 gate 会拒绝工作。
         device: 推理设备
         input_size: 需与模型一致
+        scoring_cfg: 特征尺度、聚合权重及分块误差参数；随训练检查点固定
     """
 
     def __init__(
@@ -289,11 +307,13 @@ class VisibilityScorer:
         calibration: CalibrationStats | None = None,
         device: str | torch.device = "cpu",
         input_size: tuple[int, int] = (144, 256),
+        scoring_cfg: dict[str, Any] | None = None,
     ) -> None:
         self.model = model.to(device).eval()
         self.calibration = calibration
         self.device = torch.device(device)
         self.input_size = tuple(input_size)
+        self.scoring_cfg = scoring_cfg or {}
 
     # --- 构建 ---
 
@@ -303,7 +323,8 @@ class VisibilityScorer:
         checkpoint_path: str | Path,
         device: str | torch.device = "cpu",
         cfg: dict[str, Any] | None = None,
-    ) -> "VisibilityScorer":
+        scoring_cfg: dict[str, Any] | None = None,
+    ) -> VisibilityScorer:
         """从训练 checkpoint 恢复。checkpoint 内嵌模型配置与校准统计。"""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model_cfg = ckpt.get("model_cfg", cfg or {})
@@ -311,6 +332,11 @@ class VisibilityScorer:
         model.load_state_dict(ckpt["model_state"])
         cal = ckpt.get("calibration")
         calibration = CalibrationStats(**cal) if cal else None
+        # 调用方显式提供的配置代表当前实验/部署策略，应优先于 checkpoint 快照。
+        # 未提供时再回退到训练时保存的值，保证独立加载仍可复现。
+        effective_scoring_cfg = (
+            scoring_cfg if scoring_cfg is not None else ckpt.get("scoring_cfg", {})
+        )
         if calibration is None:
             logger.warning(
                 "checkpoint 中没有校准统计，z 分数不可用。"
@@ -321,6 +347,7 @@ class VisibilityScorer:
             calibration,
             device=device,
             input_size=tuple(model_cfg.get("input_size", (144, 256))),
+            scoring_cfg=effective_scoring_cfg,
         )
 
     # --- 打分 ---
@@ -335,7 +362,10 @@ class VisibilityScorer:
     @torch.no_grad()
     def score_tensors(self, x: torch.Tensor) -> list[tuple[float, float]]:
         """对一批张量算 (recon_mean, recon_p90_block)。"""
-        errs = reconstruction_error(self.model, x.to(self.device))
+        block_grid = tuple(
+            self.scoring_cfg.get("reconstruction_error", {}).get("block_grid", (3, 3))
+        )
+        errs = reconstruction_error(self.model, x.to(self.device), block_grid=block_grid)
         return [(e.mean, e.p90_block) for e in errs]
 
     def score_arrays(self, images: Sequence[np.ndarray], paths: Sequence[str] | None = None):
@@ -348,7 +378,7 @@ class VisibilityScorer:
         cal = self.calibration
         out: list[VisibilityScore] = []
         for i, img in enumerate(images):
-            feat = compute_information_features(img)
+            feat = compute_information_features(img, self.scoring_cfg)
             mean, p90 = recon[i]
             z = (mean - cal.mean) / cal.std if cal and cal.std > 0 else float("nan")
             out.append(
@@ -358,7 +388,7 @@ class VisibilityScorer:
                     recon_p90_block=p90,
                     recon_z=z,
                     features=feat,
-                    information=information_score(feat),
+                    information=information_score(feat, scoring_cfg=self.scoring_cfg),
                 )
             )
         return out

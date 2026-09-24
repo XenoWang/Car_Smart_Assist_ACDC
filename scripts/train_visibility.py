@@ -92,13 +92,21 @@ def main() -> int:
         print(f"  {torch.cuda.get_device_name(0)}  "
               f"arch_list 含 sm_120: {'sm_120' in torch.cuda.get_arch_list()}")
 
-    trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
+    try:
+        trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
+    except ValueError as exc:
+        logging.getLogger(__name__).error("无法使用当前检查点：%s", exc)
+        return 2
     if trainer.resume_path is not None:
         print(f"续训来源: {trainer.resume_path}")
     else:
         print("未找到已有检查点，从头训练")
 
-    history = trainer.fit()
+    try:
+        history = trainer.fit()
+    except ValueError as exc:
+        logging.getLogger(__name__).error("无法继续训练：%s", exc)
+        return 2
 
     print("\n" + "=" * 62)
     print("训练完成")

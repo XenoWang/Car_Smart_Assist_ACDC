@@ -44,7 +44,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
-    VisibilityLevel,
     VisibilityScorer,
     degrade,
     resolve_device,
@@ -121,17 +120,15 @@ def eval_fit_quality(
 ) -> dict[str, Any]:
     """过拟合 / 欠拟合检查，并在**测试集**上给出最终误报率。
 
-    三划分的角色必须分清：
+    四划分的角色必须分清：
         train  模型拟合过      —— 指标最好，但不代表泛化
-        calib  参与早停与校准   —— 会被间接拟合，指标偏乐观
+        val    参与早停与权重选择
+        calib  只用于计算零校准统计
         test   **不参与任何决定** —— 这里报出的数字才是可引用的
 
     ⚠️ 必须直接测**原始图像**的重建误差，不能拿训练日志里的 train_loss 对比。
-    训练损失是在**开了增强**的数据上算的，而验证损失没有增强 ——
-    两边口径不一致，会把真实差距压小。实测中：
-        训练日志口径  calib/train = 1.14（看着像轻微过拟合）
-        原始图像口径  calib/train = 1.46（实际是明显过拟合）
-    前者差了 30 个百分点，足以让人误判模型没问题。
+    训练损失是在开了增强的数据上算的，而验证/测试损失没有增强；
+    所以这里分别在原始图像上抽样，统一重算重建误差。
 
     使用与 trainer 完全相同的划分函数，保证切分一致。
     """
@@ -140,24 +137,27 @@ def eval_fit_quality(
         split_ref_indices,
     )
 
-    # 必须与 trainer 用完全相同的划分参数，否则 train/calib 对不上
+    # 必须与 trainer 用完全相同的划分参数，否则各集合会错位
     groups = (
         [sequence_of(p) for p in ref_paths]
         if dcfg.get("split_by_sequence", True)
         else None
     )
-    tr_idx, ca_idx, te_idx = split_ref_indices(
+    tr_idx, val_idx, ca_idx, te_idx = split_ref_indices(
         len(ref_paths),
         train_ratio=float(dcfg.get("train_ratio", 0.80)),
-        calib_ratio=float(dcfg.get("calib_ratio", 0.10)),
+        val_ratio=float(dcfg.get("val_ratio", 0.05)),
+        calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
         test_ratio=float(dcfg.get("test_ratio", 0.10)),
         seed=int(dcfg.get("split_seed", 42)),
         mode=str(dcfg.get("split_mode", "fixed")),
         groups=groups,
     )
 
+    rng = np.random.default_rng(int(dcfg.get("split_seed", 42)))
+
     def probe(idx: np.ndarray):
-        take = idx[:n]
+        take = rng.choice(idx, size=min(n, len(idx)), replace=False)
         s = scorer.score_arrays([refs[i] for i in take], [str(ref_paths[i]) for i in take])
         return (
             float(np.mean([x.recon_mean for x in s])),
@@ -165,47 +165,56 @@ def eval_fit_quality(
             s,
         )
 
-    tr_mean, tr_info, tr_scores = probe(tr_idx)
+    tr_mean, tr_info, _ = probe(tr_idx)
+    val_mean, val_info, _ = probe(val_idx)
     ca_mean, ca_info, _ = probe(ca_idx)
     te_mean, te_info, te_scores = probe(te_idx)
 
-    ratio = ca_mean / tr_mean if tr_mean > 0 else float("nan")
-    if ratio < 1.05:
-        verdict = "拟合充分（训练与校准几乎无差距）"
-    elif ratio < 1.30:
-        verdict = "轻微过拟合，重建类任务上可接受"
+    val_ratio = val_mean / tr_mean if tr_mean > 0 else float("nan")
+    test_ratio = te_mean / tr_mean if tr_mean > 0 else float("nan")
+    if test_ratio < 1.05:
+        verdict = "测试集与训练集差距较小"
+    elif test_ratio < 1.30:
+        verdict = "测试集存在轻度泛化差距"
     else:
-        verdict = "⚠️ 明显过拟合，需要降容量或加正则"
+        verdict = "⚠️ 测试集泛化差距明显，需检查模型容量与数据分布"
 
     # 测试集上的误报率 —— 这是唯一没被任何决策污染过的数字
     te_verdicts = gate.judge_many(te_scores)
     te_fpr = summarize(te_verdicts)["blind"]
 
     logger.info(
-        "拟合质量: train=%.6f calib=%.6f test=%.6f  比值(calib/train)=%.3f -> %s",
-        tr_mean, ca_mean, te_mean, ratio, verdict,
+        "拟合质量: train=%.6f val=%.6f calib=%.6f test=%.6f "
+        "比值(test/train)=%.3f -> %s",
+        tr_mean, val_mean, ca_mean, te_mean, test_ratio, verdict,
     )
     logger.info(
-        "  信息量中位数 train=%.3f calib=%.3f test=%.3f（三者应接近）",
-        tr_info, ca_info, te_info,
+        "  信息量中位数 train=%.3f val=%.3f calib=%.3f test=%.3f",
+        tr_info, val_info, ca_info, te_info,
     )
     logger.info(
-        "  **测试集误报率 = %.2f%%**（%d 张，未参与任何决策）",
-        te_fpr * 100, len(te_idx),
+        "  **测试集误报率 = %.2f%%**（本次抽样 %d 张，未参与任何决策）",
+        te_fpr * 100, min(n, len(te_idx)),
     )
 
     return {
         "train_recon_mean": tr_mean,
+        "val_recon_mean": val_mean,
         "calib_recon_mean": ca_mean,
         "test_recon_mean": te_mean,
-        "overfit_ratio": ratio,
+        "val_train_ratio": val_ratio,
+        "test_train_ratio": test_ratio,
         "verdict": verdict,
         "train_information_median": tr_info,
+        "val_information_median": val_info,
         "calib_information_median": ca_info,
         "test_information_median": te_info,
-        "split_sizes": {"train": len(tr_idx), "calib": len(ca_idx), "test": len(te_idx)},
+        "split_sizes": {
+            "train": len(tr_idx), "val": len(val_idx),
+            "calib": len(ca_idx), "test": len(te_idx),
+        },
         "test_false_positive_rate": te_fpr,
-        "n_each": min(n, len(tr_idx), len(ca_idx), len(te_idx)),
+        "n_each": min(n, len(tr_idx), len(val_idx), len(ca_idx), len(te_idx)),
     }
 
 
@@ -322,14 +331,16 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         "| 集合 | 张数 | 重建误差均值 | 角色 |",
         "|------|------|-------------|------|",
         f"| 训练集 | {sz['train']} | {f['train_recon_mean']:.6f} | 模型拟合过，指标最乐观 |",
-        f"| 校准集 | {sz['calib']} | {f['calib_recon_mean']:.6f} | 参与早停与校准，会被间接拟合 |",
+        f"| 验证集 | {sz['val']} | {f['val_recon_mean']:.6f} | 用于选择权重与早停 |",
+        f"| 校准集 | {sz['calib']} | {f['calib_recon_mean']:.6f} | 只用于最终零校准 |",
         f"| **测试集** | {sz['test']} | **{f['test_recon_mean']:.6f}** | **不参与任何决定，可引用** |",
         "",
-        f"- 校准/训练 误差比：**{f['overfit_ratio']:.3f}**",
+        f"- 验证/训练误差比：**{f['val_train_ratio']:.3f}**（验证集用于选择权重）",
+        f"- 测试/训练误差比：**{f['test_train_ratio']:.3f}**（只作最终泛化诊断，不用于选权重）",
         f"- 结论：**{f['verdict']}**",
         f"- 信息量分数中位数：训练 {f['train_information_median']:.3f} / "
-        f"校准 {f['calib_information_median']:.3f} / 测试 {f['test_information_median']:.3f}"
-        "（三者应接近）",
+        f"验证 {f['val_information_median']:.3f} / 校准 {f['calib_information_median']:.3f} / "
+        f"测试 {f['test_information_median']:.3f}",
         f"- 每组抽样：{f['n_each']}",
         "",
         f"### 测试集误报率：**{f['test_false_positive_rate']:.2%}**",
@@ -339,7 +350,7 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         "",
         "> ⚠️ 这里直接测**原始图像**，不能拿训练日志里的 train_loss 对比：",
         "> 训练损失在开了增强的数据上算，验证损失没有增强，两边口径不一致会**缩小**差距。",
-        "> 实测中日志口径给出 1.14（看着像轻微过拟合），原始图像口径是 1.46（实际明显过拟合）。",
+        "> train / val / test 使用同一原始图像重建口径；训练日志损失含增强与去噪，不与其直接比较。",
         "",
     ]
 
@@ -450,7 +461,12 @@ def main() -> int:
         return 2
 
     device = args.device or str(cfg.get("device", "auto"))
-    scorer = VisibilityScorer.from_checkpoint(ckpt, device=resolve_device(device), cfg=cfg.get("model", {}))
+    scorer = VisibilityScorer.from_checkpoint(
+        ckpt,
+        device=resolve_device(device),
+        cfg=cfg.get("model", {}),
+        scoring_cfg=cfg.get("scoring", {}),
+    )
     gate = VisibilityGate.from_config(cfg)
     if scorer.calibration is None:
         logger.warning("无零校准统计，BLIND 判定将被降级 —— 建议重新训练")
@@ -487,7 +503,9 @@ def main() -> int:
     print("评估完成")
     print("=" * 62)
     fq = report["fit_quality"]
-    print(f"  拟合质量  训练/校准 误差比 : {fq['overfit_ratio']:.3f}  -> {fq['verdict']}")
+    print(
+        f"  拟合诊断  测试/训练误差比 : {fq['test_train_ratio']:.3f}  -> {fq['verdict']}"
+    )
     print(f"  误报率（清晰图被判 BLIND） : {report['clean_control']['false_positive_rate']:.2%}")
     for cond, s in report["real_adverse"].items():
         print(f"  真实 {cond:6s} BLIND 比例      : {s['blind']:.2%}")

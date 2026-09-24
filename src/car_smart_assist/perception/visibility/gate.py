@@ -81,7 +81,7 @@ class GateThresholds:
     use_recon_z: bool = False
 
     @classmethod
-    def from_config(cls, cfg: dict[str, Any]) -> "GateThresholds":
+    def from_config(cls, cfg: dict[str, Any]) -> GateThresholds:
         return cls(
             info_blind=float(cfg.get("info_blind", 0.34)),
             info_degraded=float(cfg.get("info_degraded", 0.50)),
@@ -100,6 +100,7 @@ class VisibilityVerdict:
     triggered: list[str] = field(default_factory=list)
     information: float = float("nan")
     recon_z: float = float("nan")
+    degraded_confidence_multiplier: float = 0.6
     # 供上游日志与人工复核：完整的打分明细
     score: VisibilityScore | None = None
 
@@ -115,9 +116,10 @@ class VisibilityVerdict:
         DEGRADED 时下调下游置信度，让决策层更倾向提示与接管；
         BLIND 时没有下游结果，返回 0。
         """
-        return {VisibilityLevel.VISIBLE: 1.0, VisibilityLevel.DEGRADED: 0.6}.get(
-            self.level, 0.0
-        )
+        return {
+            VisibilityLevel.VISIBLE: 1.0,
+            VisibilityLevel.DEGRADED: self.degraded_confidence_multiplier,
+        }.get(self.level, 0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -141,16 +143,25 @@ class VisibilityGate:
     """
 
     def __init__(
-        self, thresholds: GateThresholds | None = None, require_calibration: bool = True
+        self,
+        thresholds: GateThresholds | None = None,
+        require_calibration: bool = True,
+        degraded_confidence_multiplier: float = 0.6,
     ) -> None:
         self.thresholds = thresholds or GateThresholds()
         self.require_calibration = require_calibration
+        self.degraded_confidence_multiplier = float(degraded_confidence_multiplier)
+        if not 0.0 <= self.degraded_confidence_multiplier <= 1.0:
+            raise ValueError("degraded_confidence_multiplier 必须在 [0, 1] 内")
 
     @classmethod
-    def from_config(cls, cfg: dict[str, Any]) -> "VisibilityGate":
+    def from_config(cls, cfg: dict[str, Any]) -> VisibilityGate:
         return cls(
             thresholds=GateThresholds.from_config(cfg.get("thresholds", {})),
             require_calibration=bool(cfg.get("require_calibration", True)),
+            degraded_confidence_multiplier=float(
+                cfg.get("degraded_confidence_multiplier", 0.6)
+            ),
         )
 
     def judge(self, score: VisibilityScore) -> VisibilityVerdict:
@@ -209,8 +220,8 @@ class VisibilityGate:
 
         return self._make(VisibilityLevel.VISIBLE, "信息量与重建误差均在正常范围", [], score)
 
-    @staticmethod
     def _make(
+        self,
         level: VisibilityLevel,
         reason: str,
         triggered: list[str],
@@ -222,6 +233,7 @@ class VisibilityGate:
             triggered=list(triggered),
             information=score.information,
             recon_z=score.recon_z,
+            degraded_confidence_multiplier=self.degraded_confidence_multiplier,
             score=score,
         )
 
