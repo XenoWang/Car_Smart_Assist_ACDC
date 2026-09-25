@@ -41,7 +41,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -609,14 +608,7 @@ class VisibilityTrainer:
         for x in loader:
             means = reconstruction_mean(self.model, x.to(self.device))
             vals.extend(means.cpu().tolist())
-        arr = np.asarray(vals, dtype=np.float64)
-        stats = CalibrationStats(
-            mean=float(arr.mean()),
-            std=float(arr.std()),
-            p95=float(np.percentile(arr, 95)),
-            p99=float(np.percentile(arr, 99)),
-            n=int(arr.size),
-        )
+        stats = CalibrationStats.from_errors(vals)
         logger.info(
             "零校准（%d 张正常天气图）：均值 %.6f，标准差 %.6f，p95 %.6f，p99 %.6f",
             stats.n, stats.mean, stats.std, stats.p95, stats.p99,

@@ -110,7 +110,7 @@ visibility:
 
   # --- 训练 ---
   train:
-    epochs: 40
+    epochs: 100
     batch_size: 32           # 256×144 的输入很小，batch 可以开大
     lr: 1.0e-3
     weight_decay: 0.0        # AE 上加 wd 会让重建变糊，反而抹掉高频信号

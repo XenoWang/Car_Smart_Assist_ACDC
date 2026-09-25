@@ -34,7 +34,6 @@ from typing import Any
 
 import numpy as np
 import torch
-from PIL import Image
 
 from car_smart_assist.config.visibility import MODEL_DEFAULTS, SCORING_DEFAULTS
 from car_smart_assist.perception.visibility.autoencoder import (
@@ -43,6 +42,7 @@ from car_smart_assist.perception.visibility.autoencoder import (
     reconstruction_error,
     reconstruction_mean,
 )
+from car_smart_assist.perception.visibility.dataset import read_rgb_image
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +293,20 @@ class CalibrationStats:
     p99: float
     n: int
 
+    @classmethod
+    def from_errors(cls, errors: Sequence[float] | np.ndarray) -> CalibrationStats:
+        """训练与手动校准共用统计口径，拒绝空数据及非有限误差。"""
+        values = np.asarray(errors, dtype=np.float64)
+        if values.ndim != 1 or values.size == 0:
+            raise ValueError("校准需要非空的一维重建误差序列")
+        if not np.isfinite(values).all():
+            raise ValueError("校准重建误差包含 NaN 或无穷大")
+        p95, p99 = np.percentile(values, [95, 99])
+        return cls(
+            mean=float(values.mean()), std=float(values.std()),
+            p95=float(p95), p99=float(p99), n=int(values.size),
+        )
+
     def to_dict(self) -> dict[str, float | int]:
         return {"mean": self.mean, "std": self.std, "p95": self.p95, "p99": self.p99, "n": self.n}
 
@@ -411,11 +425,9 @@ class VisibilityScorer:
         """对文件路径逐个解码并打分。批量小、只用于调试或小规模评估。"""
         images: list[np.ndarray] = []
         ok_paths: list[str] = []
-        h, w = self.input_size
         for p in paths:
             try:
-                with Image.open(p) as im:
-                    images.append(np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR)))
+                images.append(read_rgb_image(p, self.input_size))
                 ok_paths.append(str(p))
             except Exception as exc:  # noqa: BLE001
                 logger.error("无法读取 %s: %s", p, exc)
@@ -428,13 +440,6 @@ class VisibilityScorer:
         if not images:
             raise ValueError("校准至少需要一张正常天气参考图")
         means = reconstruction_mean(self.model, self._to_tensor_batch(images))
-        vals = np.asarray(means.cpu().tolist(), dtype=np.float64)
-        stats = CalibrationStats(
-            mean=float(vals.mean()),
-            std=float(vals.std()),
-            p95=float(np.percentile(vals, 95)),
-            p99=float(np.percentile(vals, 99)),
-            n=int(vals.size),
-        )
+        stats = CalibrationStats.from_errors(means.cpu().tolist())
         self.calibration = stats
         return stats

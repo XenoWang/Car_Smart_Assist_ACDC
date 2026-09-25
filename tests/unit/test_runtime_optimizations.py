@@ -5,12 +5,44 @@ import pickle
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 from torch.utils.data import DataLoader
 
 from car_smart_assist.inference.pipeline import InferencePipeline
-from car_smart_assist.perception.visibility.dataset import VisibilityImageDataset
-from car_smart_assist.perception.visibility.scorer import VisibilityScorer
+from car_smart_assist.perception.visibility.dataset import VisibilityImageDataset, read_rgb_image
+from car_smart_assist.perception.visibility.scorer import CalibrationStats, VisibilityScorer
 from car_smart_assist.perception.visibility.trainer import VisibilityTrainer
+
+
+@pytest.mark.parametrize("channels", [1, 3, 4])
+@pytest.mark.parametrize("size", [None, (8, 12)])
+def test_shared_image_reader_matches_original_conversion(tmp_path, channels, size):
+    shape = (17, 23) if channels == 1 else (17, 23, channels)
+    pixels = np.random.default_rng(7).integers(0, 256, shape, dtype=np.uint8)
+    path = tmp_path / "image.png"
+    Image.fromarray(pixels).save(path)
+    with Image.open(path) as image:
+        reference = image.convert("RGB")
+        if size is not None:
+            reference = reference.resize((size[1], size[0]), Image.BILINEAR)
+        expected = np.asarray(reference)
+    actual = read_rgb_image(path, size)
+    path.unlink()  # Windows 上文件句柄必须已经关闭。
+    np.testing.assert_array_equal(actual, expected)
+    assert actual.dtype == np.uint8
+
+
+def test_shared_calibration_statistics():
+    stats = CalibrationStats.from_errors([1, 2, 3, 4, 5])
+    assert stats.to_dict() == pytest.approx(
+        {"mean": 3, "std": 2 ** 0.5, "p95": 4.8, "p99": 4.96, "n": 5}
+    )
+
+
+@pytest.mark.parametrize("errors", [[], [float("nan")], [float("inf")], [[1, 2]]])
+def test_shared_calibration_rejects_invalid_errors(errors):
+    with pytest.raises(ValueError, match="校准"):
+        CalibrationStats.from_errors(errors)
 
 
 @pytest.mark.parametrize("augment", [False, True])

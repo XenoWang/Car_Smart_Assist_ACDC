@@ -38,8 +38,6 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from PIL import Image  # noqa: E402
-
 from car_smart_assist.config.visibility import MODEL_DEFAULTS  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
@@ -50,6 +48,7 @@ from car_smart_assist.perception.visibility import (  # noqa: E402
 )
 from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     list_ref_images,
+    read_rgb_image,
     sequence_of,
     split_ref_indices,
 )
@@ -69,12 +68,7 @@ MAX_SEV = SEVERITIES[-1]
 
 
 def load_refs(paths, size) -> list[np.ndarray]:
-    h, w = size
-    out = []
-    for p in paths:
-        with Image.open(p) as im:
-            out.append(np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR)))
-    return out
+    return [read_rgb_image(path, size) for path in paths]
 
 
 # ---------------------------------------------------------------------------

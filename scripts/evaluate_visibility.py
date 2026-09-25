@@ -38,7 +38,6 @@ from typing import Any
 
 import numpy as np
 import yaml
-from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -52,6 +51,7 @@ from car_smart_assist.perception.visibility import (  # noqa: E402
 from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     list_adverse_images,
     list_ref_images,
+    read_rgb_image,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,12 +64,10 @@ logger = logging.getLogger(__name__)
 
 def load_images(paths: list[Path], size: tuple[int, int]) -> list[np.ndarray]:
     """解码并缩放到指定尺寸，返回 uint8 数组列表。"""
-    h, w = size
     out: list[np.ndarray] = []
     for p in paths:
         try:
-            with Image.open(p) as im:
-                out.append(np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR)))
+            out.append(read_rgb_image(p, size))
         except Exception as exc:  # noqa: BLE001
             logger.warning("跳过无法读取的图 %s: %s", p, exc)
     return out

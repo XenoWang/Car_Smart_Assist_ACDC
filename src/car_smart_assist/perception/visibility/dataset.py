@@ -60,6 +60,20 @@ def list_adverse_images(
     return sorted(paths)
 
 
+def read_rgb_image(path: str | Path, size: tuple[int, int] | None = None) -> np.ndarray:
+    """读取 RGB uint8 图像；size 为 (H, W)，省略时保留原始分辨率。
+
+    缩放统一使用 BILINEAR，避免训练与评估的频率特征口径不一致。
+    读取异常交由调用方处理，文件句柄在返回前关闭。
+    """
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        if size is not None:
+            h, w = size
+            rgb = rgb.resize((w, h), Image.BILINEAR)
+        return np.asarray(rgb, dtype=np.uint8)
+
+
 def _build_cache(paths: Sequence[Path], size: tuple[int, int], cache: Path) -> np.ndarray:
     """把图像解码、缩放、存成 npy。返回 uint8 数组 (N, H, W, 3)。"""
     h, w = size
@@ -70,10 +84,7 @@ def _build_cache(paths: Sequence[Path], size: tuple[int, int], cache: Path) -> n
     failed: list[tuple[str, str]] = []
     for i, p in enumerate(paths):
         try:
-            with Image.open(p) as im:
-                # BILINEAR 而非 LANCZOS：缩放是预处理，不是关键路径；
-                # 且 LANCZOS 的锐化会人为抬高高频能量，干扰「糊没糊」的判据
-                arr[i] = np.asarray(im.convert("RGB").resize((w, h), Image.BILINEAR))
+            arr[i] = read_rgb_image(p, size)
         except Exception as exc:  # noqa: BLE001
             failed.append((str(p), f"{type(exc).__name__}: {exc}"))
             arr[i] = 0
@@ -350,12 +361,7 @@ class VisibilityImageDataset(Dataset):
         if cache is not None:
             img = np.asarray(cache[idx])                             # (H, W, 3) uint8
         else:
-            with Image.open(self.paths[idx]) as im:
-                img = np.asarray(
-                    im.convert("RGB").resize(
-                        (self.input_size[1], self.input_size[0]), Image.BILINEAR
-                    )
-                )
+            img = read_rgb_image(self.paths[idx], self.input_size)
 
         # 显式拷贝而非 ascontiguousarray：
         # memmap 是只读的，torch.from_numpy 会共享内存并发出

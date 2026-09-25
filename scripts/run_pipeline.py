@@ -27,7 +27,6 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -35,6 +34,7 @@ from car_smart_assist.inference.pipeline import InferencePipeline  # noqa: E402
 from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     list_adverse_images,
     list_ref_images,
+    read_rgb_image,
 )
 
 
@@ -57,12 +57,12 @@ def build_samples(root: Path, cfg: dict) -> list[tuple[str, np.ndarray]]:
 
     refs = list_ref_images(acdc)
     if refs:
-        samples.append(("正常天气参考图", np.asarray(Image.open(refs[0]).convert("RGB"))))
+        samples.append(("正常天气参考图", read_rgb_image(refs[0])))
 
     for cond in ("fog", "night", "rain", "snow"):
         paths = list_adverse_images(acdc, [cond])
         if paths:
-            samples.append((f"真实 {cond}", np.asarray(Image.open(paths[0]).convert("RGB"))))
+            samples.append((f"真实 {cond}", read_rgb_image(paths[0])))
     return samples
 
 
@@ -82,7 +82,7 @@ def main() -> int:
     )
 
     if args.image:
-        samples = [(Path(p).name, np.asarray(Image.open(p).convert("RGB"))) for p in args.image]
+        samples = [(Path(p).name, read_rgb_image(p)) for p in args.image]
     else:
         samples = build_samples(root, cfg)
 
@@ -100,7 +100,7 @@ def main() -> int:
 
     if args.json:
         print(json.dumps(
-            [{"name": n, **r.to_dict()} for (n, _), r in zip(samples, results)],
+            [{"name": n, **r.to_dict()} for (n, _), r in zip(samples, results, strict=True)],
             ensure_ascii=False, indent=2,
         ))
         return 0
@@ -108,7 +108,7 @@ def main() -> int:
     print("=" * 92)
     print(f"{'样本':<22}{'能见度':<10}{'信息量':>8}{'接管':>6}{'风险':>10}  提示")
     print("-" * 92)
-    for (name, _), r in zip(samples, results):
+    for (name, _), r in zip(samples, results, strict=True):
         v = r.visibility
         a = r.advisory
         info = f"{v.information:.3f}" if v else "n/a"
@@ -130,7 +130,7 @@ def main() -> int:
     from car_smart_assist.advisory.prompt.templates import check_wording
 
     bad = 0
-    for _, r in zip(samples, results):
+    for r in results:
         probs = check_wording(r.advisory.text)
         if probs:
             bad += 1

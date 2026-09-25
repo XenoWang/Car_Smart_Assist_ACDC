@@ -305,9 +305,7 @@ class ConvAutoencoder(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """自重建。输出与输入同尺寸（用 interpolate 兜底非 16 倍数的输入）。"""
-        f = self.pool_to_grid(self.encoder(x))
-        f = self.pre_latent(f)
-        z = self.to_latent(f.flatten(1))
+        z = self.encode(x)
         y = self.from_latent(z).view(x.shape[0], self.latent_spatial_ch, *self.feat_hw)
         y = self.post_latent(y)
         y = self.decoder(y)

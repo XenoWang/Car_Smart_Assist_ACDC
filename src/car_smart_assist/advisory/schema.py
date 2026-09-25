@@ -117,20 +117,20 @@ class PerceptionResult:
     @property
     def nearest_leading(self) -> TargetObject | None:
         """最近的前车。None 表示没有或距离未知。"""
-        cands = [
-            o for o in self.objects
-            if o.direction is TargetDirection.LEADING and o.distance_m is not None
-        ]
-        return min(cands, key=lambda o: o.distance_m) if cands else None
+        return self._nearest_in_direction(TargetDirection.LEADING)
 
     @property
     def nearest_oncoming(self) -> TargetObject | None:
         """最近的来车。"""
-        cands = [
-            o for o in self.objects
-            if o.direction is TargetDirection.ONCOMING and o.distance_m is not None
-        ]
-        return min(cands, key=lambda o: o.distance_m) if cands else None
+        return self._nearest_in_direction(TargetDirection.ONCOMING)
+
+    def _nearest_in_direction(self, direction: TargetDirection) -> TargetObject | None:
+        """单次遍历查找最近目标，不创建候选列表。"""
+        return min(
+            (o for o in self.objects if o.direction is direction and o.distance_m is not None),
+            key=lambda o: o.distance_m,
+            default=None,
+        )
 
 
 @dataclass

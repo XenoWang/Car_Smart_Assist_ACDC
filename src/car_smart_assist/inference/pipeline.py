@@ -65,6 +65,7 @@ from PIL import Image
 from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
 from car_smart_assist.config.visibility import MODEL_DEFAULTS
+from car_smart_assist.perception.visibility.dataset import read_rgb_image
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
     VisibilityLevel,
@@ -117,8 +118,7 @@ def _to_array(image: np.ndarray | Image.Image | str | Path) -> np.ndarray:
         return np.ascontiguousarray(a)
     if isinstance(image, Image.Image):
         return np.asarray(image.convert("RGB"), dtype=np.uint8)
-    with Image.open(image) as im:
-        return np.asarray(im.convert("RGB"), dtype=np.uint8)
+    return read_rgb_image(image)
 
 
 class InferencePipeline:
