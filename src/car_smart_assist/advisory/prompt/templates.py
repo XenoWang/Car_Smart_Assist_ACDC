@@ -20,8 +20,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from car_smart_assist.advisory.schema import RiskLevel
 from car_smart_assist.perception.visibility.gate import VisibilityLevel
+
+if TYPE_CHECKING:
+    from car_smart_assist.advisory.policy.handover_rules import HandoverDecision
 
 # --- 能见度三档的固定文案 ---
 VISIBILITY_TEXT: dict[VisibilityLevel, str] = {
@@ -59,6 +64,21 @@ def render_visibility(level: VisibilityLevel) -> tuple[str, RiskLevel]:
     if text is None or risk is None:
         return "路况未知，请注意观察", RiskLevel.NOTICE
     return text, risk
+
+
+def render_policy(decision: HandoverDecision) -> str:
+    """动作由规则决定，完整原因放在 evidence，驾驶提示保持简短。"""
+    if decision.should_takeover:
+        if decision.unable_to_judge:
+            return FALLBACK_TEXT
+        if decision.risk.risk_level is RiskLevel.CRITICAL:
+            return "识别到高风险情况，请立即接管车辆"
+        return "已达系统能力边界，请立即接管车辆"
+    if decision.risk.risk_level is RiskLevel.WARNING:
+        return "图片识别到风险，请减速并注意周围交通"
+    if decision.action == "light_notice":
+        return "请提高注意，持续观察路况变化"
+    return "当前未触发风险规则，请继续观察路况"
 
 
 def check_wording(text: str) -> list[str]:

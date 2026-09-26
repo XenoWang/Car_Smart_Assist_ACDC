@@ -79,6 +79,7 @@ coverage.xml
 .idea/
 *.swp
 *~
+.claude/
 
 # Windows
 Thumbs.db

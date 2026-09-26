@@ -83,7 +83,7 @@ advisory:
   # --- 决策策略（规则引擎，见 advisory/policy/handover_rules.py）---
   # 这一段的阈值直接关系安全，改动必须走 docs/adr/ 记录理由
   policy:
-    # 距离阈值（米）—— 超过这些值就要提示
+    # 距离阈值（米）—— 距离严格小于阈值时触发；初始规则，须用验证数据标定
     distance_thresholds:
       critical: 15                 # < 15m：建议立即接管
       warning: 30                  # < 30m：提示注意
@@ -95,15 +95,30 @@ advisory:
       2: request_takeover          # 应立即接管
     # 天气权重：同样的距离，雨雪天要更早提示（制动距离变长）
     weather_risk_multiplier:
+      clear: 1.0                  # 预留给可输出正常天气的识别器
       fog:   1.4
       rain:  1.3
       snow:  1.6
       night: 1.2
-    # 置信度低于此值时不下「无需接管」的结论，改为保守的「无法判断，请保持注意」。
-    # 这是「宁可保守」原则的具体实现 —— 不确定时不给出安全承诺。
+    # 天气识别本身的提示等级；天气类别不单独触发接管。倍率只调整目标距离阈值，
+    # 可与目标距离共同提高风险等级；可见清晰度极差时由 visibility_gate 请求接管。
+    weather_risk_levels:
+      clear: none
+      fog: notice
+      rain: notice
+      snow: notice
+      night: notice
+    # 使用识别置信度 × 能见度乘子；不足时明确请求接管。
     min_confidence_for_clear: 0.7
     # 来车（对向）用更严格的阈值：会车时相对速度是叠加的
     oncoming_stricter_factor: 1.2
+    # 有距离标准差时使用 max(0, distance - sigma * 标准差) 进行保守分级。
+    uncertainty_sigma: 1.0
+    max_distance_uncertainty_ratio: 0.5
+    # 距离头暂未提供标准差时，仍可使用有效距离；提供了非法值则视作无法判断。
+    require_distance_uncertainty: false
+    # 当前规则可以独立于接管分类头运行；若接入该头并设 true，缺失会请求接管。
+    require_handover_head: false
 
   # --- 生成后处理 ---
   postprocess:

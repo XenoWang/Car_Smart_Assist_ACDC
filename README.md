@@ -170,6 +170,20 @@ python scripts/analyze_dataset.py
 
 ### 5. 训练与评测
 
+已实装的独立天气模型可用项目 `.venv` 单独训练：
+
+```powershell
+.venv\Scripts\python.exe scripts\train_weather.py
+```
+
+先将 ACDC 官方 `rgb_anon/{fog,night,rain,snow}/{train,val}` 放在 `data/raw/acdc/`；
+默认自动续训，`--fresh` 从头训练。权重保存到 `artifacts/checkpoints/weather/best.pt`，
+推理管线找到该权重后自动加载并输出四类概率与视觉线索。
+目前工作区没有原始 ACDC 图片，因此尚无真实数据训练的天气权重或准确率结果。
+反光、疑似湿润区域、亮白覆盖与低对比度仅是图像代理指标，不代表水深、摩擦力、实际积雪面积或雾中可视距离。
+
+项目下列完整 Stage 1/Stage 2 命令目前仍包含尚未实装的模块：
+
 ```bash
 make dry-run              # 只跑几个 step，确认训练通路打通
 make train-perception     # Stage 1

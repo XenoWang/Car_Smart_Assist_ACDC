@@ -1,4 +1,4 @@
-"""数据清洗入口：校验 ACDC 与 KITTI 的完整性与一致性。
+"""数据清洗入口：校验 ACDC、KITTI 与 Pixel Accurate Benchmark 图像完整性。
 
 职责:
     - 解析 configs/data/cleaning.yaml，调用 car_smart_assist.data.preprocessing.clean
@@ -10,11 +10,12 @@
     python scripts/clean_data.py                          # 全量清洗
     python scripts/clean_data.py --only acdc              # 只洗 ACDC
     python scripts/clean_data.py --only kitti --workers 8
+    python scripts/clean_data.py --only acdc pixel_accurate_benchmark --corrupt-images-only
 
 产物（**不修改任何原始文件**）:
     artifacts/reports/cleaning/report.json    完整明细
     artifacts/reports/cleaning/report.md      可读摘要
-    data/processed/manifests/{acdc,kitti}.json  有效样本清单，供数据集类过滤
+    data/processed/manifests/{acdc,kitti,pixel_accurate_benchmark}.json
 
 退出码:
     0  无 ERROR
@@ -41,8 +42,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="数据清洗：完整性、一致性与重复性校验")
     p.add_argument("--config", default="configs/data/cleaning.yaml", help="清洗配置文件")
     p.add_argument(
-        "--only", nargs="*", choices=["acdc", "kitti"], default=None,
-        help="只清洗指定数据集，默认全部",
+        "--only", nargs="*", choices=["acdc", "kitti", "pixel_accurate_benchmark"], default=None,
+        help="只清洗指定数据集；未指定时清洗 ACDC 与 KITTI",
+    )
+    p.add_argument(
+        "--corrupt-images-only",
+        action="store_true",
+        help="只扫描完全无法解码的图片，不检查标注、内容统计、重复项或其他文件",
     )
     p.add_argument("--workers", type=int, default=None, help="覆盖配置中的并行度")
     p.add_argument("--log-level", default="INFO", help="日志级别")
@@ -72,7 +78,12 @@ def main() -> int:
         cfg["num_workers"] = args.workers
 
     print(f"开始清洗（配置文件 {cfg_path.relative_to(root)}）...")
-    report = pp.clean(cfg, project_root=root, only=args.only)
+    report = pp.clean(
+        cfg,
+        project_root=root,
+        only=args.only,
+        corrupt_images_only=args.corrupt_images_only,
+    )
 
     sev = report.counts_by_severity()
     print("\n" + "=" * 62)

@@ -166,7 +166,7 @@ class TestGateBlocksPerception:
         assert "perception" in r.skipped
         assert "尚未接入" in r.skipped["perception"]
         assert r.advisory.should_takeover is True
-        assert r.advisory.risk_level is RiskLevel.CRITICAL
+        assert r.advisory.risk_level is RiskLevel.UNKNOWN
 
     def test_scorer_failure_emits_takeover_fallback(self):
         predictor = StubPredictor()
@@ -347,25 +347,44 @@ class TestSchemaContract:
 
 
 class TestAdvisoryGenerator:
+    @pytest.mark.parametrize(("distance", "risk", "takeover"), [
+        (10.0, RiskLevel.CRITICAL, True),
+        (25.0, RiskLevel.WARNING, False),
+        (60.0, RiskLevel.NONE, False),
+    ])
+    def test_pipeline_uses_recognized_scene(self, distance, risk, takeover):
+        class RecognizedScenePredictor:
+            def predict(self, image):
+                return PerceptionResult(
+                    road_condition="clear", road_condition_confidence=1.0,
+                    object_detection_available=True,
+                    objects=[TargetObject("car", TargetDirection.LEADING, distance, confidence=1.0)],
+                )
+
+        result = make_pipeline(information=0.95, predictor=RecognizedScenePredictor()).run(frame())
+        assert result.advisory.source == "policy"
+        assert result.advisory.risk_level is risk
+        assert result.advisory.should_takeover is takeover
+        assert result.advisory.policy_details["unable_to_judge"] is False
+
     def test_fallback_when_nothing_available(self):
         a = AdvisoryGenerator().generate()
         assert a.text == FALLBACK_TEXT
         assert a.source == "fallback"
         assert a.text  # 不静默失声
         assert a.should_takeover is True
-        assert a.risk_level is RiskLevel.CRITICAL
+        assert a.risk_level is RiskLevel.UNKNOWN
 
-    def test_perception_path_not_implemented_but_does_not_silence(self):
-        """感知路径未实现时必须明确，而不是返回假数据或空。"""
+    def test_incomplete_perception_requests_takeover(self):
+        """感知规则已实现，但缺少关键识别字段时不能假装能判断。"""
         g = AdvisoryGenerator()
         p = PerceptionResult(road_condition="fog")
-        assert hasattr(g, "from_perception")
-        with pytest.raises(NotImplementedError, match="尚未实现"):
-            g.from_perception(p)
-        # 但统一入口不能因此失声
+        assert g.from_perception(p).source == "policy"
         a = g.generate(perception=p)
         assert a.text
         assert a.should_takeover is True
+        assert a.risk_level is RiskLevel.UNKNOWN
+        assert a.policy_details["unable_to_judge"] is True
 
     def test_blind_takes_priority_over_perception(self):
         from car_smart_assist.perception.visibility.gate import VisibilityVerdict

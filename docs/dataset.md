@@ -36,7 +36,7 @@ ETH Zurich, ICCV 2021
 - ❌ **没有距离标注** → 距离头必须用外部数据集监督（**这是唯一必须外部的任务**）
 - ❌ **没有「前车 / 来车」的方向区分** → 检测框只有类别标签，方向要自己推导
 - ❌ **没有接管/决策相关标注** → 接管边界标签必须自己构造（见 `handover_policy.md`）
-- ❌ **没有官方 train/val/test 划分** → 必须自己按 scene 切分
+- ❌ **没有积水深度、路面积雪覆盖率和雾能见距离的逐图数值标签** → 不能直接监督这些物理量
 
 > ⚠️ **勘误记录（2026-09-21）**
 > 本文档早期版本写着「没有车辆检测框 → 检测头必须用外部数据集监督」，**这是错的**。
@@ -46,6 +46,10 @@ ETH Zurich, ICCV 2021
 > 影响：检测任务不必再跨域，域差异问题从「检测 + 距离」缩小到只剩「距离」。
 > 相应地，`configs/model/perception_multitask.yaml` 中检测头的
 > `label_source` 应从 `external` 改为 `acdc`。
+
+> ACDC 官方提供 train/val/test 图像划分；四类条件由 fog/night/rain/snow 子集确定。
+> 独立天气小模型只用 train 训练、val 选优，test 保留作最终评估。
+> 类别来源见 [ACDC 原论文](https://openaccess.thecvf.com/content/ICCV2021/papers/Sakaridis_ACDC_The_Adverse_Conditions_Dataset_With_Correspondences_for_Semantic_Driving_ICCV_2021_paper.pdf)。
 
 ### 1.3 数据划分注意事项
 

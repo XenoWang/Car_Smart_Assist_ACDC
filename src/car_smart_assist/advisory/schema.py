@@ -32,7 +32,8 @@ from typing import Any
 class RiskLevel(str, Enum):
     """风险等级。决定提示强度。"""
 
-    NONE = "none"          # 一切正常，不提示
+    UNKNOWN = "unknown"    # 识别信息不足，无法评估场景风险
+    NONE = "none"          # 当前识别证据未触发风险规则，不代表道路安全
     NOTICE = "notice"      # 轻提示：注意即可
     WARNING = "warning"    # 需要动作：减速 / 提高注意
     CRITICAL = "critical"  # 必须立即接管
@@ -93,6 +94,9 @@ class PerceptionResult:
 
     # --- 目标 ---
     objects: list[TargetObject] = field(default_factory=list)
+    # 只有检测器实际成功运行并返回本帧完整结果时才设为 True。
+    # True + [] 表示未检出目标；False 表示检测结果不可用，两者不能混同。
+    object_detection_available: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -104,6 +108,7 @@ class PerceptionResult:
             "handover_level": self.handover_level,
             "handover_confidence": self.handover_confidence,
             "objects": [o.to_dict() for o in self.objects],
+            "object_detection_available": self.object_detection_available,
         }
 
     def effective_confidence(self, raw: float) -> float:
@@ -147,6 +152,8 @@ class AdvisoryResult:
     # 这条结果是哪个环节产生的：visibility_gate | policy | template | llm
     # 用它区分「规则判定的」与「模型生成的」，出问题时能快速定位。
     source: str = "unknown"
+    # 感知策略的分级依据、未知项和接管决定；门控/兜底路径可为 None。
+    policy_details: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)

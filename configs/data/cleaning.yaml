@@ -16,6 +16,10 @@ cleaning:
     # 每条问题在报告里最多保留多少条明细（防止一个批量问题刷爆报告）
     max_samples_per_issue: 50
 
+  # --- 外部数据集路径 ---
+  pixel_accurate_benchmark:
+    root: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark
+
   # --- 检查开关：按需关闭，便于分步排查 ---
   checks:
     image_integrity: true          # 能否解码、是否截断

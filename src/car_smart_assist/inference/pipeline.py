@@ -44,7 +44,7 @@
 当前实现状态:
     ① 已实现且已验证（召回/误报/单调性见 artifacts/reports/visibility/）
     ② 未实现 —— Stage 1 多任务模型尚未训练
-    ③ 部分实现 —— 门控驱动的接管路径可用（advisory/generator.from_visibility）
+    ③ 已实现 —— 门控接管与结构化感知规则路径可用（advisory/generator）
 
     因此现在跑管线会得到「路况未知」类的提示而不是真实识别结果。
     这是如实反映实现进度，不是 bug —— 管线会把这些阶段记进 `skipped`。
@@ -65,6 +65,7 @@ from PIL import Image
 from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
 from car_smart_assist.config.visibility import MODEL_DEFAULTS
+from car_smart_assist.config.weather import load_weather_config
 from car_smart_assist.perception.visibility.dataset import read_rgb_image
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
@@ -72,6 +73,7 @@ from car_smart_assist.perception.visibility.gate import (
     VisibilityVerdict,
 )
 from car_smart_assist.perception.visibility.scorer import VisibilityScorer
+from car_smart_assist.perception.weather import WeatherPrediction, WeatherPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,7 @@ class PipelineResult:
     visibility: VisibilityVerdict | None = None
     perception: PerceptionResult | None = None
     advisory: AdvisoryResult | None = None
+    weather: WeatherPrediction | None = None
     # 各阶段耗时（毫秒）。分开计是因为三者的优化手段完全不同，
     # 只给一个总耗时说明不了任何问题。
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -97,6 +100,7 @@ class PipelineResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "visibility": self.visibility.to_dict() if self.visibility else None,
+            "weather": self.weather.to_dict() if self.weather else None,
             "perception": self.perception.to_dict() if self.perception else None,
             "advisory": self.advisory.to_dict() if self.advisory else None,
             "timings_ms": {k: round(v, 2) for k, v in self.timings_ms.items()},
@@ -142,18 +146,19 @@ class InferencePipeline:
         predictor: Any | None = None,
         gate_input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         cfg: dict[str, Any] | None = None,
+        weather_predictor: WeatherPredictor | None = None,
     ) -> None:
         self.scorer = scorer
         self.gate = gate or VisibilityGate()
         self.generator = generator or AdvisoryGenerator()
         self.predictor = predictor
+        self.weather_predictor = weather_predictor
         self.gate_input_size = tuple(gate_input_size)
         self.cfg = cfg or {}
 
         if self.scorer is None:
             logger.warning(
-                "管线未接入能见度门控 —— 这一帧不会经过任何能见度判断。"
-                "安全网失效，仅应用于调试。"
+                "管线未接入能见度门控 —— 这一帧不会经过任何能见度判断。安全网失效，仅应用于调试。"
             )
 
     # --- 构建 ---
@@ -168,6 +173,7 @@ class InferencePipeline:
         advisory_cfg: dict[str, Any] | None = None,
         predictor: Any | None = None,
         require_visibility: bool = True,
+        weather_checkpoint: str | Path | None = None,
     ) -> InferencePipeline:
         """按配置构建管线。
 
@@ -192,7 +198,8 @@ class InferencePipeline:
             from car_smart_assist.perception.visibility.trainer import resolve_device
 
             scorer = VisibilityScorer.from_checkpoint(
-                ckpt, device=resolve_device(device or str(visibility_cfg.get("device", "auto"))),
+                ckpt,
+                device=resolve_device(device or str(visibility_cfg.get("device", "auto"))),
                 cfg=model_cfg,
                 scoring_cfg=visibility_cfg.get("scoring"),
             )
@@ -209,11 +216,27 @@ class InferencePipeline:
         else:
             logger.warning("未找到门控 checkpoint（%s），管线将不带能见度判断运行", ckpt)
 
+        weather_predictor = None
+        weather_config_path = root / "configs/model/weather_classifier.yaml"
+        if weather_config_path.is_file():
+            weather_cfg = load_weather_config(weather_config_path)
+            weather_ckpt = (
+                Path(weather_checkpoint) if weather_checkpoint else Path(weather_cfg.checkpoint)
+            )
+            if not weather_ckpt.is_absolute():
+                weather_ckpt = root / weather_ckpt
+            if weather_ckpt.is_file():
+                weather_predictor = WeatherPredictor.from_checkpoint(weather_ckpt, weather_cfg)
+                logger.info("天气小模型已接入: %s", weather_ckpt)
+        elif weather_checkpoint is not None:
+            raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
+
         return cls(
             scorer=scorer,
             gate=VisibilityGate.from_config(visibility_cfg),
             generator=AdvisoryGenerator(advisory_cfg),
             predictor=predictor,
+            weather_predictor=weather_predictor,
             gate_input_size=size,
             cfg={"visibility": visibility_cfg, "advisory": advisory_cfg or {}},
         )
@@ -231,9 +254,7 @@ class InferencePipeline:
         h, w = self.gate_input_size
         if img.shape[0] == h and img.shape[1] == w:
             return img
-        return np.asarray(
-            Image.fromarray(img).resize((w, h), Image.BILINEAR), dtype=np.uint8
-        )
+        return np.asarray(Image.fromarray(img).resize((w, h), Image.BILINEAR), dtype=np.uint8)
 
     def _run_gate(self, images: Sequence[np.ndarray]) -> list[VisibilityVerdict]:
         if self.scorer is None:
@@ -293,10 +314,32 @@ class InferencePipeline:
                 r.skipped["advisory_perception_path"] = "同上"
                 continue
 
+            if self.weather_predictor is not None:
+                weather_started = time.perf_counter()
+                try:
+                    weather = self.weather_predictor.predict(arrays[i])
+                    if not isinstance(weather, WeatherPrediction):
+                        raise TypeError("weather_predictor.predict() 必须返回 WeatherPrediction")
+                    r.weather = weather
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("天气识别失败")
+                    r.skipped["weather"] = f"天气识别异常: {type(exc).__name__}: {exc}"
+                r.timings_ms["weather"] = (time.perf_counter() - weather_started) * 1000.0
+
             if self.predictor is None:
                 r.skipped["perception"] = (
                     "Stage 1 感知模型尚未接入（perception/models/multitask.py 待训练）"
                 )
+                if r.weather is not None:
+                    r.perception = PerceptionResult(
+                        visibility_level=r.visibility.level.value if r.visibility else "unknown",
+                        visibility_confidence_multiplier=(
+                            r.visibility.confidence_multiplier if r.visibility else 1.0
+                        ),
+                        visibility_reasons=list(r.visibility.triggered) if r.visibility else [],
+                        road_condition=r.weather.condition,
+                        road_condition_confidence=r.weather.confidence,
+                    )
                 continue
 
             t1 = time.perf_counter()
@@ -311,10 +354,16 @@ class InferencePipeline:
                     )
                 if r.visibility is not None:
                     perception.visibility_level = r.visibility.level.value
-                    perception.visibility_confidence_multiplier = (
-                        r.visibility.confidence_multiplier
-                    )
+                    perception.visibility_confidence_multiplier = r.visibility.confidence_multiplier
                     perception.visibility_reasons = list(r.visibility.triggered)
+                if r.weather is not None and r.weather.accepted:
+                    if perception.road_condition is None:
+                        perception.road_condition = r.weather.condition
+                        perception.road_condition_confidence = r.weather.confidence
+                    elif perception.road_condition != r.weather.condition:
+                        perception.road_condition = None
+                        perception.road_condition_confidence = 0.0
+                        r.skipped["weather_fusion"] = "两个识别器的路况类别冲突，改为无法判断"
                 r.perception = perception
             except Exception as exc:  # noqa: BLE001
                 # 感知失败不能让整条管线失声 —— 记下来，后面走降级文案

@@ -1,10 +1,11 @@
-"""数据清洗：对 ACDC 与 KITTI 做完整性、一致性与重复性校验。
+"""数据清洗：对 ACDC、KITTI 与 Pixel Accurate Benchmark 做完整性检查。
 
 职责:
     - 图像完整性：能否解码、是否截断、尺寸是否异常、是否退化（纯色/极低方差）
     - ACDC 配对：每张图与它的 5 个标注变体是否配套；掩码是否有效（非全 ignore、类别在范围内）
     - 检测标注：bbox 是否越界/零面积、是否引用了不存在的图像、是否有孤儿标注
     - KITTI 三元组：image / label / calib 是否齐全，每帧内参是否可解析
+    - Pixel Accurate Benchmark：直接检查子 ZIP 中图片能否完整解码
     - 重复检测：精确重复（内容哈希）与近重复（dHash 汉明距离）
     - 统计离群（可选）：抓「能正常解码但统计特征异常」的图，这是完整性检查抓不到的
     - 产出清洗报告与「有效样本清单」，供数据集类过滤
@@ -48,9 +49,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
 import math
+import zipfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -386,6 +389,51 @@ def _run_probes(
         if not r["ok"]:
             report.error(check, r["path"], f"无法解码: {r['error']}")
     return results
+
+
+def check_zip_image_integrity(
+    archive_paths: Sequence[Path],
+    report: CleaningReport,
+    *,
+    check: str,
+    project_root: str | Path,
+) -> list[str]:
+    """完整解码 ZIP 内图片；原归档不解包、不修改。"""
+    image_extensions = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+    checked_paths: list[str] = []
+    checked = 0
+    invalid = 0
+    base = Path(project_root).resolve()
+
+    for archive_path in sorted(archive_paths):
+        try:
+            with zipfile.ZipFile(archive_path) as archive:
+                for info in archive.infolist():
+                    if info.is_dir() or Path(info.filename).suffix.lower() not in image_extensions:
+                        continue
+                    member_path = f"{archive_path.resolve().relative_to(base)}::{info.filename}"
+                    checked_paths.append(member_path)
+                    checked += 1
+                    try:
+                        image_bytes = archive.read(info)
+                        with Image.open(io.BytesIO(image_bytes)) as image:
+                            image.verify()
+                        with Image.open(io.BytesIO(image_bytes)) as image:
+                            image.load()
+                    except Exception as exc:  # noqa: BLE001 — 一个损坏成员不能中断整包扫描
+                        invalid += 1
+                        report.error(
+                            check,
+                            member_path,
+                            f"无法完整解码: {type(exc).__name__}: {exc}",
+                        )
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            report.error(check, archive_path, f"无法读取图像归档: {type(exc).__name__}: {exc}")
+
+    report.mark_checked(f"{check.rsplit('/', 1)[0]}.images_probed", checked)
+    report.stats[f"{check.rsplit('/', 1)[0]}_total_images"] = checked
+    report.stats[f"{check.rsplit('/', 1)[0]}_corrupt_images"] = invalid
+    return checked_paths
 
 
 # =============================================================================
@@ -1014,7 +1062,7 @@ def check_statistical_outliers(
 
 
 def _write_manifest(
-    report: CleaningReport, all_paths: Sequence[Path], out_dir: str | Path, name: str
+    report: CleaningReport, all_paths: Sequence[str | Path], out_dir: str | Path, name: str
 ) -> Path:
     """写出有效样本清单 —— 清洗的实际交付物，数据集类据此过滤。"""
     out = Path(out_dir)
@@ -1044,6 +1092,7 @@ def clean(
     *,
     project_root: str | Path = ".",
     only: Iterable[str] | None = None,
+    corrupt_images_only: bool = False,
 ) -> CleaningReport:
     """执行数据清洗。
 
@@ -1051,6 +1100,7 @@ def clean(
         cfg: cleaning 配置段（configs/data/cleaning.yaml 的 ``cleaning`` 键）
         project_root: 项目根目录，配置里的相对路径以此为基准
         only: 只跑指定的数据集，如 ``{"acdc"}``；None 表示全部
+        corrupt_images_only: 只检查完整图像解码，不检查配对、统计特征或重复项
 
     Returns:
         填充好的 CleaningReport
@@ -1061,7 +1111,7 @@ def clean(
     """
     root = Path(project_root)
     report = CleaningReport()
-    checks = cfg.get("checks", {})
+    checks = {} if corrupt_images_only else cfg.get("checks", {})
     workers = int(cfg.get("num_workers", 4))
     out_cfg = cfg.get("output", {})
     max_samp = int(out_cfg.get("max_samples_per_issue", 50))
@@ -1070,11 +1120,27 @@ def clean(
 
     if "acdc" in targets:
         acdc_root = root / "data" / "raw" / "acdc"
-        check_acdc(acdc_root, report, cfg, checks, num_workers=workers,
-                   max_samples_per_issue=max_samp)
+        if not corrupt_images_only:
+            check_acdc(acdc_root, report, cfg, checks, num_workers=workers,
+                       max_samples_per_issue=max_samp)
         acdc_images = sorted((acdc_root / "rgb_anon").rglob("*.png")) if acdc_root.exists() else []
         if acdc_images:
-            check_duplicates(acdc_images, report, cfg.get("duplicates", {}), checks, label="acdc")
+            if corrupt_images_only:
+                results = _run_probes(
+                    acdc_images,
+                    report,
+                    check="acdc/image_integrity",
+                    force_load=True,
+                    want_stats=False,
+                    downsample=1,
+                    num_workers=workers,
+                )
+                report.mark_checked("acdc.images_probed", len(results))
+                report.stats["acdc_total_images"] = len(acdc_images)
+            else:
+                check_duplicates(
+                    acdc_images, report, cfg.get("duplicates", {}), checks, label="acdc"
+                )
             if checks.get("statistical_outliers", False):
                 integ = cfg.get("integrity", {})
                 stat_cfg = cfg.get("image_statistics", {})
@@ -1092,12 +1158,45 @@ def clean(
 
     if "kitti" in targets:
         kitti_root = root / "data" / "external" / "kitti"
-        check_kitti(kitti_root, report, cfg, checks, num_workers=workers)
+        if not corrupt_images_only:
+            check_kitti(kitti_root, report, cfg, checks, num_workers=workers)
         kitti_images = sorted(kitti_root.rglob("image_2/*.png")) if kitti_root.exists() else []
         if kitti_images:
-            check_duplicates(kitti_images, report, cfg.get("duplicates", {}), checks, label="kitti")
+            if not corrupt_images_only:
+                check_duplicates(
+                    kitti_images, report, cfg.get("duplicates", {}), checks, label="kitti"
+                )
+            else:
+                results = _run_probes(
+                    kitti_images, report, check="kitti/image_integrity",
+                    force_load=True, want_stats=False, downsample=1, num_workers=workers,
+                )
+                report.mark_checked("kitti.images_probed", len(results))
             _write_manifest(report, kitti_images, root / out_cfg.get(
                 "manifest_dir", "data/processed/manifests"), "kitti")
+
+    if "pixel_accurate_benchmark" in targets:
+        benchmark_cfg = cfg.get("pixel_accurate_benchmark", {})
+        benchmark_root = root / benchmark_cfg.get(
+            "root", "data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark"
+        )
+        if not benchmark_root.exists():
+            report.mark_skipped("pixel_accurate_benchmark", f"路径不存在: {benchmark_root}")
+        else:
+            image_archives = sorted(benchmark_root.glob("*.zip"))
+            image_paths = check_zip_image_integrity(
+                image_archives,
+                report,
+                check="pixel_accurate_benchmark/image_integrity",
+                project_root=root,
+            )
+            if image_paths:
+                _write_manifest(
+                    report,
+                    image_paths,
+                    root / out_cfg.get("manifest_dir", "data/processed/manifests"),
+                    "pixel_accurate_benchmark",
+                )
 
     report.write(root / out_cfg.get("report_dir", "artifacts/reports/cleaning"), max_samp)
     return report

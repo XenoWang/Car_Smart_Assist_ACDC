@@ -1,0 +1,28 @@
+# ACDC 四类场景条件识别；类别来自官方子集，视觉线索不是物理量。
+weather_classifier:
+  classes: [fog, night, rain, snow]
+  image_size: [128, 224]            # [高, 宽]，维持 ACDC 约 16:9 的画幅
+  channels: [16, 32, 64]
+  dropout: 0.2
+  checkpoint: artifacts/checkpoints/weather/best.pt
+  device: auto                     # auto 优先 CUDA；不可用时用 CPU
+  min_confidence: 0.70
+  min_margin: 0.15                 # 前两类概率差过小则拒绝判断
+  features:
+    road_top_fraction: 0.55        # 下部中央仅是道路区域近似，不是分割掩膜
+    road_side_fraction: 0.15
+    bright_threshold: 0.72
+    dark_threshold: 0.38
+    saturation_max: 0.25
+    smooth_gradient_max: 0.06
+  train:
+    acdc_root: data/raw/acdc
+    cache_dir: data/processed/weather
+    epochs: 20
+    batch_size: 16
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    label_smoothing: 0.05
+    patience: 5
+    num_workers: 0
+    seed: 42
