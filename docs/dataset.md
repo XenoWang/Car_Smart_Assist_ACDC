@@ -48,7 +48,8 @@ ETH Zurich, ICCV 2021
 > `label_source` 应从 `external` 改为 `acdc`。
 
 > ACDC 官方提供 train/val/test 图像划分；四类条件由 fog/night/rain/snow 子集确定。
-> 独立天气小模型只用 train 训练、val 选优，test 保留作最终评估。
+> 实测官方 train 和 val 可能包含同一 sequence 的不同帧。天气小模型将官方 train+val
+> 合并后按 sequence 分组重切分训练/验证；官方 test 保留作最终评估。
 > 类别来源见 [ACDC 原论文](https://openaccess.thecvf.com/content/ICCV2021/papers/Sakaridis_ACDC_The_Adverse_Conditions_Dataset_With_Correspondences_for_Semantic_Driving_ICCV_2021_paper.pdf)。
 
 ### 1.3 数据划分注意事项
@@ -59,8 +60,9 @@ ACDC 的图像来自连续采集的 session，**同一 session 的相邻帧高�
 验证指标会显著虚高（这个虚高幅度可能达到十几个点），
 而模型在真正的新场景上并没有那么好。
 
-因此划分策略必须是 `by_scene`（见 `configs/data/acdc.yaml` 的 `split.strategy`），
-且划分结果落盘到 `data/processed/acdc/split.json`，保证所有实验用同一套划分。
+因此需要评估新场景泛化的任务必须按 scene/sequence 分组切分，不能直接把官方
+train/val 当作视频级隔离。天气小模型当前在训练代码中按固定 seed 重切分；其他任务
+应使用其任务配置和落盘划分文件，保证实验可复现。
 
 ---
 

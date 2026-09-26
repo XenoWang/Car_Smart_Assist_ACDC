@@ -26,3 +26,4 @@ weather_classifier:
     patience: 5
     num_workers: 0
     seed: 42
+    validation_fraction: 0.2       # 合并官方 train/val 后按序列分组留出；官方 test 保持不动

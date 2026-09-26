@@ -28,12 +28,13 @@ data:
     - snow
 
   # --- 划分 ---
-  # 更正（解压后核实）：ACDC **自带官方 train/val/test 划分**，按 sequence 切好。
+  # 更正（解压后核实）：ACDC **自带官方 train/val/test 划分**。
   # 早期配置写的是「官方不提供划分，自己按 70/15/15 切」—— 那是错的。
   #
   # 必须用官方划分，理由：
   #   1. 用自造划分的结果无法与已发表论文对比，项目的指标失去参照系
-  #   2. 官方划分已保证同一 sequence 不跨集合，帧间泄漏问题官方已处理
+  #   2. 官方划分可用于基准对比；但实测同一 sequence 的不同帧会跨 train/val。
+  #      需要视频级隔离的任务应合并 train+val 后自行按 sequence 重切分。
   #   3. test 集标注官方不公开（只给 image_info），想自己切也无从评估
   split:
     source: official           # official | custom

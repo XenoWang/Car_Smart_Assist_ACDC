@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +32,46 @@ def list_condition_images(
         folder = root / condition / split
         records.extend((p, label) for p in sorted(folder.rglob("*_rgb_anon.png")) if p.is_file())
     return records
+
+
+def split_by_sequence(
+    records: list[tuple[Path, int]],
+    validation_fraction: float,
+    seed: int,
+) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]]]:
+    """按天气类别整段留出视频序列，避免相邻帧跨训练与验证集合。"""
+    grouped: dict[int, dict[str, list[tuple[Path, int]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for record in records:
+        path, label = record
+        grouped[label][path.parent.name].append(record)
+
+    train_records: list[tuple[Path, int]] = []
+    val_records: list[tuple[Path, int]] = []
+    for label, sequences in sorted(grouped.items()):
+        groups = sorted(sequences.items())
+        if len(groups) < 2:
+            raise ValueError(f"天气类别 {label} 少于两个独立视频序列，无法做无泄漏验证")
+        random.Random(seed + label).shuffle(groups)
+        total = sum(len(items) for _, items in groups)
+        target = min(total - 1, max(1, round(total * validation_fraction)))
+
+        reachable: dict[int, tuple[str, ...]] = {0: ()}
+        for sequence, items in groups:
+            for count, selected in list(reachable.items()):
+                new_count = count + len(items)
+                if new_count < total and new_count not in reachable:
+                    reachable[new_count] = (*selected, sequence)
+        val_count = min(
+            (count for count in reachable if 0 < count < total),
+            key=lambda count: abs(count - target),
+        )
+        val_sequences = set(reachable[val_count])
+        for sequence, items in groups:
+            (val_records if sequence in val_sequences else train_records).extend(items)
+
+    return sorted(train_records), sorted(val_records)
 
 
 def dataset_signature(records: list[tuple[Path, int]], size: tuple[int, int]) -> str:
@@ -128,26 +170,12 @@ def train_weather(
     """验证损失选 best，早停；续训仅接收相同模型配置和数据签名。"""
     root = Path(project_root)
     train_cfg = cfg.train
-    acdc_root = root / train_cfg["acdc_root"]
-    train_records = list_condition_images(acdc_root, "train", cfg.classes)
-    val_records = list_condition_images(acdc_root, "val", cfg.classes)
-    if not train_records or not val_records:
-        raise FileNotFoundError("ACDC 官方 train/val 图片不完整，无法训练或选优")
-    for label, condition in enumerate(cfg.classes):
-        if not any(y == label for _, y in train_records) or not any(
-            y == label for _, y in val_records
-        ):
-            raise ValueError(f"{condition} 在官方 train 或 val 划分中无图片")
-    train_sequences = {p.parent.name for p, _ in train_records}
-    val_sequences = {p.parent.name for p, _ in val_records}
-    if train_sequences & val_sequences:
-        raise ValueError("ACDC train/val 有重叠视频序列，存在验证集泄漏")
-
     try:
         batch_size = int(train_cfg["batch_size"])
         epochs = int(train_cfg["epochs"])
         patience = int(train_cfg["patience"])
         seed = int(train_cfg["seed"])
+        validation_fraction = float(train_cfg.get("validation_fraction", 0.2))
         workers = int(train_cfg["num_workers"])
         learning_rate = float(train_cfg["learning_rate"])
         weight_decay = float(train_cfg["weight_decay"])
@@ -156,10 +184,30 @@ def train_weather(
         raise ValueError(f"天气训练配置无效：{exc}") from exc
     if min(batch_size, epochs, patience) <= 0:
         raise ValueError("batch_size/epochs/patience 必须为正整数")
+    if not np.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction 必须在 0 和 1 之间")
     if workers < 0 or not np.isfinite([learning_rate, weight_decay, smoothing]).all():
         raise ValueError("天气训练参数必须为非负有限数")
     if learning_rate <= 0 or weight_decay < 0 or not 0 <= smoothing < 1:
         raise ValueError("天气训练学习率、权重衰减或标签平滑范围无效")
+
+    acdc_root = root / train_cfg["acdc_root"]
+    official_train = list_condition_images(acdc_root, "train", cfg.classes)
+    official_val = list_condition_images(acdc_root, "val", cfg.classes)
+    if not official_train or not official_val:
+        raise FileNotFoundError("ACDC 官方 train/val 图片不完整，无法训练或选优")
+    train_records, val_records = split_by_sequence(
+        [*official_train, *official_val], validation_fraction, seed
+    )
+    for label, condition in enumerate(cfg.classes):
+        if not any(y == label for _, y in train_records) or not any(
+            y == label for _, y in val_records
+        ):
+            raise ValueError(f"{condition} 在序列分组后的 train 或 val 划分中无图片")
+    train_sequences = {p.parent.name for p, _ in train_records}
+    val_sequences = {p.parent.name for p, _ in val_records}
+    if train_sequences & val_sequences:
+        raise ValueError("按序列切分后仍发现 train/val 视频重叠，停止训练以避免泄漏")
 
     device = select_device(cfg.device)
     cache_dir = root / train_cfg["cache_dir"]
