@@ -1,4 +1,4 @@
-"""训练 ACDC 四类条件小模型：.venv/Scripts/python.exe scripts/train_weather.py。"""
+"""训练天气/光照多属性模型：.venv/Scripts/python.exe scripts/train_weather.py。"""
 
 from __future__ import annotations
 

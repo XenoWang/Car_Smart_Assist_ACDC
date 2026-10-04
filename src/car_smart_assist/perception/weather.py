@@ -1,4 +1,4 @@
-"""独立的 ACDC 四类条件小模型和可解释视觉线索。"""
+"""独立天气现象/光照多标签小模型和可解释视觉线索。"""
 
 from __future__ import annotations
 
@@ -98,7 +98,7 @@ class WeatherClassifier(nn.Module):
         self.encoder = nn.Sequential(*layers, nn.AdaptiveAvgPool2d(1), nn.Flatten())
         self.cue_encoder = nn.Sequential(nn.Linear(len(FEATURE_NAMES), 16), nn.ReLU(inplace=True))
         self.head = nn.Sequential(
-            nn.Dropout(cfg.dropout), nn.Linear(in_channels + 16, len(cfg.classes))
+            nn.Dropout(cfg.dropout), nn.Linear(in_channels + 16, len(cfg.attributes))
         )
 
     def forward(self, images: torch.Tensor, cues: torch.Tensor) -> torch.Tensor:
@@ -107,22 +107,45 @@ class WeatherClassifier(nn.Module):
 
 @dataclass(frozen=True)
 class WeatherPrediction:
-    condition: str | None
-    confidence: float
+    attributes: tuple[str, ...]
+    decisions: dict[str, bool]
     probabilities: dict[str, float]
     cues: dict[str, float]
-    accepted: bool
     reason: str
+
+    @property
+    def warning(self) -> str | None:
+        return render_weather_warning(self.attributes)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "condition": self.condition,
-            "confidence": self.confidence,
+            "attributes": list(self.attributes),
+            "decisions": dict(self.decisions),
             "probabilities": dict(self.probabilities),
             "cues": dict(self.cues),
-            "accepted": self.accepted,
+            "warning": self.warning,
             "reason": self.reason,
         }
+
+
+def render_weather_warning(attributes: tuple[str, ...]) -> str | None:
+    """Build an informational warning; this text never requests handover by itself."""
+    detected = set(attributes)
+    night = "night" in detected
+    fog = "fog" in detected
+    rain = "rain" in detected
+    snow = "snow" in detected
+    if fog and rain:
+        return "雾雨天气，视线可能受影响，请减速"
+    if fog:
+        return "夜间有雾，视线可能受影响，请减速" if night else "检测到雾，视线可能受影响，请减速"
+    if rain:
+        return "夜间降雨，路面可能湿滑，请减速" if night else "检测到降雨，路面可能湿滑，请减速"
+    if snow:
+        return "检测到降雪，请减速并留足制动距离"
+    if night:
+        return "夜间行车，请注意观察路况"
+    return None
 
 
 def select_device(requested: str) -> torch.device:
@@ -150,10 +173,14 @@ class WeatherPredictor:
     @classmethod
     def from_checkpoint(cls, path: str | Path, cfg: WeatherConfig) -> WeatherPredictor:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-        if checkpoint.get("format_version") != 1:
+        if checkpoint.get("format_version") != 2:
             raise ValueError("天气检查点格式不兼容")
-        for key in ("classes", "image_size", "channels", "features"):
-            expected = list(getattr(cfg, key)) if key != "features" else cfg.features
+        for key in ("attributes", "image_size", "channels", "features"):
+            expected = (
+                list(getattr(cfg, key))
+                if key in ("attributes", "image_size", "channels")
+                else getattr(cfg, key)
+            )
             if checkpoint["model_config"][key] != expected:
                 raise ValueError(f"天气检查点的 {key} 与当前配置不一致")
         model = WeatherClassifier(cfg)
@@ -168,23 +195,21 @@ class WeatherPredictor:
         logits = self.model(
             pixels.unsqueeze(0).to(self.device), vector.unsqueeze(0).to(self.device)
         )
-        probabilities = torch.softmax(logits.float(), dim=1).cpu().numpy()[0]
+        probabilities = torch.sigmoid(logits.float()).cpu().numpy()[0]
         if not np.isfinite(probabilities).all():
             raise ValueError("天气模型概率包含非有限值")
-        order = np.argsort(probabilities)[::-1]
-        first, second = (int(order[0]), int(order[1]))
-        confidence = float(probabilities[first])
-        margin = confidence - float(probabilities[second])
-        accepted = confidence >= self.cfg.min_confidence and margin >= self.cfg.min_margin
+        probability_map = {
+            name: float(probabilities[i]) for i, name in enumerate(self.cfg.attributes)
+        }
+        decisions = {
+            name: probability_map[name] >= self.cfg.decision_thresholds[name]
+            for name in self.cfg.attributes
+        }
+        attributes = tuple(name for name in self.cfg.attributes if decisions[name])
         return WeatherPrediction(
-            condition=self.cfg.classes[first] if accepted else None,
-            confidence=confidence,
-            probabilities={
-                name: float(probabilities[i]) for i, name in enumerate(self.cfg.classes)
-            },
+            attributes=attributes,
+            decisions=decisions,
+            probabilities=probability_map,
             cues=cues,
-            accepted=accepted,
-            reason="天气类别已通过置信度与间隔检查"
-            if accepted
-            else "天气分类不确定，交由接管规则处理",
+            reason="天气属性由独立阈值分别判断；属性不确定不单独触发接管",
         )

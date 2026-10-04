@@ -1,141 +1,268 @@
-"""ACDC 官方 train/val 四类条件小模型训练；保留 test 集用于最终评估。"""
+"""Train the weather/illumination attribute model without scene leakage."""
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import random
+import re
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from zipfile import ZipFile
 
 import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from car_smart_assist.config.weather import WeatherConfig
 from car_smart_assist.perception.visibility.dataset import read_rgb_image
-from car_smart_assist.perception.weather import WeatherClassifier, image_tensors, select_device
+from car_smart_assist.perception.weather import (
+    FEATURE_NAMES,
+    WeatherClassifier,
+    prepare_image,
+    select_device,
+    visual_cues,
+)
+
+
+@dataclass(frozen=True)
+class WeatherSample:
+    labels: tuple[float, ...]
+    group: str
+    stratum: str
+    path: Path | None = None
+    archive_path: Path | None = None
+    member: str | None = None
+
+
+def _acdc_split(
+    acdc_root: Path, split: str, attributes: tuple[str, ...]
+) -> list[WeatherSample]:
+    if split not in ("train", "val", "test"):
+        raise ValueError("ACDC 天气图片 split 必须是 train/val/test")
+    root = acdc_root / "rgb_anon"
+    samples: list[WeatherSample] = []
+    for condition in attributes:
+        folder = root / condition / split
+        for path in sorted(folder.rglob("*_rgb_anon.png")) if folder.is_dir() else ():
+            if not path.is_file():
+                continue
+            labels = tuple(float(attribute == condition) for attribute in attributes)
+            samples.append(
+                WeatherSample(
+                    labels=labels,
+                    group=f"acdc:{condition}:{path.parent.name}",
+                    stratum=condition,
+                    path=path,
+                )
+            )
+    return samples
 
 
 def list_condition_images(
-    acdc_root: Path, split: str, classes: tuple[str, ...]
-) -> list[tuple[Path, int]]:
-    """只取官方恶劣条件图片，排除 paired *_ref 图片和 test。"""
+    acdc_root: Path, split: str, attributes: tuple[str, ...]
+) -> list[WeatherSample]:
+    """List ACDC development images; test is deliberately reserved for evaluation."""
     if split not in ("train", "val"):
-        raise ValueError("训练和选优只允许官方 train/val 划分")
-    root = acdc_root / "rgb_anon"
-    records: list[tuple[Path, int]] = []
-    for label, condition in enumerate(classes):
-        folder = root / condition / split
-        records.extend((p, label) for p in sorted(folder.rglob("*_rgb_anon.png")) if p.is_file())
-    return records
+        raise ValueError("训练和选优只允许读取 ACDC 官方 train/val")
+    return _acdc_split(acdc_root, split, attributes)
 
 
 def split_by_sequence(
-    records: list[tuple[Path, int]],
-    validation_fraction: float,
-    seed: int,
-) -> tuple[list[tuple[Path, int]], list[tuple[Path, int]]]:
-    """按天气类别整段留出视频序列，避免相邻帧跨训练与验证集合。"""
-    grouped: dict[int, dict[str, list[tuple[Path, int]]]] = defaultdict(
-        lambda: defaultdict(list)
-    )
-    for record in records:
-        path, label = record
-        grouped[label][path.parent.name].append(record)
+    records: list[WeatherSample], validation_fraction: float, seed: int
+) -> tuple[list[WeatherSample], list[WeatherSample]]:
+    """Keep all frames from an ACDC weather sequence in one partition."""
+    grouped: dict[str, dict[str, list[WeatherSample]]] = defaultdict(lambda: defaultdict(list))
+    for sample in records:
+        grouped[sample.stratum][sample.group].append(sample)
 
-    train_records: list[tuple[Path, int]] = []
-    val_records: list[tuple[Path, int]] = []
-    for label, sequences in sorted(grouped.items()):
-        groups = sorted(sequences.items())
+    train_records: list[WeatherSample] = []
+    val_records: list[WeatherSample] = []
+    for stratum_index, stratum in enumerate(sorted(grouped)):
+        groups = sorted(grouped[stratum].items())
         if len(groups) < 2:
-            raise ValueError(f"天气类别 {label} 少于两个独立视频序列，无法做无泄漏验证")
-        random.Random(seed + label).shuffle(groups)
+            raise ValueError(f"天气类别 {stratum} 少于两个独立视频序列，无法无泄漏选优")
+        random.Random(seed + stratum_index).shuffle(groups)
         total = sum(len(items) for _, items in groups)
         target = min(total - 1, max(1, round(total * validation_fraction)))
 
         reachable: dict[int, tuple[str, ...]] = {0: ()}
-        for sequence, items in groups:
+        for group, items in groups:
             for count, selected in list(reachable.items()):
                 new_count = count + len(items)
                 if new_count < total and new_count not in reachable:
-                    reachable[new_count] = (*selected, sequence)
+                    reachable[new_count] = (*selected, group)
         val_count = min(
             (count for count in reachable if 0 < count < total),
             key=lambda count: abs(count - target),
         )
-        val_sequences = set(reachable[val_count])
-        for sequence, items in groups:
-            (val_records if sequence in val_sequences else train_records).extend(items)
+        val_groups = set(reachable[val_count])
+        for group, items in groups:
+            (val_records if group in val_groups else train_records).extend(items)
 
-    return sorted(train_records), sorted(val_records)
+    return sorted(train_records, key=lambda sample: str(sample.path)), sorted(
+        val_records, key=lambda sample: str(sample.path)
+    )
 
 
-def dataset_signature(records: list[tuple[Path, int]], size: tuple[int, int]) -> str:
+def list_pixel_accurate_images(
+    archive_path: Path,
+    attributes: tuple[str, ...],
+    validation_scene: int,
+) -> tuple[list[WeatherSample], list[WeatherSample]]:
+    """Use filename metadata as multi-label targets and hold out one full scene."""
+    pattern = re.compile(
+        r"scene(?P<scene>\d+)_(?P<illumination>day|night)_"
+        r"(?P<condition>clear|fog\d+|rain\d+)_(?P<frame>\d+)\.png$",
+        re.IGNORECASE,
+    )
+    train_samples: list[WeatherSample] = []
+    val_samples: list[WeatherSample] = []
+    with ZipFile(archive_path) as archive:
+        for member in archive.namelist():
+            match = pattern.fullmatch(Path(member).name)
+            if not match:
+                continue
+            scene = int(match.group("scene"))
+            illumination = match.group("illumination").lower()
+            condition = match.group("condition").lower()
+            values = {attribute: 0.0 for attribute in attributes}
+            if condition.startswith("fog"):
+                values["fog"] = 1.0
+            elif condition.startswith("rain"):
+                values["rain"] = 1.0
+            if illumination == "night":
+                values["night"] = 1.0
+            sample = WeatherSample(
+                labels=tuple(values[attribute] for attribute in attributes),
+                group=f"pixel-accurate:scene{scene}",
+                stratum=f"{illumination}:{condition}",
+                archive_path=archive_path,
+                member=member,
+            )
+            (val_samples if scene == validation_scene else train_samples).append(sample)
+    if not train_samples or not val_samples:
+        raise ValueError(
+            f"Pixel Accurate 场景切分无效：训练 {len(train_samples)}，验证 {len(val_samples)}"
+        )
+    return train_samples, val_samples
+
+
+def _sample_signature(samples: list[WeatherSample], size: tuple[int, int]) -> str:
     digest = hashlib.sha256(repr(size).encode())
-    for path, label in records:
-        stat = path.stat()
-        digest.update(f"{path.resolve()}|{label}|{stat.st_size}|{stat.st_mtime_ns}\n".encode())
+    archive_stats: dict[Path, tuple[int, int]] = {}
+    for sample in samples:
+        if sample.path is not None:
+            stat = sample.path.stat()
+            source = f"{sample.path.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+        else:
+            assert sample.archive_path is not None and sample.member is not None
+            if sample.archive_path not in archive_stats:
+                stat = sample.archive_path.stat()
+                archive_stats[sample.archive_path] = (stat.st_size, stat.st_mtime_ns)
+            size_bytes, modified = archive_stats[sample.archive_path]
+            source = f"{sample.archive_path.resolve()}|{size_bytes}|{modified}|{sample.member}"
+        digest.update(f"{source}|{sample.labels}\n".encode())
     return digest.hexdigest()
 
 
-class ACDCWeatherDataset(Dataset):
-    """首次缩放并缓存 uint8 图像；以后从 memmap 读取，避免每轮解码大 PNG。"""
+class WeatherDataset(Dataset):
+    """Cache resized uint8 images and visual cues; read ZIP images without extraction."""
 
     def __init__(
-        self, records: list[tuple[Path, int]], cfg: WeatherConfig, cache_file: Path
+        self, samples: list[WeatherSample], cfg: WeatherConfig, cache_file: Path
     ) -> None:
-        if not records:
-            raise FileNotFoundError("未找到 ACDC 天气图，请先放置官方 rgb_anon 数据")
-        self.records = records
+        if not samples:
+            raise FileNotFoundError("没有可用于天气模型的图片")
+        self.samples = samples
         self.cfg = cfg
+        self.targets = np.asarray([sample.labels for sample in samples], dtype=np.float32)
+        self.signature = _sample_signature(samples, cfg.image_size)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cues_file = cache_file.with_name(cache_file.stem + "_cues.npy")
         manifest = cache_file.with_suffix(".json")
-        signature = dataset_signature(records, cfg.image_size)
-        expected_shape = (len(records), *cfg.image_size, 3)
+        expected_shape = (len(samples), *cfg.image_size, 3)
+        expected_cues_shape = (len(samples), len(FEATURE_NAMES))
         reuse = False
-        if cache_file.exists() and manifest.exists():
+        if cache_file.exists() and cues_file.exists() and manifest.exists():
             try:
                 info = json.loads(manifest.read_text(encoding="utf-8"))
-                reuse = info.get("signature") == signature
-                if reuse:
-                    cache = np.load(cache_file, mmap_mode="r", allow_pickle=False)
-                    reuse = cache.shape == expected_shape and cache.dtype == np.uint8
+                cache = np.load(cache_file, mmap_mode="r", allow_pickle=False)
+                cached_cues = np.load(cues_file, mmap_mode="r", allow_pickle=False)
+                reuse = (
+                    info.get("signature") == self.signature
+                    and cache.shape == expected_shape
+                    and cache.dtype == np.uint8
+                    and cached_cues.shape == expected_cues_shape
+                    and cached_cues.dtype == np.float32
+                )
             except (OSError, ValueError, json.JSONDecodeError):
                 reuse = False
         if not reuse:
             if "cache" in locals():
                 del cache
-            temporary = cache_file.with_name(cache_file.stem + ".partial.npy")
-            array = np.lib.format.open_memmap(
-                temporary, mode="w+", dtype=np.uint8, shape=expected_shape
+            if "cached_cues" in locals():
+                del cached_cues
+            image_temp = cache_file.with_name(cache_file.stem + ".partial.npy")
+            cues_temp = cues_file.with_name(cues_file.stem + ".partial.npy")
+            image_cache = np.lib.format.open_memmap(
+                image_temp, mode="w+", dtype=np.uint8, shape=expected_shape
+            )
+            cue_cache = np.lib.format.open_memmap(
+                cues_temp, mode="w+", dtype=np.float32, shape=expected_cues_shape
             )
             try:
-                for i, (path, _) in enumerate(records):
-                    array[i] = read_rgb_image(path, cfg.image_size)
-                array.flush()
+                with ExitStack() as stack:
+                    archives = {
+                        archive_path: stack.enter_context(ZipFile(archive_path))
+                        for archive_path in {sample.archive_path for sample in samples}
+                        if archive_path is not None
+                    }
+                    for index, sample in enumerate(samples):
+                        if sample.path is not None:
+                            image = read_rgb_image(sample.path, cfg.image_size)
+                        else:
+                            assert sample.archive_path is not None and sample.member is not None
+                            with Image.open(
+                                io.BytesIO(archives[sample.archive_path].read(sample.member))
+                            ) as source:
+                                image = prepare_image(source, cfg.image_size)
+                        image_cache[index] = image
+                        cues = visual_cues(image, cfg)
+                        cue_cache[index] = [cues[name] for name in FEATURE_NAMES]
+                image_cache.flush()
+                cue_cache.flush()
             finally:
-                del array
-            temporary.replace(cache_file)
-            manifest.write_text(json.dumps({"signature": signature}), encoding="utf-8")
+                del image_cache
+                del cue_cache
+            image_temp.replace(cache_file)
+            cues_temp.replace(cues_file)
+            manifest.write_text(json.dumps({"signature": self.signature}), encoding="utf-8")
             cache = np.load(cache_file, mmap_mode="r", allow_pickle=False)
+            cached_cues = np.load(cues_file, mmap_mode="r", allow_pickle=False)
         self.images = cache
-        self.signature = signature
+        self.cues = cached_cues
 
     def __len__(self) -> int:
-        return len(self.records)
+        return len(self.samples)
 
-    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, int]:
-        pixels, cues = image_tensors(self.images[index], self.cfg)
-        return pixels, cues, self.records[index][1]
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pixels = torch.from_numpy(np.array(self.images[index], copy=True)).permute(2, 0, 1)
+        pixels = pixels.float().div_(255.0)
+        cues = torch.from_numpy(np.array(self.cues[index], copy=True))
+        labels = torch.from_numpy(self.targets[index].copy())
+        return pixels, cues, labels
 
 
 def checkpoint_model_config(cfg: WeatherConfig) -> dict[str, Any]:
     return {
-        "classes": list(cfg.classes),
+        "attributes": list(cfg.attributes),
         "image_size": list(cfg.image_size),
         "channels": list(cfg.channels),
         "features": dict(cfg.features),
@@ -149,16 +276,67 @@ def _save_checkpoint(payload: dict[str, Any], path: Path) -> None:
     temporary.replace(path)
 
 
+def attribute_metrics(
+    targets: np.ndarray,
+    probabilities: np.ndarray,
+    attributes: tuple[str, ...],
+    thresholds: dict[str, float],
+) -> dict[str, Any]:
+    predicted = np.stack(
+        [probabilities[:, index] >= thresholds[name] for index, name in enumerate(attributes)],
+        axis=1,
+    )
+    actual = targets.astype(bool)
+    per_attribute: dict[str, dict[str, Any]] = {}
+    f1s: list[float] = []
+    tp_all = fp_all = fn_all = 0
+    for index, name in enumerate(attributes):
+        tp = int(np.logical_and(actual[:, index], predicted[:, index]).sum())
+        fp = int(np.logical_and(~actual[:, index], predicted[:, index]).sum())
+        fn = int(np.logical_and(actual[:, index], ~predicted[:, index]).sum())
+        support = int(actual[:, index].sum())
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        per_attribute[name] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support,
+            "threshold": thresholds[name],
+        }
+        if support:
+            f1s.append(f1)
+        tp_all += tp
+        fp_all += fp
+        fn_all += fn
+    micro_precision = tp_all / (tp_all + fp_all) if tp_all + fp_all else 0.0
+    micro_recall = tp_all / (tp_all + fn_all) if tp_all + fn_all else 0.0
+    micro_f1 = (
+        2 * micro_precision * micro_recall / (micro_precision + micro_recall)
+        if micro_precision + micro_recall
+        else 0.0
+    )
+    return {
+        "sample_count": int(len(targets)),
+        "exact_match_accuracy": float((actual == predicted).all(axis=1).mean()),
+        "macro_f1": float(np.mean(f1s)) if f1s else 0.0,
+        "micro_f1": micro_f1,
+        "per_attribute": per_attribute,
+    }
+
+
 @dataclass(frozen=True)
 class WeatherTrainResult:
     best_epoch: int
     best_val_loss: float
-    val_accuracy: float
-    val_macro_recall: float
+    val_metrics: dict[str, Any]
     checkpoint: Path
     device: str
     train_count: int
     val_count: int
+    pixel_train_count: int
+    pixel_val_count: int
 
 
 def train_weather(
@@ -167,7 +345,7 @@ def train_weather(
     *,
     resume: bool = True,
 ) -> WeatherTrainResult:
-    """验证损失选 best，早停；续训仅接收相同模型配置和数据签名。"""
+    """Train independent weather/light attributes using scene-safe ACDC and Pixel splits."""
     root = Path(project_root)
     train_cfg = cfg.train
     try:
@@ -179,41 +357,54 @@ def train_weather(
         workers = int(train_cfg["num_workers"])
         learning_rate = float(train_cfg["learning_rate"])
         weight_decay = float(train_cfg["weight_decay"])
-        smoothing = float(train_cfg["label_smoothing"])
+        pos_weight_cap = float(train_cfg.get("pos_weight_cap", 5.0))
+        use_pixel = bool(train_cfg.get("use_pixel_accurate", True))
+        validation_scene = int(train_cfg.get("pixel_accurate_validation_scene", 4))
     except (KeyError, TypeError, ValueError, OverflowError) as exc:
         raise ValueError(f"天气训练配置无效：{exc}") from exc
     if min(batch_size, epochs, patience) <= 0:
         raise ValueError("batch_size/epochs/patience 必须为正整数")
     if not np.isfinite(validation_fraction) or not 0 < validation_fraction < 1:
         raise ValueError("validation_fraction 必须在 0 和 1 之间")
-    if workers < 0 or not np.isfinite([learning_rate, weight_decay, smoothing]).all():
+    if workers < 0 or not np.isfinite([learning_rate, weight_decay, pos_weight_cap]).all():
         raise ValueError("天气训练参数必须为非负有限数")
-    if learning_rate <= 0 or weight_decay < 0 or not 0 <= smoothing < 1:
-        raise ValueError("天气训练学习率、权重衰减或标签平滑范围无效")
+    if learning_rate <= 0 or weight_decay < 0 or pos_weight_cap <= 0:
+        raise ValueError("学习率必须为正数，权重衰减和正样本权重上限必须为非负数")
 
     acdc_root = root / train_cfg["acdc_root"]
-    official_train = list_condition_images(acdc_root, "train", cfg.classes)
-    official_val = list_condition_images(acdc_root, "val", cfg.classes)
+    official_train = list_condition_images(acdc_root, "train", cfg.attributes)
+    official_val = list_condition_images(acdc_root, "val", cfg.attributes)
     if not official_train or not official_val:
         raise FileNotFoundError("ACDC 官方 train/val 图片不完整，无法训练或选优")
-    train_records, val_records = split_by_sequence(
+    acdc_train, acdc_val = split_by_sequence(
         [*official_train, *official_val], validation_fraction, seed
     )
-    for label, condition in enumerate(cfg.classes):
-        if not any(y == label for _, y in train_records) or not any(
-            y == label for _, y in val_records
-        ):
-            raise ValueError(f"{condition} 在序列分组后的 train 或 val 划分中无图片")
-    train_sequences = {p.parent.name for p, _ in train_records}
-    val_sequences = {p.parent.name for p, _ in val_records}
-    if train_sequences & val_sequences:
-        raise ValueError("按序列切分后仍发现 train/val 视频重叠，停止训练以避免泄漏")
+    if {sample.group for sample in acdc_train} & {sample.group for sample in acdc_val}:
+        raise ValueError("ACDC 按序列切分后仍有 train/val 重叠，停止训练以避免泄漏")
+
+    pixel_train: list[WeatherSample] = []
+    pixel_val: list[WeatherSample] = []
+    if use_pixel:
+        pixel_archive = root / train_cfg["pixel_accurate_zip"]
+        if not pixel_archive.is_file():
+            raise FileNotFoundError(f"Pixel Accurate RGB 压缩包不存在：{pixel_archive}")
+        pixel_train, pixel_val = list_pixel_accurate_images(
+            pixel_archive, cfg.attributes, validation_scene
+        )
+    train_samples = [*acdc_train, *pixel_train]
+    val_samples = [*acdc_val, *pixel_val]
+    for index, attribute in enumerate(cfg.attributes):
+        train_values = {sample.labels[index] for sample in train_samples}
+        val_values = {sample.labels[index] for sample in val_samples}
+        if len(train_values) < 2 or len(val_values) < 2:
+            raise ValueError(f"属性 {attribute} 在 train 或 val 中缺少正/负样本")
 
     device = select_device(cfg.device)
     cache_dir = root / train_cfg["cache_dir"]
-    train_set = ACDCWeatherDataset(train_records, cfg, cache_dir / "train.npy")
-    val_set = ACDCWeatherDataset(val_records, cfg, cache_dir / "val.npy")
-
+    train_signature = _sample_signature(train_samples, cfg.image_size)[:16]
+    val_signature = _sample_signature(val_samples, cfg.image_size)[:16]
+    train_set = WeatherDataset(train_samples, cfg, cache_dir / f"train_{train_signature}.npy")
+    val_set = WeatherDataset(val_samples, cfg, cache_dir / f"val_{val_signature}.npy")
     generator = torch.Generator().manual_seed(seed)
     train_loader = DataLoader(
         train_set,
@@ -235,21 +426,26 @@ def train_weather(
     ):
         torch.manual_seed(seed)
         model = WeatherClassifier(cfg).to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate,
-        weight_decay=weight_decay,
+    positives = train_set.targets.sum(axis=0)
+    pos_weight = np.minimum(
+        (len(train_set) - positives) / np.maximum(positives, 1), pos_weight_cap
     )
-    loss_fn = nn.CrossEntropyLoss(label_smoothing=smoothing)
+    loss_fn = nn.BCEWithLogitsLoss(
+        pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device)
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     best_path = root / cfg.checkpoint
     last_path = best_path.with_name("last.pt")
     signatures = {"train": train_set.signature, "val": val_set.signature}
     model_cfg = checkpoint_model_config(cfg)
     start_epoch, best_epoch, best_loss, wait = 0, 0, float("inf"), 0
+    best_metrics: dict[str, Any] = {}
     if resume and last_path.exists():
         previous = torch.load(last_path, map_location="cpu", weights_only=True)
-        if previous.get("format_version") != 1 or previous.get("model_config") != model_cfg:
-            raise ValueError("天气检查点模型配置不兼容；如需重训请使用 --fresh")
+        previous_model_cfg = dict(previous.get("model_config", {}))
+        previous_model_cfg.pop("decision_thresholds", None)
+        if previous.get("format_version") != 2 or previous_model_cfg != model_cfg:
+            raise ValueError("天气属性模型检查点不兼容；请使用 --fresh")
         if previous.get("dataset_signatures") != signatures:
             raise ValueError("天气训练数据变化，不能沿用旧优化器状态；请使用 --fresh")
         model.load_state_dict(previous["model_state"])
@@ -258,57 +454,56 @@ def train_weather(
         best_epoch = int(previous["best_epoch"])
         best_loss = float(previous["best_val_loss"])
         wait = int(previous["wait"])
+        best_metrics = previous["best_val_metrics"]
         generator.set_state(previous["shuffle_state"])
-
-    best_accuracy, best_macro_recall = 0.0, 0.0
-    if best_epoch > 0 and best_path.exists():
-        best = torch.load(best_path, map_location="cpu", weights_only=True)
-        if best.get("model_config") != model_cfg or int(best.get("epoch", -1)) != best_epoch:
-            raise ValueError("天气 best/last 检查点不匹配；请使用 --fresh")
-        best_accuracy = float(best["val_accuracy"])
-        best_macro_recall = float(best["val_macro_recall"])
-    elif best_epoch > 0:
+    if best_epoch > 0 and not best_path.is_file():
         raise ValueError("last 检查点引用的 best 权重不存在；请使用 --fresh")
+
     for epoch in range(start_epoch + 1, epochs + 1):
         model.train()
         for images, cues, labels in train_loader:
-            images, cues, labels = images.to(device), cues.to(device), labels.to(device)
+            images = images.to(device, non_blocking=True)
+            cues = cues.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(images, cues), labels)
             loss.backward()
             optimizer.step()
+
         model.eval()
-        total_loss, total_correct, total = 0.0, 0, 0
-        class_correct = np.zeros(len(cfg.classes), dtype=np.int64)
-        class_total = np.zeros(len(cfg.classes), dtype=np.int64)
+        total_loss = 0.0
+        label_count = 0
+        all_targets: list[np.ndarray] = []
+        all_probabilities: list[np.ndarray] = []
         with torch.inference_mode():
             for images, cues, labels in val_loader:
-                images, cues, labels = images.to(device), cues.to(device), labels.to(device)
+                images = images.to(device, non_blocking=True)
+                cues = cues.to(device, non_blocking=True)
+                labels_device = labels.to(device, non_blocking=True)
                 logits = model(images, cues)
                 count = labels.numel()
-                total_loss += float(loss_fn(logits, labels).item()) * count
-                predicted = logits.argmax(dim=1)
-                total_correct += int((predicted == labels).sum().item())
-                total += count
-                for i in range(len(cfg.classes)):
-                    mask = labels == i
-                    class_total[i] += int(mask.sum().item())
-                    class_correct[i] += int(((predicted == i) & mask).sum().item())
-        val_loss = total_loss / total
-        accuracy = total_correct / total
-        macro_recall = float((class_correct / class_total).mean())
+                total_loss += float(loss_fn(logits, labels_device).item()) * count
+                label_count += count
+                all_targets.append(labels.numpy())
+                all_probabilities.append(torch.sigmoid(logits.float()).cpu().numpy())
+        val_loss = total_loss / label_count
+        metrics = attribute_metrics(
+            np.concatenate(all_targets),
+            np.concatenate(all_probabilities),
+            cfg.attributes,
+            cfg.decision_thresholds,
+        )
         if val_loss < best_loss:
             best_epoch, best_loss, wait = epoch, val_loss, 0
-            best_accuracy, best_macro_recall = accuracy, macro_recall
+            best_metrics = metrics
             _save_checkpoint(
                 {
-                    "format_version": 1,
+                    "format_version": 2,
                     "model_config": model_cfg,
-                    "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    "model_state": {key: value.detach().cpu() for key, value in model.state_dict().items()},
                     "epoch": epoch,
                     "val_loss": val_loss,
-                    "val_accuracy": accuracy,
-                    "val_macro_recall": macro_recall,
+                    "val_metrics": metrics,
                 },
                 best_path,
             )
@@ -316,13 +511,14 @@ def train_weather(
             wait += 1
         _save_checkpoint(
             {
-                "format_version": 1,
+                "format_version": 2,
                 "model_config": model_cfg,
-                "model_state": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                "model_state": {key: value.detach().cpu() for key, value in model.state_dict().items()},
                 "optimizer_state": optimizer.state_dict(),
                 "epoch": epoch,
                 "best_epoch": best_epoch,
                 "best_val_loss": best_loss,
+                "best_val_metrics": best_metrics,
                 "wait": wait,
                 "shuffle_state": generator.get_state(),
                 "dataset_signatures": signatures,
@@ -332,14 +528,33 @@ def train_weather(
         if wait >= patience:
             break
     if best_epoch == 0:
-        raise ValueError("未找到可用的天气 best 检查点；请检查 epochs 配置")
+        raise ValueError("未找到可用的天气属性模型 best 检查点")
+    best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=True)
+    model.load_state_dict(best_checkpoint["model_state"])
+    model.eval()
+    final_targets: list[np.ndarray] = []
+    final_probabilities: list[np.ndarray] = []
+    with torch.inference_mode():
+        for images, cues, labels in val_loader:
+            logits = model(
+                images.to(device, non_blocking=True), cues.to(device, non_blocking=True)
+            )
+            final_targets.append(labels.numpy())
+            final_probabilities.append(torch.sigmoid(logits.float()).cpu().numpy())
+    best_metrics = attribute_metrics(
+        np.concatenate(final_targets),
+        np.concatenate(final_probabilities),
+        cfg.attributes,
+        cfg.decision_thresholds,
+    )
     return WeatherTrainResult(
         best_epoch,
         best_loss,
-        best_accuracy,
-        best_macro_recall,
+        best_metrics,
         best_path,
         str(device),
         len(train_set),
         len(val_set),
+        len(pixel_train),
+        len(pixel_val),
     )

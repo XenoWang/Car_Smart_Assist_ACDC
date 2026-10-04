@@ -117,6 +117,8 @@ def main() -> int:
             f"{name:<22}{lvl:<10}{info:>8}"
             f"{('是' if a.should_takeover else '否'):>6}{a.risk_level.value:>10}  {a.text}"
         )
+        if r.weather_warning:
+            print(f"  天气提醒：{r.weather_warning}")
 
     print("-" * 92)
     t = results[-1].timings_ms
@@ -131,10 +133,14 @@ def main() -> int:
 
     bad = 0
     for r in results:
-        probs = check_wording(r.advisory.text)
-        if probs:
-            bad += 1
-            print(f"  ✗ {r.advisory.text}: {probs}")
+        texts = [r.advisory.text]
+        if r.weather_warning:
+            texts.append(r.weather_warning)
+        for text in texts:
+            probs = check_wording(text)
+            if probs:
+                bad += 1
+                print(f"  ✗ {text}: {probs}")
     print("  全部通过" if not bad else f"  {bad} 条不合格")
     return 0
 

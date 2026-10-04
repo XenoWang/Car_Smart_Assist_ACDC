@@ -1,13 +1,15 @@
-"""四类天气小模型的数据口径、训练续训和管线接入测试。"""
+"""Weather attribute labels, training, inference, and pipeline warning behavior."""
 
 from __future__ import annotations
 
 import json
 from dataclasses import replace
 from pathlib import Path
+from zipfile import ZipFile
 
 import numpy as np
 import pytest
+import torch
 from PIL import Image
 
 from car_smart_assist.advisory.schema import (
@@ -22,16 +24,21 @@ from car_smart_assist.perception.visibility.gate import GateThresholds, Visibili
 from car_smart_assist.perception.visibility.scorer import InformationFeatures, VisibilityScore
 from car_smart_assist.perception.weather import (
     FEATURE_NAMES,
+    WeatherClassifier,
     WeatherPrediction,
     WeatherPredictor,
     prepare_image,
     select_device,
     visual_cues,
 )
-from car_smart_assist.perception.weather_training import list_condition_images, train_weather
+from car_smart_assist.perception.weather_training import (
+    list_condition_images,
+    list_pixel_accurate_images,
+    train_weather,
+)
 
 
-def small_config(root: Path, *, epochs: int = 1):
+def small_config(*, epochs: int = 1):
     cfg = load_weather_config()
     train = {
         **cfg.train,
@@ -41,6 +48,7 @@ def small_config(root: Path, *, epochs: int = 1):
         "batch_size": 2,
         "num_workers": 0,
         "patience": 3,
+        "use_pixel_accurate": False,
     }
     return replace(
         cfg,
@@ -48,41 +56,64 @@ def small_config(root: Path, *, epochs: int = 1):
         channels=(4, 8, 8),
         dropout=0,
         device="cpu",
-        min_confidence=1.0,
         train=train,
-        checkpoint="checkpoints/weather/best.pt",
+        checkpoint="checkpoints/weather_attributes/best.pt",
     )
 
 
 def write_dataset(root: Path, cfg) -> None:
-    for class_index, condition in enumerate(cfg.classes):
+    for attr_index, condition in enumerate(cfg.attributes):
         for split, count in (("train", 2), ("val", 1)):
             sequence = f"{condition}_{split}_sequence"
             directory = root / "acdc" / "rgb_anon" / condition / split / sequence
             directory.mkdir(parents=True)
             for index in range(count):
-                image = np.full((40, 60, 3), 20 + class_index * 50 + index, dtype=np.uint8)
+                image = np.full((40, 60, 3), 20 + attr_index * 50 + index, dtype=np.uint8)
                 Image.fromarray(image).save(
                     directory / f"{sequence}_frame_{index:06d}_rgb_anon.png"
                 )
 
 
-def test_acdc_class_source_and_reference_exclusion(tmp_path):
-    cfg = small_config(tmp_path)
+def test_acdc_attribute_source_and_reference_exclusion(tmp_path):
+    cfg = small_config()
     write_dataset(tmp_path, cfg)
     refs = tmp_path / "acdc" / "rgb_anon" / "fog" / "train_ref" / "reference"
     refs.mkdir(parents=True)
     Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(refs / "ref_rgb_ref_anon.png")
-    records = list_condition_images(tmp_path / "acdc", "train", cfg.classes)
+    records = list_condition_images(tmp_path / "acdc", "train", cfg.attributes)
     assert len(records) == 8
-    assert {label for _, label in records} == {0, 1, 2, 3}
-    assert all("_ref" not in p.parts for p, _ in records)
+    assert {sample.stratum for sample in records} == set(cfg.attributes)
+    assert all(sample.path is not None and "_ref" not in sample.path.parts for sample in records)
+    for sample in records:
+        assert sample.labels[cfg.attributes.index(sample.stratum)] == 1
+        assert sum(sample.labels) == 1
     with pytest.raises(ValueError):
-        list_condition_images(tmp_path / "acdc", "test", cfg.classes)
+        list_condition_images(tmp_path / "acdc", "test", cfg.attributes)
 
 
-def test_visual_cues_are_distinct_proxies(tmp_path):
-    cfg = small_config(tmp_path)
+def test_pixel_accurate_filename_labels_allow_cooccurrence(tmp_path):
+    archive_path = tmp_path / "rgb_left_8bit.zip"
+    with ZipFile(archive_path, "w") as archive:
+        for name in (
+            "rgb_left_8bit/scene1_night_fog20_0.png",
+            "rgb_left_8bit/scene1_night_rain55_0.png",
+            "rgb_left_8bit/scene2_day_clear_0.png",
+        ):
+            archive.writestr(name, b"metadata-only")
+    cfg = small_config()
+    train, val = list_pixel_accurate_images(archive_path, cfg.attributes, validation_scene=2)
+    assert len(train) == 2 and len(val) == 1
+    fog = next(sample for sample in train if sample.stratum.endswith("fog20"))
+    rain = next(sample for sample in train if sample.stratum.endswith("rain55"))
+    assert fog.labels[cfg.attributes.index("fog")] == 1
+    assert fog.labels[cfg.attributes.index("night")] == 1
+    assert rain.labels[cfg.attributes.index("rain")] == 1
+    assert rain.labels[cfg.attributes.index("night")] == 1
+    assert not any(val[0].labels)
+
+
+def test_visual_cues_are_distinct_proxies():
+    cfg = small_config()
     white = np.full((32, 48, 3), 235, dtype=np.uint8)
     white_cues = visual_cues(white, cfg)
     assert white_cues["snow_coverage_proxy"] > 0.9
@@ -96,19 +127,36 @@ def test_visual_cues_are_distinct_proxies(tmp_path):
     assert prepare_image(np.zeros((40, 60, 3), dtype=np.uint8), cfg.image_size).shape == (32, 48, 3)
 
 
+def test_classifier_can_predict_fog_and_night_together():
+    cfg = small_config()
+    model = WeatherClassifier(cfg)
+    with torch.no_grad():
+        model.head[-1].weight.zero_()
+        model.head[-1].bias.fill_(-8)
+        model.head[-1].bias[cfg.attributes.index("fog")] = 8
+        model.head[-1].bias[cfg.attributes.index("night")] = 8
+    prediction = WeatherPredictor(model, cfg, torch.device("cpu")).predict(
+        np.zeros((32, 48, 3), dtype=np.uint8)
+    )
+    assert prediction.attributes == ("fog", "night")
+    assert prediction.decisions["fog"] and prediction.decisions["night"]
+
+
 def test_training_checkpoint_predict_and_resume(tmp_path):
-    cfg = small_config(tmp_path)
+    cfg = small_config()
     write_dataset(tmp_path, cfg)
     first = train_weather(cfg, tmp_path)
     assert first.best_epoch == 1
     assert first.train_count == 8 and first.val_count == 4
+    assert first.pixel_train_count == 0 and first.pixel_val_count == 0
     assert first.checkpoint.is_file()
-    assert (tmp_path / "checkpoints/weather/last.pt").is_file()
+    assert (tmp_path / "checkpoints/weather_attributes/last.pt").is_file()
     predictor = WeatherPredictor.from_checkpoint(first.checkpoint, cfg)
     result = predictor.predict(np.zeros((40, 60, 3), dtype=np.uint8))
-    assert result.condition is None and not result.accepted  # 人工小样本不能当作可信天气分类器
-    assert len(result.probabilities) == 4
-    assert sum(result.probabilities.values()) == pytest.approx(1.0)
+    assert set(result.decisions) == set(cfg.attributes)
+    assert set(result.attributes) <= set(cfg.attributes)
+    assert set(result.probabilities) == set(cfg.attributes)
+    assert all(0 <= probability <= 1 for probability in result.probabilities.values())
     json.dumps(result.to_dict(), allow_nan=False)
     resumed = train_weather(replace(cfg, train={**cfg.train, "epochs": 2}), tmp_path)
     assert resumed.best_epoch in (1, 2)
@@ -116,7 +164,7 @@ def test_training_checkpoint_predict_and_resume(tmp_path):
 
 
 def test_changed_data_rejects_resume(tmp_path):
-    cfg = small_config(tmp_path)
+    cfg = small_config()
     write_dataset(tmp_path, cfg)
     train_weather(cfg, tmp_path)
     new_image = tmp_path / "acdc/rgb_anon/fog/train/fog_train_sequence/new_rgb_anon.png"
@@ -127,12 +175,10 @@ def test_changed_data_rejects_resume(tmp_path):
 
 def test_missing_data_cannot_train(tmp_path):
     with pytest.raises(FileNotFoundError, match="ACDC"):
-        train_weather(small_config(tmp_path), tmp_path)
+        train_weather(small_config(), tmp_path)
 
 
 def test_auto_device_respects_cuda_availability(monkeypatch):
-    import torch
-
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     assert select_device("auto").type == "cpu"
     with pytest.raises(ValueError, match="不可用"):
@@ -163,67 +209,72 @@ def weather_pipeline(stub, information=0.95):
     )
 
 
-def test_weather_alone_reaches_risk_but_requests_takeover():
+def test_weather_warning_is_separate_from_handover_decision():
     class WeatherStub:
         def predict(self, image):
             return WeatherPrediction(
-                "snow",
-                0.9,
-                {"fog": 0.03, "night": 0.03, "rain": 0.04, "snow": 0.9},
+                ("fog", "night"),
+                {"fog": True, "rain": False, "snow": False, "night": True},
+                {"fog": 0.9, "rain": 0.1, "snow": 0.02, "night": 0.88},
+                dict.fromkeys(FEATURE_NAMES, 0.2),
+                "synthetic co-occurrence",
+            )
+
+    class PerceptionStub:
+        def predict(self, image):
+            return PerceptionResult(object_detection_available=True)
+
+    pipeline = weather_pipeline(WeatherStub())
+    pipeline.predictor = PerceptionStub()
+    result = pipeline.run(np.zeros((32, 48, 3), dtype=np.uint8))
+    assert result.weather.attributes == ("fog", "night")
+    assert result.weather_warning == "夜间有雾，视线可能受影响，请减速"
+    assert result.advisory.should_takeover is False
+    assert result.advisory.risk_level is RiskLevel.NONE
+
+
+def test_missing_perception_still_requests_takeover_independently_of_weather():
+    class WeatherStub:
+        def predict(self, image):
+            return WeatherPrediction(
+                ("snow",),
+                {"fog": False, "rain": False, "snow": True, "night": False},
+                {"fog": 0.03, "rain": 0.04, "snow": 0.9, "night": 0.03},
                 dict.fromkeys(FEATURE_NAMES, 0.3),
-                True,
                 "synthetic",
             )
 
-    pipeline = weather_pipeline(WeatherStub())
-    result = pipeline.run(np.zeros((32, 48, 3), dtype=np.uint8))
-    assert result.weather.condition == "snow"
-    assert result.perception.road_condition == "snow"
-    assert result.perception.object_detection_available is False
-    assert result.advisory.risk_level is RiskLevel.NOTICE
+    result = weather_pipeline(WeatherStub()).run(np.zeros((32, 48, 3), dtype=np.uint8))
+    assert result.weather_warning == "检测到降雪，请减速并留足制动距离"
     assert result.advisory.should_takeover
-    assert result.advisory.policy_details["unable_to_judge"]
+    assert result.advisory.risk_level is RiskLevel.UNKNOWN
     assert "perception" in result.skipped
 
 
-def test_uncertain_weather_alone_is_unknown():
+def test_weather_uncertainty_does_not_trigger_takeover_with_complete_perception():
     class WeatherStub:
         def predict(self, image):
             return WeatherPrediction(
-                None,
-                0.4,
-                dict.fromkeys(("fog", "night", "rain", "snow"), 0.25),
+                (),
+                dict.fromkeys(("fog", "rain", "snow", "night"), False),
+                dict.fromkeys(("fog", "rain", "snow", "night"), 0.25),
                 dict.fromkeys(FEATURE_NAMES, 0.0),
-                False,
-                "uncertain",
+                "no weather attribute exceeded its threshold",
             )
-
-    result = weather_pipeline(WeatherStub()).run(np.zeros((32, 48, 3), dtype=np.uint8))
-    assert result.advisory.risk_level is RiskLevel.UNKNOWN
-    assert result.advisory.should_takeover
-    assert not any("天气分类置信度不足" in reason for reason in result.advisory.evidence)
-
-
-def test_uncertain_weather_does_not_trigger_takeover_when_other_inputs_are_complete():
-    class WeatherStub:
-        def predict(self, image):
-            return WeatherPrediction(None, 0.4, dict.fromkeys(("fog", "night", "rain", "snow"), 0.25),
-                                     dict.fromkeys(FEATURE_NAMES, 0.0), False, "uncertain")
 
     class PerceptionStub:
         def predict(self, image):
             return PerceptionResult(
-                road_condition=None, road_condition_confidence=0.0,
                 object_detection_available=True,
                 objects=[TargetObject("car", TargetDirection.LEADING, 60, confidence=1.0)],
             )
 
-    result = weather_pipeline(WeatherStub())
-    result.predictor = PerceptionStub()
-    advisory = result.run(np.zeros((32, 48, 3), dtype=np.uint8)).advisory
-    assert advisory.risk_level is RiskLevel.NONE
-    assert advisory.should_takeover is False
-    assert any("天气类别未能确认" in reason for reason in advisory.evidence)
+    pipeline = weather_pipeline(WeatherStub())
+    pipeline.predictor = PerceptionStub()
+    result = pipeline.run(np.zeros((32, 48, 3), dtype=np.uint8))
+    assert result.weather_warning is None
+    assert result.advisory.risk_level is RiskLevel.NONE
+    assert result.advisory.should_takeover is False
 
 
 def test_blind_gate_skips_weather_model():
@@ -235,5 +286,6 @@ def test_blind_gate_skips_weather_model():
         np.zeros((32, 48, 3), dtype=np.uint8)
     )
     assert result.blocked and result.weather is None
+    assert result.weather_warning is None
     assert result.advisory.should_takeover is True
     assert result.advisory.source == "visibility_gate"

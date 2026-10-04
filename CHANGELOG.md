@@ -8,6 +8,16 @@
 
 ## [Unreleased]
 
+### 天气模型拆分为多属性输出（2026-10-04）
+
+- 将互斥 `fog/night/rain/snow` 分类改为可共存的 fog/rain/snow/night 独立属性；昼夜不再与天气类别争抢一个输出位。
+- ACDC 官方 train+val 仍按序列分组 80/20；加入本地 Pixel Accurate RGB 文件名中的雾、雨、昼夜标签，scene 1–3 训练、scene 4 整组验证；ACDC 官方 test 保持最终测试集。
+- 天气提示经 `PipelineResult.weather_warning` 独立返回，不改变 `should_takeover`；天气属性不确定时不单独请求接管。
+- 阈值由开发验证集选取并统一配置。模型仍仅有视觉代理线索，没有积水深度或车轮水花标注。
+- CUDA 训练 2,806 张、验证 800 张。ACDC 官方 test 2,000 张的 exact-match accuracy 88.2%、macro-F1 92.1%；雾/雨/雪/夜的 F1 分别为 91.1/89.2/89.2/98.9%。
+- Pixel scene 4 验证中雾与夜间 F1 均为 93.2%/100%；雨属性 precision 为 100%，recall 仅 12.5%（40 张）。跨场景雨提醒仍漏报明显，不把该结果与 ACDC test 分数合并报告。
+- 验证：天气分类定向测试 12 项、全量测试 336 项通过；天气训练、ACDC test 评估、Pixel scene 4 评估及推理提醒 smoke run 成功。
+
 ### 独立天气识别小模型（2026-09-26，未发布）
 
 - 新增四类轻量 CNN，融合图像与反光、疑似湿润路面、亮白覆盖、低对比度四项视觉代理指标；输出分类概率、置信度及各项线索，置信度或类别间隔不足时拒绝判断。

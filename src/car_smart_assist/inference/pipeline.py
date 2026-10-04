@@ -86,6 +86,8 @@ class PipelineResult:
     perception: PerceptionResult | None = None
     advisory: AdvisoryResult | None = None
     weather: WeatherPrediction | None = None
+    # 天气模块给司机的独立提醒；不参与 should_takeover 计算。
+    weather_warning: str | None = None
     # 各阶段耗时（毫秒）。分开计是因为三者的优化手段完全不同，
     # 只给一个总耗时说明不了任何问题。
     timings_ms: dict[str, float] = field(default_factory=dict)
@@ -101,6 +103,7 @@ class PipelineResult:
         return {
             "visibility": self.visibility.to_dict() if self.visibility else None,
             "weather": self.weather.to_dict() if self.weather else None,
+            "weather_warning": self.weather_warning,
             "perception": self.perception.to_dict() if self.perception else None,
             "advisory": self.advisory.to_dict() if self.advisory else None,
             "timings_ms": {k: round(v, 2) for k, v in self.timings_ms.items()},
@@ -321,6 +324,7 @@ class InferencePipeline:
                     if not isinstance(weather, WeatherPrediction):
                         raise TypeError("weather_predictor.predict() 必须返回 WeatherPrediction")
                     r.weather = weather
+                    r.weather_warning = weather.warning
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("天气识别失败")
                     r.skipped["weather"] = f"天气识别异常: {type(exc).__name__}: {exc}"
@@ -330,16 +334,6 @@ class InferencePipeline:
                 r.skipped["perception"] = (
                     "Stage 1 感知模型尚未接入（perception/models/multitask.py 待训练）"
                 )
-                if r.weather is not None:
-                    r.perception = PerceptionResult(
-                        visibility_level=r.visibility.level.value if r.visibility else "unknown",
-                        visibility_confidence_multiplier=(
-                            r.visibility.confidence_multiplier if r.visibility else 1.0
-                        ),
-                        visibility_reasons=list(r.visibility.triggered) if r.visibility else [],
-                        road_condition=r.weather.condition,
-                        road_condition_confidence=r.weather.confidence,
-                    )
                 continue
 
             t1 = time.perf_counter()
@@ -356,14 +350,6 @@ class InferencePipeline:
                     perception.visibility_level = r.visibility.level.value
                     perception.visibility_confidence_multiplier = r.visibility.confidence_multiplier
                     perception.visibility_reasons = list(r.visibility.triggered)
-                if r.weather is not None and r.weather.accepted:
-                    if perception.road_condition is None:
-                        perception.road_condition = r.weather.condition
-                        perception.road_condition_confidence = r.weather.confidence
-                    elif perception.road_condition != r.weather.condition:
-                        perception.road_condition = None
-                        perception.road_condition_confidence = 0.0
-                        r.skipped["weather_fusion"] = "两个识别器的路况类别冲突，改为无法判断"
                 r.perception = perception
             except Exception as exc:  # noqa: BLE001
                 # 感知失败不能让整条管线失声 —— 记下来，后面走降级文案

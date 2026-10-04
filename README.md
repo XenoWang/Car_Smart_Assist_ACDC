@@ -6,8 +6,14 @@
 基于 [ACDC](https://acdc.vision.ee.ethz.ch/)（Adverse Conditions Dataset with Correspondences）
 的雾 / 夜 / 雨 / 雪四类场景构建。
 
-> **状态：v0.0.1 —— 项目骨架已建立，功能尚未实现。**
-> 当前仓库包含完整的目录结构、配置体系与设计文档，各模块以 docstring 描述职责。
+当前可运行的推理链路是：能见度门控 →（有权重时）天气分类 → 规则与模板建议。
+主感知模型未接入时，系统会将目标检测等信息标记为不可用并走保守接管路径；
+不会把空检测结果当成“没有目标”。
+
+> **实现状态：部分功能可运行，完整两阶段系统仍在开发中。**
+> 能见度门控、独立天气分类、风险/接管规则和模板提示已实现；主感知模型
+>（目标检测、距离、分割等）及 LLM/VLM 生成后端尚未接入。下面的架构图表示目标设计，
+> 不代表当前所有模块都已运行。详细状态见 [`TECH_STACK.md`](TECH_STACK.md)；
 > 开发计划见 [`docs/roadmap.md`](docs/roadmap.md)。
 
 ---
@@ -168,31 +174,59 @@ python scripts/analyze_dataset.py
 
 **最后一步不要跳过。** 先看统计数据确认数据没问题，再开训。
 
-### 5. 训练与评测
+### 5. 训练、测试与推理
 
-已实装的独立天气模型可用项目 `.venv` 单独训练：
+#### 当前可训练模型
+
+能见度门控与天气分类模型已有独立训练入口。当前开发工作区已准备 ACDC 数据、处理缓存及两类模型权重；
+数据和模型权重不随代码仓库分发，新环境需要先按上文准备数据。
 
 ```powershell
+# 能见度门控（ACDC 正常天气参考图，无监督重建）
+.venv\Scripts\python.exe scripts\train_visibility.py
+
+# 天气/光照多属性模型（ACDC 按序列切分；Pixel Accurate 按 scene 留出；ACDC test 留出）
 .venv\Scripts\python.exe scripts\train_weather.py
+
+# 天气模型评估：ACDC 官方 test
+.venv\Scripts\python.exe scripts\evaluate_weather.py
+
+# 开发验证集及 Pixel Accurate scene 4 验证
+.venv\Scripts\python.exe scripts\evaluate_weather.py --dataset validation
+.venv\Scripts\python.exe scripts\evaluate_weather.py --dataset pixel-accurate
 ```
 
-先将 ACDC 官方 `rgb_anon/{fog,night,rain,snow}/{train,val}` 放在 `data/raw/acdc/`；
-默认自动续训，`--fresh` 从头训练。权重保存到 `artifacts/checkpoints/weather/best.pt`，
-推理管线找到该权重后自动加载并输出四类概率与视觉线索。
-目前工作区没有原始 ACDC 图片，因此尚无真实数据训练的天气权重或准确率结果。
-反光、疑似湿润区域、亮白覆盖与低对比度仅是图像代理指标，不代表水深、摩擦力、实际积雪面积或雾中可视距离。
+两个入口默认续训已有 `last.pt`；天气模型使用 `--fresh` 从头训练，能见度训练也支持 `--fresh`。
+天气属性模型权重写入 `artifacts/checkpoints/weather_attributes/`，能见度权重写入 `artifacts/checkpoints/visibility/`。
+pipeline 会加载可用的能见度权重；天气配置和权重都存在时也会自动加载天气模型。
 
-项目下列完整 Stage 1/Stage 2 命令目前仍包含尚未实装的模块：
+天气模型分别输出雾、雨、雪和夜间概率，配置阈值把这些属性独立转成提醒；例如夜雾可以同时输出 `fog` 与 `night`。
+天气提醒通过 `weather_warning` 单独返回，不直接决定是否接管。能见度 BLIND 门控以及其他必要感知缺失仍按原接管规则处理。
 
-```bash
-make dry-run              # 只跑几个 step，确认训练通路打通
-make train-perception     # Stage 1
-make train-advisory       # Stage 2
-make eval                 # 完整评测 -> artifacts/reports/
-make infer                # 单图 demo：图像 -> 司机提示
+天气模型输出的反光、疑似湿润区域、亮白覆盖与低对比度是图像代理指标，不代表水深、摩擦力、
+实际积雪面积或雾中可视距离。训练期间使用验证集选模；正式测试结果由 `evaluate_weather.py` 单独报告。
+Pixel Accurate 训练使用 scene 1–3，scene 4 整组留作验证，避免同场景图像跨集合；数据含 clear、雾等级、雨强度及昼夜组合，
+不含 snow。scene 4 雨类样本较少，跨场景雨类仍需更多验证。ACDC 官方 test 指标与 Pixel 验证指标分开报告。
+
+#### 测试和当前推理链路
+
+```powershell
+# 全量自动化测试；项目内临时目录可避开 Windows 默认临时目录权限问题
+.venv\Scripts\python.exe -m pytest tests -q --basetemp=artifacts\pytest-tmp
+
+# ACDC 样例图端到端演示（查看 JSON 中的 skipped.perception）
+.venv\Scripts\python.exe scripts\run_pipeline.py --json --log-level INFO
 ```
 
-`make help` 可查看全部命令。
+推理演示会运行已接入的能见度、天气和建议逻辑；当 `skipped.perception` 出现时，表示主感知阶段
+没有运行，不能据此视为完整车辆识别测试。
+
+#### 尚不能运行的完整训练
+
+Stage 1 多任务感知模型（分割、目标检测、距离和接管边界）与 Stage 2 LLM/VLM 微调尚未实现。
+`scripts/train_perception.py`、`scripts/train_advisory.py` 目前只是职责说明，完整的
+`make train-perception`、`make train-advisory`、`make eval` 训练/评测链路尚不可用。
+规则和模板可以消费结构化感知结果，但当前没有已训练的主感知模型为它们提供真实目标与距离。
 
 ---
 
