@@ -6,13 +6,13 @@
 基于 [ACDC](https://acdc.vision.ee.ethz.ch/)（Adverse Conditions Dataset with Correspondences）
 的雾 / 夜 / 雨 / 雪四类场景构建。
 
-当前可运行的推理链路是：能见度门控 →（有权重时）天气分类 → 规则与模板建议。
-主感知模型未接入时，系统会将目标检测等信息标记为不可用并走保守接管路径；
-不会把空检测结果当成“没有目标”。
+当前可运行的推理链路是：能见度门控 → 天气多属性识别与 YOLO 常规目标检测 → 规则与模板建议。
+模型按配置中的现有权重加载；检测未运行和成功运行但未检出目标分别记录。
+常规检测仅覆盖八个已知类别，空框不能排除掉落货物等未知障碍。
 
 > **实现状态：部分功能可运行，完整两阶段系统仍在开发中。**
-> 能见度门控、独立天气分类、风险/接管规则和模板提示已实现；主感知模型
->（目标检测、距离、分割等）及 LLM/VLM 生成后端尚未接入。下面的架构图表示目标设计，
+> 能见度门控、独立天气模型、YOLO 框检测、风险/接管规则和模板提示已实现；
+> 距离、方向、道路分割、通用道路障碍物及 LLM/VLM 生成后端尚未实现。下面的架构图表示目标设计，
 > 不代表当前所有模块都已运行。详细状态见 [`TECH_STACK.md`](TECH_STACK.md)；
 > 开发计划见 [`docs/roadmap.md`](docs/roadmap.md)。
 
@@ -34,7 +34,6 @@
 │                                             │
 │   共享骨干 (SegFormer-MiT)                    │
 │     ├── 语义分割      → 可行驶区域、场景结构      │
-│     ├── 路况分类      → 雾 / 夜 / 雨 / 雪       │
 │     ├── 接管边界      → 三档分级 (0/1/2)        │
 │     └── 检测 + 距离   → 前车/来车 + 距离(米)     │
 └────────────────────┬────────────────────────┘
@@ -55,6 +54,9 @@
                      ▼
         「夜间有雾，前方约 30 米有车，建议减速并准备接管」
 ```
+
+天气与光照使用共享骨干之外的独立模型，按 `fog/rain/snow/night` 分别判断；Stage 1 不重复训练天气头。
+分类规范与数据映射见 [天气属性标签](docs/label_spec.md#2-天气现象与光照属性标签)。
 
 ### 两个核心设计取舍
 
@@ -201,12 +203,79 @@ python scripts/analyze_dataset.py
 pipeline 会加载可用的能见度权重；天气配置和权重都存在时也会自动加载天气模型。
 
 天气模型分别输出雾、雨、雪和夜间概率，配置阈值把这些属性独立转成提醒；例如夜雾可以同时输出 `fog` 与 `night`。
-天气提醒通过 `weather_warning` 单独返回，不直接决定是否接管。能见度 BLIND 门控以及其他必要感知缺失仍按原接管规则处理。
+天气现象分组为 fog/rain/snow，光照分组为 night。没有属性达到阈值时表示“未检出这些属性”，不直接推断晴天或白天。
+
+当前模型的 ACDC 官方 test 报告（2,000 张，2026-10-06 核对已有报告）如下；阈值属于推理配置，不是天气强度：
+
+| 分组 | 属性 | 当前阈值 | Precision | Recall | F1 |
+|------|------|---------:|----------:|-------:|---:|
+| 天气现象 | 雾 fog | 0.50 | 97.1% | 85.8% | 91.1% |
+| 天气现象 | 雨 rain | 0.77 | 91.6% | 87.0% | 89.2% |
+| 天气现象 | 雪 snow | 0.68 | 88.1% | 90.4% | 89.2% |
+| 光照属性 | 夜间 night | 0.78 | 99.8% | 98.0% | 98.9% |
+
+多属性 exact-match accuracy 为 88.15%，macro-F1 为 92.11%。这些指标不能解释为积水深度或雨雾强度的准确率。
+完整指标在本机 `artifacts/reports/weather_attributes/acdc_test_metrics.json`；详细分类口径见 [标签规范](docs/label_spec.md#2-天气现象与光照属性标签)。
+
+天气提醒通过 `weather_warning` 单独返回；天气属性单独不触发接管。已确认 fog/rain/snow 且能见度同时为 DEGRADED 时，
+可作为接管辅助条件；night 或不确定天气不触发该条件。能见度 BLIND 门控和其他必要感知缺失仍按原规则处理。
 
 天气模型输出的反光、疑似湿润区域、亮白覆盖与低对比度是图像代理指标，不代表水深、摩擦力、
 实际积雪面积或雾中可视距离。训练期间使用验证集选模；正式测试结果由 `evaluate_weather.py` 单独报告。
 Pixel Accurate 训练使用 scene 1–3，scene 4 整组留作验证，避免同场景图像跨集合；数据含 clear、雾等级、雨强度及昼夜组合，
 不含 snow。scene 4 雨类样本较少，跨场景雨类仍需更多验证。ACDC 官方 test 指标与 Pixel 验证指标分开报告。
+
+#### YOLO 检测：数据准备、训练与四分评估
+
+检测参数在 `configs/model/yolo_detection.yaml`，数据参数在 `configs/data/acdc_detection.yaml`。
+YOLO11n 使用 PyTorch 后端，`device: auto` 优先使用可用 CUDA。
+
+```powershell
+# 保留当前 CUDA PyTorch，在项目 .venv 添加检测依赖
+.venv\Scripts\python.exe -m pip install --no-deps -r requirements\requirements-detection.txt
+.venv\Scripts\python.exe scripts\prepare_detection.py
+.venv\Scripts\python.exe scripts\prepare_detection.py --verify-only --verify-hashes
+.venv\Scripts\python.exe scripts\train_detection.py
+# 默认检测已有模型并续训；显式重新开始与另外两个模型统一为 --fresh
+.venv\Scripts\python.exe scripts\train_detection.py --fresh
+.venv\Scripts\python.exe scripts\evaluate_detection.py --split val
+.venv\Scripts\python.exe scripts\evaluate_detection.py --split calibration
+.venv\Scripts\python.exe scripts\evaluate_detection.py --split test
+```
+
+使用 ACDC train+val 合并检测标注，固定种子 42，按 GoPro 原始拍摄组分层四分；
+GOPR 与 GP01/GP02 章节属于同一组。train 更新权重，val 早停和选择 best，
+calibration 单独选择置信度阈值，test 使用锁定的权重与阈值评估。四分本身不能消除过拟合。
+官方 2,000 张 test 没有公开检测真值，单独列为推理图片，不作为空目标负样本或本地 mAP 测试集。
+
+实际导出 train/val/calibration/test 为 **1,053 / 201 / 226 / 191** 张。
+335 张含 `iscrowd` 的图片按已确认方案列为待支持，原图和标注完整保留；损坏图 0 张。
+有效小框、夜间和低对比度图片均保留。输出位于 `data/processed/acdc_detection_yolo/`，
+清洗复用 `data/preprocessing.py` 完整性检查。默认硬链接节省磁盘，输出图片也应只读使用。
+
+目标比例 70/10/10/10 受整组约束影响，实际约 63.0/12.0/13.5/11.4。
+四集合都有八类目标和四类天气，但 val 雨天仅 6 张、test 雨天仅 9 张，
+calibration 雪天仅 3 张；少量天气子集指标不能代表可靠泛化。
+报告见 `artifacts/reports/detection_data/summary.md` 及 `artifacts/reports/detection/yolo11n_acdc/`。
+
+2026-10-07 已在 RTX 5070 完成 30 轮基线训练。仅在 val 上比较后，推理尺寸选择 960
+（训练仍为 640）；val mAP50 从 25.75% 提升到 30.51%。calibration 选出的置信度阈值为 0.2042。
+本地独立 test 的 mAP50 / mAP50–95 为 **32.99% / 16.72%**，宏召回率为 **33.73%**。
+汽车相对较好，小目标和少数类别漏检仍明显；这版是可运行基线，尚不能宣称可靠识别。
+分项结果、速度测量范围和 pipeline 结果见 `artifacts/reports/detection/yolo11n_acdc/summary.md`。
+本次权重的原始训练参数保存在运行目录 `args.yaml`；配置已为后续新的 AdamW 训练明确
+`warmup_bias_lr: 0.0`，本轮基线未按该新增参数重训。
+
+中断续训同时需要 `weights/last.pt` 与配对的 `weights/last_training_state.pt`。
+后者保存完整精度模型、优化器、EMA、AMP 缩放器与调度器，避免依赖库的 FP16 优化器保存丢失精度。
+默认优先查找运行目录的 last/best 权重，再查找配置 `checkpoint`；已有模型就复用，不会自动改回 COCO 预训练权重。
+中断运行恢复原计划；新版完整检查点即使已完成也可恢复状态继续训练。已完成旧版权重没有配对状态时，
+自动从已有 best 权重继续微调并重新建立优化器，日志明确区分 `resume`、`finetune` 与 `fresh`。
+完成已有计划后，默认再训练配置 `epochs` 轮；也可用配置 `train.resume_extra_epochs` 指定追加轮数。
+`--epochs` 覆盖轮数：有完整状态时未达到该上限就补足，已达到时将其视为追加轮数。
+`--fresh` 忽略已有训练状态，从配置 `model` 重新开始；`--resume` 保留为显式要求已有模型的兼容参数，不能与 `--fresh` 同用。
+重新开始或进入下一轮前，旧权重与训练记录保存在运行目录 `history/round_XXXX/`。
+权重更新后应重新运行校准与测试，pipeline 不会误用与新权重不匹配的旧校准阈值。
 
 #### 测试和当前推理链路
 
@@ -214,19 +283,22 @@ Pixel Accurate 训练使用 scene 1–3，scene 4 整组留作验证，避免同
 # 全量自动化测试；项目内临时目录可避开 Windows 默认临时目录权限问题
 .venv\Scripts\python.exe -m pytest tests -q --basetemp=artifacts\pytest-tmp
 
-# ACDC 样例图端到端演示（查看 JSON 中的 skipped.perception）
+# ACDC 样例图端到端演示（同时查看 perception 与 skipped）
 .venv\Scripts\python.exe scripts\run_pipeline.py --json --log-level INFO
 ```
 
-推理演示会运行已接入的能见度、天气和建议逻辑；当 `skipped.perception` 出现时，表示主感知阶段
-没有运行，不能据此视为完整车辆识别测试。
+推理演示自动加载已配置的 YOLO best 权重及匹配的校准阈值。
+检测返回原图坐标框、类别与置信度；距离为 `None`，方向为 `unknown`，不会编造测距结果。
+`object_detection_classes` 明确类别覆盖范围，`road_obstacle_detection_available=false`
+与 `skipped.road_obstacle_detection` 明确通用道路障碍分支未运行。
 
 #### 尚不能运行的完整训练
 
-Stage 1 多任务感知模型（分割、目标检测、距离和接管边界）与 Stage 2 LLM/VLM 微调尚未实现。
+Stage 1 多任务感知模型（分割、距离、方向和接管边界）与 Stage 2 LLM/VLM 微调尚未实现。
 `scripts/train_perception.py`、`scripts/train_advisory.py` 目前只是职责说明，完整的
 `make train-perception`、`make train-advisory`、`make eval` 训练/评测链路尚不可用。
-规则和模板可以消费结构化感知结果，但当前没有已训练的主感知模型为它们提供真实目标与距离。
+规则和模板已消费 YOLO 的真实框检测结果，缺失方向／距离时仍按现有保守规则请求接管。
+常规目标与道路障碍的分支设计、数据需求见 `docs/road_obstacle_detection.md`。
 
 ---
 

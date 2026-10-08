@@ -308,6 +308,11 @@ def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
     return r
 
 
+def probe_image_integrity(path: str | Path) -> dict[str, Any]:
+    """只验证图片结构与完整解码，供数据准备复用；不按亮度或清晰度过滤。"""
+    return _probe_image((str(path), True, False, 1))
+
+
 def _image_stats(im: Image.Image, downsample: int) -> dict[str, float]:
     """计算用于退化与离群检测的图像统计量。
 

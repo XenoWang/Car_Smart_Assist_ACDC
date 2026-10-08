@@ -100,8 +100,8 @@ advisory:
       rain:  1.3
       snow:  1.6
       night: 1.2
-    # 天气识别本身的提示等级；天气类别不单独触发接管。倍率只调整目标距离阈值，
-    # 可与目标距离共同提高风险等级；可见清晰度极差时由 visibility_gate 请求接管。
+    # 天气属性本身只产生提示/风险线索，不单独触发接管。倍率只调整目标距离阈值；
+    # weather_handover_* 另要求能见度同时 DEGRADED，才把雾/雨/雪作为接管辅助依据。
     weather_risk_levels:
       clear: none
       fog: notice
@@ -119,6 +119,9 @@ advisory:
     require_distance_uncertainty: false
     # 当前规则可以独立于接管分类头运行；若接入该头并设 true，缺失会请求接管。
     require_handover_head: false
+    # 天气属性只作辅助：雾/雨/雪与能见度 DEGRADED 同时确认时请求接管；天气单独不触发。
+    weather_handover_enabled: true
+    weather_handover_conditions: [fog, rain, snow]
 
   # --- 生成后处理 ---
   postprocess:

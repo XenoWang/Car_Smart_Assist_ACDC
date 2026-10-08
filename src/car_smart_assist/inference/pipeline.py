@@ -21,8 +21,8 @@
       │            │
       │            ▼
       │     ┌─────────────────────┐
-      │     │ ② 感知识别（待实现）  │  ← 用**原始分辨率**
-      │     │   路况/接管边界/距离  │
+      │     │ ② YOLO 常规目标检测  │  ← 用**原始分辨率**
+      │     │   测距/障碍物待实现  │
       │     └──────┬──────────────┘
       │            ▼
       │     ┌─────────────────────┐
@@ -43,11 +43,10 @@
 
 当前实现状态:
     ① 已实现且已验证（召回/误报/单调性见 artifacts/reports/visibility/）
-    ② 未实现 —— Stage 1 多任务模型尚未训练
+    ② 天气和 YOLO 常规目标检测已接入；测距、方向、道路障碍分支未实现
     ③ 已实现 —— 门控接管与结构化感知规则路径可用（advisory/generator）
 
-    因此现在跑管线会得到「路况未知」类的提示而不是真实识别结果。
-    这是如实反映实现进度，不是 bug —— 管线会把这些阶段记进 `skipped`。
+    已训练的检测权重按配置自动加载；输出明确记录未实现的道路障碍能力。
 """
 
 from __future__ import annotations
@@ -234,6 +233,17 @@ class InferencePipeline:
         elif weather_checkpoint is not None:
             raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
 
+        detection_config_path = root / "configs/model/yolo_detection.yaml"
+        if predictor is None and detection_config_path.is_file():
+            from car_smart_assist.config.detection import load_yolo_config
+            from car_smart_assist.perception.detection_yolo import YoloDetectionPredictor
+
+            detection_cfg = load_yolo_config(detection_config_path)
+            detection_checkpoint = root / detection_cfg["checkpoint"]
+            if detection_checkpoint.is_file():
+                predictor = YoloDetectionPredictor.from_config(detection_cfg, root)
+                logger.info("YOLO 目标检测已接入: %s", detection_checkpoint)
+
         return cls(
             scorer=scorer,
             gate=VisibilityGate.from_config(visibility_cfg),
@@ -332,7 +342,7 @@ class InferencePipeline:
 
             if self.predictor is None:
                 r.skipped["perception"] = (
-                    "Stage 1 感知模型尚未接入（perception/models/multitask.py 待训练）"
+                    "目标检测权重或感知 predictor 尚未接入"
                 )
                 continue
 
@@ -350,7 +360,14 @@ class InferencePipeline:
                     perception.visibility_level = r.visibility.level.value
                     perception.visibility_confidence_multiplier = r.visibility.confidence_multiplier
                     perception.visibility_reasons = list(r.visibility.triggered)
+                if r.weather is not None:
+                    perception.weather_attributes = r.weather.attributes
+                    perception.weather_probabilities = dict(r.weather.probabilities)
                 r.perception = perception
+                if not perception.road_obstacle_detection_available:
+                    r.skipped["road_obstacle_detection"] = (
+                        "道路障碍分支未训练；常规目标检测无法排除掉落货物等未知障碍"
+                    )
             except Exception as exc:  # noqa: BLE001
                 # 感知失败不能让整条管线失声 —— 记下来，后面走降级文案
                 logger.exception("感知阶段失败")

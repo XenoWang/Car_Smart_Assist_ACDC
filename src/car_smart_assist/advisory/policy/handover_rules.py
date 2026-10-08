@@ -1,4 +1,4 @@
-"""根据判断可靠性与已识别风险生成接管请求，不执行车辆控制权切换。"""
+"""根据判断可靠性、组合天气信号与已识别风险生成接管请求。"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def evaluate_handover(
     perception: PerceptionResult | None,
     config: PolicyConfig,
 ) -> HandoverDecision:
-    """无法可靠判断就请求接管；明确高风险和可靠的接管头 2 级同样请求接管。"""
+    """无法可靠判断就请求接管；天气仅与能见度下降组合时辅助触发接管。"""
     risk = assess_risk(perception, config)
     reasons = [*risk.unavailable_reasons, *risk.diagnostics]
     unable_to_judge = not risk.reliable
@@ -59,12 +59,41 @@ def evaluate_handover(
             if head_action != "no_action":
                 reasons.append(f"接管边界分类头识别为 {level} 级，动作 {head_action}")
 
+    weather_auxiliary_takeover = False
+    if (
+        config.weather_handover_enabled
+        and isinstance(perception, PerceptionResult)
+        and perception.visibility_level == "degraded"
+    ):
+        attributes = perception.weather_attributes
+        if isinstance(attributes, (tuple, list)) and all(
+            isinstance(attribute, str) for attribute in attributes
+        ):
+            severe_weather = tuple(
+                condition
+                for condition in config.weather_handover_conditions
+                if condition in attributes
+            )
+            if severe_weather:
+                weather_auxiliary_takeover = True
+                reason = (
+                    "天气识别到 "
+                    + "/".join(severe_weather)
+                    + "，且能见度已下降；天气作为辅助信号请求接管"
+                )
+                reasons.append(reason)
+                risk.reasons.append(reason)
+                risk.triggered.append("weather_visibility_auxiliary_handover")
+        else:
+            risk.diagnostics.append("天气属性格式无效，未用于接管辅助判断")
+
     if risk.risk_level is RiskLevel.CRITICAL:
         reasons.append("图片识别结果触发 critical 风险规则")
     should_takeover = (
         unable_to_judge
         or risk.risk_level is RiskLevel.CRITICAL
         or head_action == "request_takeover"
+        or weather_auxiliary_takeover
     )
     action = (
         "request_takeover"

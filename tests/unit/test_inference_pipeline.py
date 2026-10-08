@@ -149,6 +149,8 @@ class TestGateBlocksPerception:
         assert r.blocked is False
         assert r.perception is not None
         assert len(predictor.seen_shapes) == 1
+        assert "road_obstacle_detection" in r.skipped
+        assert not r.perception.road_obstacle_detection_available
 
     def test_degraded_still_runs_perception(self):
         """DEGRADED 只是降低置信度，不该阻断 —— 误报会让用户学会忽略它。"""

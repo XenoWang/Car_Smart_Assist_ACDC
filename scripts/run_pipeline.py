@@ -12,9 +12,8 @@
     python scripts/run_pipeline.py --json                # 输出 json
 
 当前实现状态:
-    门控（第一级判断）已实现且可用；Stage 1 感知尚未训练接入，
-    因此输出里的 `skipped` 会标明感知阶段被跳过 —— 这是如实反映进度，
-    不是异常。被门控判为 BLIND 的帧则连感知都不需要，直接出接管请求。
+    门控、天气与 YOLO 常规检测按现有权重加载；测距、方向及道路障碍分支待实现。
+    输出 `skipped` 记录被跳过的阶段。BLIND 帧直接请求接管。
 """
 
 from __future__ import annotations

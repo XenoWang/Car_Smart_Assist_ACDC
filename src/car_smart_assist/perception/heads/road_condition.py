@@ -1,9 +1,6 @@
-"""路况分类头。
+"""旧 Stage 1 路况头占位，配置中已禁用。
 
-职责:
-    - 分类天气/光照/路面状况（fog / night / rain / snow 及其组合）
-    - 可直接复用 ACDC 的天气子集标签做监督（这部分标签质量最好）
-    - 输出作为 Stage 2 生成提示时的上下文条件
-
-依赖: 共享骨干特征
+当前天气现象与光照由 perception/weather.py 的独立属性模型处理。
+输出顺序和阈值见 configs/model/weather_classifier.yaml；pipeline 将多标签结果
+传入 PerceptionResult.weather_attributes / weather_probabilities，不复用旧单类别编码。
 """

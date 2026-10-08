@@ -92,6 +92,57 @@ def test_recognized_weather_has_baseline_notice(config, weather):
     assert weather in " ".join(decision.risk.reasons)
 
 
+def test_weather_is_only_handover_support_when_visibility_is_degraded(config):
+    visible = evaluate_handover(scene(weather_attributes=("fog",)), config)
+    assert not visible.should_takeover
+
+    degraded = evaluate_handover(
+        scene(weather_attributes=("fog",), visibility_level="degraded"), config
+    )
+    assert degraded.should_takeover
+    assert not degraded.unable_to_judge
+    assert degraded.action == "request_takeover"
+    assert "weather_visibility_auxiliary_handover" in degraded.risk.triggered
+    advisory = AdvisoryGenerator().from_perception(
+        scene(weather_attributes=("fog",), visibility_level="degraded")
+    )
+    assert advisory.should_takeover
+    assert "恶劣天气且能见度下降" in advisory.text
+    assert not check_wording(advisory.text)
+
+    night_only = evaluate_handover(
+        scene(weather_attributes=("night",), visibility_level="degraded"), config
+    )
+    assert not night_only.should_takeover
+    disabled = load_policy_config({"weather_handover_enabled": False})
+    assert not evaluate_handover(
+        scene(weather_attributes=("fog",), visibility_level="degraded"), disabled
+    ).should_takeover
+
+
+def test_adverse_weather_only_supports_handover_with_degraded_visibility(config):
+    visible = evaluate_handover(scene(weather_attributes=("fog",)), config)
+    assert not visible.should_takeover
+    assert not visible.unable_to_judge
+
+    degraded = evaluate_handover(
+        scene(weather_attributes=("fog",), visibility_level="degraded"), config
+    )
+    assert degraded.should_takeover
+    assert not degraded.unable_to_judge
+    assert "weather_visibility_auxiliary_handover" in degraded.risk.triggered
+
+    night_only = evaluate_handover(
+        scene(weather_attributes=("night",), visibility_level="degraded"), config
+    )
+    assert not night_only.should_takeover
+
+    disabled = load_policy_config({"weather_handover_enabled": False})
+    assert not evaluate_handover(
+        scene(weather_attributes=("fog",), visibility_level="degraded"), disabled
+    ).should_takeover
+
+
 def test_weather_and_oncoming_use_configured_multipliers(config):
     assert assess_risk(scene(target(20)), config).risk_level is RiskLevel.WARNING
     assert (
@@ -282,6 +333,10 @@ def test_config_override_does_not_mutate_defaults(config):
         {"handover_level_to_action": {1.5: "no_action"}},
         {"handover_level_to_action": {"1": "no_action"}},
         {"weather_risk_multiplier": []},
+        {"weather_handover_enabled": "false"},
+        {"weather_handover_conditions": ["night"]},
+        {"weather_handover_enabled": "false"},
+        {"weather_handover_conditions": ["night"]},
         [],
         False,
     ],

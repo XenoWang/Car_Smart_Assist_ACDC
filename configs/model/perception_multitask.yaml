@@ -1,9 +1,9 @@
 # =============================================================================
 # Stage 1：多任务感知模型配置
 # =============================================================================
-# 一个共享骨干 + 四个任务头。共享而非四个独立模型，理由：
-#   (a) 显存与推理延迟 —— 车载场景不可能同时跑四个网络
-#   (b) 交叉增益 —— 路况与接管边界、分割与检测之间有强相关性
+# 共享骨干服务于分割、接管边界和检测/距离任务。
+# 天气与光照复用独立 weather_attributes 模型，不在 Stage 1 重复训练。
+# 共享特征用于控制显存与延迟，并研究分割与检测之间的交叉增益。
 # 代价是任务间可能相互干扰（负迁移），所以 loss 权重是本文件最需要调的参数。
 # =============================================================================
 
@@ -43,16 +43,11 @@ model:
       # 类别极不均衡（道路/天空占绝大多数像素），必须加权
       class_weighting: median_frequency
 
-    # 路况分类：标签直接来自 ACDC 天气子集，是本项目标签质量最好的任务
+    # 旧天气头保留禁用标记；实际属性顺序与阈值只在 weather_classifier.yaml 定义。
+    # pipeline 复用独立模型的 weather_attributes / weather_probabilities。
     road_condition:
-      enabled: true
-      type: pooling_cls            # 全局池化 + 线性层，轻量
-      num_classes: 4               # fog / night / rain / snow
-      # 注意这是多标签还是单标签取决于 ACDC 的口径：
-      # 官方每个子集是互斥的，但实际场景可能同时下雪又起雾。
-      # 先用单标签（softmax），后续如果发现漏判再改成多标签（BCE）。
-      multilabel: false
-      loss_weight: 0.5
+      enabled: false
+      loss_weight: 0.0
 
     # 接管边界：本项目最核心、也最需要说清楚的任务
     handover:
@@ -135,14 +130,14 @@ model:
       bucket_weighting: true
 
   # --- 多任务损失组合 ---
-  # 四个任务的 loss 量纲差异很大（分割是逐像素、距离是逐框），
+  # 各任务的 loss 量纲差异很大（分割是逐像素、距离是逐框），
   # 直接相加会让某个任务被淹没。这里提供两种策略。
   loss_balancing:
     strategy: uncertainty           # fixed | uncertainty | gradnorm
     # fixed 模式下的手工权重（仅 strategy=fixed 时生效）
     fixed_weights:
       segmentation: 1.0
-      road_condition: 0.5
+      road_condition: 0.0          # 独立天气模型不参与 Stage 1 多任务损失
       handover: 1.0
       vehicle_detection: 0.5
       distance: 1.0

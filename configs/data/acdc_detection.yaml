@@ -1,0 +1,28 @@
+# ACDC 实例检测数据；独立读取，不依赖尚未实现的配置继承器。
+detection_data:
+  acdc_root: data/raw/acdc
+  output_root: data/processed/acdc_detection_yolo
+  report_root: artifacts/reports/detection_data
+  annotation_files:
+    - gt_detection/instancesonly_train_gt_detection.json
+    - gt_detection/instancesonly_val_gt_detection.json
+  official_test_index: gt_detection/instancesonly_test_image_info.json
+  seed: 42
+  split_ratios:
+    train: 0.70
+    val: 0.10
+    calibration: 0.10
+    test: 0.10
+  group_strategy: recording_family # GOPRxxxx / GP01xxxx / GP02xxxx 整录制归组
+  crowd_policy: exclude_image     # 用户选择：完整保留 raw，群体框图片另列待支持
+  image_mode: hardlink            # 同盘硬链接节省空间；失败时复制。导出图片仅供读取。
+  integrity_workers: 4
+  classes:                       # 连续 YOLO ID 由此顺序决定；保留全部 ACDC 类别
+    - {source_id: 26, name: car}
+    - {source_id: 27, name: truck}
+    - {source_id: 28, name: bus}
+    - {source_id: 32, name: motorcycle}
+    - {source_id: 33, name: bicycle}
+    - {source_id: 24, name: person}
+    - {source_id: 25, name: rider}
+    - {source_id: 31, name: train}

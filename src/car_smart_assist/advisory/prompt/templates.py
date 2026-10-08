@@ -71,6 +71,8 @@ def render_policy(decision: HandoverDecision) -> str:
     if decision.should_takeover:
         if decision.unable_to_judge:
             return FALLBACK_TEXT
+        if "weather_visibility_auxiliary_handover" in decision.risk.triggered:
+            return "恶劣天气且能见度下降，请立即接管车辆"
         if decision.risk.risk_level is RiskLevel.CRITICAL:
             return "识别到高风险情况，请立即接管车辆"
         return "已达系统能力边界，请立即接管车辆"

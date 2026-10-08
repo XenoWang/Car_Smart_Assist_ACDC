@@ -5,7 +5,8 @@
 #   官网   https://acdc.vision.ee.ethz.ch/
 #   规模   4006 张图像，覆盖 fog / night / rain / snow 四类恶劣天气
 #   标注   语义分割 + panoptic + 图像间对应关系
-#   注意   **原生没有车辆距离/检测框标注** —— 距离任务必须由外部数据补充，
+#   注意   ACDC v2 提供检测框；原生没有车辆距离标注，距离任务由外部数据补充。
+#          YOLO 检测四分划分由 configs/data/acdc_detection.yaml 单独管理，
 #          见 configs/data/distance_supplement.yaml 与 docs/label_spec.md
 #
 # 许可是研究用途且禁止再分发，所以 data/ 整个目录已在 .gitignore 中。
@@ -31,7 +32,7 @@ data:
   # 更正（解压后核实）：ACDC **自带官方 train/val/test 划分**。
   # 早期配置写的是「官方不提供划分，自己按 70/15/15 切」—— 那是错的。
   #
-  # 必须用官方划分，理由：
+  # 官方划分用于论文基准对比；开发任务另按无泄漏组划分，结果不能混称官方基准：
   #   1. 用自造划分的结果无法与已发表论文对比，项目的指标失去参照系
   #   2. 官方划分可用于基准对比；但实测同一 sequence 的不同帧会跨 train/val。
   #      需要视频级隔离的任务应合并 train+val 后自行按 sequence 重切分。

@@ -87,6 +87,9 @@ class PerceptionResult:
     # --- 路况 ---
     road_condition: str | None = None
     road_condition_confidence: float = 0.0
+    # 独立天气模型的多标签输出。用于提醒；只有与其他信号组合时才参与接管判断。
+    weather_attributes: tuple[str, ...] = ()
+    weather_probabilities: dict[str, float] = field(default_factory=dict)
 
     # --- 接管边界（0=可继续 1=接近边界 2=应立即接管）---
     handover_level: int | None = None
@@ -97,6 +100,10 @@ class PerceptionResult:
     # 只有检测器实际成功运行并返回本帧完整结果时才设为 True。
     # True + [] 表示未检出目标；False 表示检测结果不可用，两者不能混同。
     object_detection_available: bool = False
+    # 检测器支持的类别；成功返回空框也不能排除这些类别之外的道路障碍。
+    object_detection_classes: tuple[str, ...] = ()
+    # 独立道路障碍分支尚未训练，不能用常规类别检测替代该能力。
+    road_obstacle_detection_available: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -105,10 +112,14 @@ class PerceptionResult:
             "visibility_reasons": list(self.visibility_reasons),
             "road_condition": self.road_condition,
             "road_condition_confidence": self.road_condition_confidence,
+            "weather_attributes": list(self.weather_attributes),
+            "weather_probabilities": dict(self.weather_probabilities),
             "handover_level": self.handover_level,
             "handover_confidence": self.handover_confidence,
             "objects": [o.to_dict() for o in self.objects],
             "object_detection_available": self.object_detection_available,
+            "object_detection_classes": list(self.object_detection_classes),
+            "road_obstacle_detection_available": self.road_obstacle_detection_available,
         }
 
     def effective_confidence(self, raw: float) -> float:

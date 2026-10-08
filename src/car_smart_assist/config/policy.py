@@ -27,6 +27,8 @@ class PolicyConfig:
     max_distance_uncertainty_ratio: float
     require_distance_uncertainty: bool
     require_handover_head: bool
+    weather_handover_enabled: bool
+    weather_handover_conditions: tuple[str, ...]
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> PolicyConfig:
@@ -88,6 +90,15 @@ class PolicyConfig:
             for key in ("require_distance_uncertainty", "require_handover_head"):
                 if not isinstance(cfg[key], bool):
                     raise ValueError(f"policy.{key} 必须是布尔值")
+            if not isinstance(cfg["weather_handover_enabled"], bool):
+                raise ValueError("policy.weather_handover_enabled 必须是布尔值")
+            weather_conditions = tuple(cfg["weather_handover_conditions"])
+            if (
+                not weather_conditions
+                or len(set(weather_conditions)) != len(weather_conditions)
+                or not set(weather_conditions) <= {"fog", "rain", "snow"}
+            ):
+                raise ValueError("weather_handover_conditions 仅接受不重复的 fog/rain/snow")
             return cls(
                 distance_thresholds=MappingProxyType(distances),
                 weather_risk_multiplier=MappingProxyType(weather),
@@ -103,6 +114,8 @@ class PolicyConfig:
                 ),
                 require_distance_uncertainty=cfg["require_distance_uncertainty"],
                 require_handover_head=cfg["require_handover_head"],
+                weather_handover_enabled=cfg["weather_handover_enabled"],
+                weather_handover_conditions=weather_conditions,
             )
         except (KeyError, TypeError, AttributeError, OverflowError) as exc:
             raise ValueError(f"policy 配置缺失或结构不正确：{exc}") from exc
