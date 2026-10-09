@@ -21,6 +21,7 @@ class WeatherConfig:
     device: str
     features: dict[str, float]
     train: dict[str, Any]
+    rain_adapter_channels: int = 0
 
 
 def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
@@ -38,6 +39,7 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
         features = dict(cfg["features"])
         train = dict(cfg["train"])
         dropout = float(cfg["dropout"])
+        rain_adapter_channels = cfg.get("rain_adapter_channels", 0)
     except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
         raise ValueError(f"天气模型配置无效：{exc}") from exc
     if attributes != ("fog", "rain", "snow", "night"):
@@ -68,6 +70,8 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
         raise ValueError("道路近似区域必须非空")
     if not isinstance(cfg["checkpoint"], str) or not isinstance(cfg["device"], str):
         raise ValueError("checkpoint/device 必须是字符串")
+    if type(rain_adapter_channels) is not int or rain_adapter_channels < 0:
+        raise ValueError("rain_adapter_channels 必须是非负整数")
     return WeatherConfig(
         attributes,
         decision_thresholds,
@@ -78,4 +82,5 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
         cfg["device"],
         features,
         train,
+        rain_adapter_channels,
     )

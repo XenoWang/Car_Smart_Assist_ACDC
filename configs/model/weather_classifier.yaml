@@ -1,4 +1,3 @@
-# 天气现象与光照独立多标签识别；视觉线索不是物理量。
 weather_classifier:
   attributes: [fog, rain, snow, night]
   image_size: [128, 224]            # [高, 宽]，维持 ACDC 约 16:9 的画幅

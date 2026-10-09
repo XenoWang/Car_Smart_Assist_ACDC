@@ -100,9 +100,23 @@ class WeatherClassifier(nn.Module):
         self.head = nn.Sequential(
             nn.Dropout(cfg.dropout), nn.Linear(in_channels + 16, len(cfg.attributes))
         )
+        self.rain_adapter = None
+        if cfg.rain_adapter_channels:
+            self.rain_adapter = nn.Sequential(
+                nn.Linear(in_channels + 16, cfg.rain_adapter_channels), nn.ReLU(inplace=True),
+                nn.Linear(cfg.rain_adapter_channels, 1),
+            )
+            # 零残差初始化保持原多标签模型的全部输出。
+            nn.init.zeros_(self.rain_adapter[-1].weight)
+            nn.init.zeros_(self.rain_adapter[-1].bias)
 
     def forward(self, images: torch.Tensor, cues: torch.Tensor) -> torch.Tensor:
-        return self.head(torch.cat((self.encoder(images), self.cue_encoder(cues)), dim=1))
+        features = torch.cat((self.encoder(images), self.cue_encoder(cues)), dim=1)
+        logits = self.head(features)
+        if self.rain_adapter is not None:
+            rain = logits[:, 1:2] + self.rain_adapter(features)
+            logits = torch.cat((logits[:, :1], rain, logits[:, 2:]), dim=1)
+        return logits
 
 
 @dataclass(frozen=True)
@@ -175,6 +189,8 @@ class WeatherPredictor:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if checkpoint.get("format_version") != 2:
             raise ValueError("天气检查点格式不兼容")
+        if checkpoint["model_config"].get("rain_adapter_channels", 0) != cfg.rain_adapter_channels:
+            raise ValueError("天气检查点的 rain_adapter_channels 与当前配置不一致")
         for key in ("attributes", "image_size", "channels", "features"):
             expected = (
                 list(getattr(cfg, key))

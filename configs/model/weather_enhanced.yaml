@@ -1,0 +1,55 @@
+weather_classifier:
+  attributes: [fog, rain, snow, night]
+  image_size: [128, 224]
+  channels: [16, 32, 64]
+  dropout: 0.2
+  rain_adapter_channels: 16
+  checkpoint: artifacts/checkpoints/weather_enhanced/best.pt
+  device: auto
+  decision_thresholds: {fog: 0.5, rain: 0.77, snow: 0.68, night: 0.78}
+  features:
+    road_top_fraction: 0.55
+    road_side_fraction: 0.15
+    bright_threshold: 0.72
+    dark_threshold: 0.38
+    saturation_max: 0.25
+    smooth_gradient_max: 0.06
+  train:
+    acdc_root: data/raw/acdc
+    acdc_cleaning_manifest: data/processed/manifests/acdc.json
+    pixel_cleaning_manifest: data/processed/manifests/pixel_accurate_benchmark.json
+    cache_dir: data/processed/weather
+    epochs: 60
+    resume_extra_epochs: 30
+    batch_size: 32
+    learning_rate: 0.0003
+    weight_decay: 0.0001
+    label_smoothing: 0.02
+    patience: 20
+    num_workers: 0
+    seed: 42
+    validation_fraction: 0.2
+    calibration_fraction: 0.1
+    use_pixel_accurate: true
+    pixel_accurate_zip: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark/rgb_left_8bit.zip
+    pixel_accurate_validation_scene: 4
+    pixel_accurate_calibration_scene: 3
+    pos_weight_cap: 1.0  # 已通过均衡采样强化雨样本，避免再次叠加过大正样本权重。
+    enhanced:
+      teacher_checkpoint: artifacts/checkpoints/weather_attributes/best.pt
+      report_dir: artifacts/reports/weather_enhanced
+      acdc_positive_only: true
+      rain_sampling_multiplier: 2.0
+      hard_rain_multiplier: 2.0
+      rain_loss_multiplier: 2.0
+      distillation_weight: 5.0
+      distillation_temperature: 2.0
+      teacher_confidence: 0.8
+      distill_unlabeled: true
+      augmentation_probability: 0.7
+      brightness_range: [0.9, 1.1]
+      contrast_range: [0.9, 1.1]
+      protected_attributes: [fog, snow, night]
+      max_f1_drop: 0.0
+      max_recall_drop: 0.0
+      max_source_macro_f1_drop: 0.0

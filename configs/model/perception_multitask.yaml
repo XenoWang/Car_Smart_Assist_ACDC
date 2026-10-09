@@ -1,38 +1,19 @@
-# =============================================================================
-# Stage 1：多任务感知模型配置
-# =============================================================================
-# 共享骨干服务于分割、接管边界和检测/距离任务。
-# 天气与光照复用独立 weather_attributes 模型，不在 Stage 1 重复训练。
-# 共享特征用于控制显存与延迟，并研究分割与检测之间的交叉增益。
-# 代价是任务间可能相互干扰（负迁移），所以 loss 权重是本文件最需要调的参数。
-# =============================================================================
-
 base: default.yaml
 
 model:
   name: perception_multitask
   arch: multitask
 
-  # --- 共享骨干 ---
   backbone:
     name: segformer
-    # 12GB 显存下的选择权衡：
-    #   mit_b0 ~3.7M  最快，指标一般
-    #   mit_b1 ~14M   推荐起点 —— 精度与显存的最佳平衡
-    #   mit_b2 ~27M   显存吃紧，需要把 batch_size 降到 2
     variant: mit_b1
     pretrained: true
-    # 预训练权重来源：imagenet 是稳的；cityscapes 上预训练对分割更有利，
-    # 但要求标签空间对齐（本项目已映射到 Cityscapes 19 类）
     pretrained_source: imagenet
-    # 冻结骨干的前 N 个 stage。ACDC 只有 4006 张图，全量微调容易过拟合
     freeze_stages: 0
     out_indices: [0, 1, 2, 3]      # 输出四层特征金字塔，供不同 scale 的头使用
 
-  # --- 任务头 ---
   heads:
 
-    # 语义分割：为其他任务提供场景上下文，也是最有把握做好的任务
     segmentation:
       enabled: true
       type: linear_fpn
@@ -40,60 +21,28 @@ model:
       ignore_index: 255
       feature_level: 3             # 用最高层特征（1/32）
       loss_weight: 1.0
-      # 类别极不均衡（道路/天空占绝大多数像素），必须加权
       class_weighting: median_frequency
 
-    # 旧天气头保留禁用标记；实际属性顺序与阈值只在 weather_classifier.yaml 定义。
-    # pipeline 复用独立模型的 weather_attributes / weather_probabilities。
     road_condition:
       enabled: false
       loss_weight: 0.0
 
-    # 接管边界：本项目最核心、也最需要说清楚的任务
     handover:
       enabled: true
       type: pooling_cls
-      # 分级而非二分类。理由：实际驾驶中「马上要接管」和「还早」是完全不同的提示，
-      # 二分类会丢掉这个信息，导致提示要么太早（烦人）要么太晚（危险）。
       num_levels: 3                # 0=可继续辅助驾驶  1=接近边界需注意  2=应立即接管
       loss_weight: 1.0
-      # 漏报代价远高于误报：该接管而没提醒是安全问题，误报只是打扰。
-      # 非对称加权，具体倍数在 labels 段调
       asymmetric_weighting: true
       loss_level_weights: [1.0, 2.0, 4.0]   # 等级 2 的样本权重最高
-      # 标签定义见 docs/handover_policy.md —— 这不是数据集自带的，是本项目自己构造的
       label_source: constructed
       labels_file: data/processed/handover/labels.json
 
-    # 车辆检测（前车 / 来车）
     vehicle_detection:
       enabled: true
       type: anchor_free_single_scale
-      #
-      # 类别 = ACDC 原生的 8 类，用 Cityscapes ID。
-      # 实测 train 集分布：car 6657 / person 1692 / truck 537 / bicycle 392 /
-      #                    motorcycle 250 / rider 227 / train 212 / bus 168
-      #
-      # 注意：「目标类别」与「前车/来车」是两个独立维度 ——
-      # 「这是不是车」和「它在同向还是对向车道」是两件事，不能塞进同一个分类头。
       num_classes: 8
       class_ids: [24, 25, 26, 27, 28, 31, 32, 33]   # Cityscapes ID，原生即是这些值
-      # 关于 train(31)：这是**铁路列车**，不是"训练集"的笔误。
-      # 城市驾驶场景出现 212 个实例存疑，实现阶段核对原图后决定并入还是丢弃。
-      # 见 docs/label_spec.md 4.4
-      #
-      # label_source: acdc —— ACDC v2 自带检测框（2006 张图，COCO 格式），
-      # 检测不需要跨域监督，域差异问题因此只剩「距离」一个输出维度。
       label_source: acdc
-      #
-      # ⚠️ 方向（前车/来车）在 ACDC 里完全不存在，且 ACDC **无任何朝向/3D 信息**
-      # （标注字段仅 area/bbox/category_id/id/image_id/iscrowd/segmentation）。
-      # 所以早期写的 strategy: yaw_angle 在 ACDC 上是执行不了的 —— 那是 KITTI 的能力。
-      #
-      # 改为：从 ACDC 的视频序列**离线推导**方向标签 ——
-      # 在同一 sequence 内跟踪目标，按其横向运动判断同向还是对向。
-      # 关键：时序只用于造标签，**推理仍是单帧**，不引入 RNN，不维护帧间状态。
-      # 阈值必须人工标定后再填，见 docs/label_spec.md 4.1
       direction:
         enabled: true
         source: sequence_tracking
@@ -103,7 +52,6 @@ model:
           min_track_len: 5           # 轨迹短于此长度不用于判方向
           max_age: 30                # 丢失多少帧后终止轨迹
           iou_match_threshold: 0.3
-        # ⚠️ 以下阈值必须用人工核对样本标定后填入，不要拍脑袋定一个就开训
         lateral_shift_threshold_px: null
         min_confidence: 0.6
         unknown_policy: exclude_from_direction_loss
@@ -113,44 +61,26 @@ model:
       nms_iou_threshold: 0.5
       max_detections: 20
 
-    # 距离回归：挂在检测框上
     distance:
       enabled: true
       type: box_mlp_regression
-      # 预测 log(distance) 而不是 distance：
-      # 距离是正值且跨越两个数量级，直接回归会被远处的大数值主导，
-      # log 空间下误差分布均匀得多，近处精度明显提升。
       predict_log: true
       loss_weight: 1.0
       loss_type: silu_huber        # 对离群标注鲁棒（距离标签里总有几帧是错的）
-      # 输出不确定度（heteroscedastic），供 Stage 2 做保守决策：
-      # 模型自己说「这帧我没把握」时，提示策略应当更保守
       predict_uncertainty: true
-      # 按距离分桶加权，避免近处样本数占优导致远处完全没学到
       bucket_weighting: true
 
-  # --- 多任务损失组合 ---
-  # 各任务的 loss 量纲差异很大（分割是逐像素、距离是逐框），
-  # 直接相加会让某个任务被淹没。这里提供两种策略。
   loss_balancing:
     strategy: uncertainty           # fixed | uncertainty | gradnorm
-    # fixed 模式下的手工权重（仅 strategy=fixed 时生效）
     fixed_weights:
       segmentation: 1.0
       road_condition: 0.0          # 独立天气模型不参与 Stage 1 多任务损失
       handover: 1.0
       vehicle_detection: 0.5
       distance: 1.0
-    # uncertainty 模式：让模型自己学各任务的权重，不需要手调，但训练初期不稳定，
-    # 建议前 2 个 epoch 先用 fixed，再切到 uncertainty
     uncertainty_warmup_epochs: 2
 
-# =============================================================================
-# 消融实验预设（写在这里是为了让「做过哪些对比」可复现，而不是靠记忆）
-# =============================================================================
 ablations:
-  # 用法：python scripts/train_perception.py --config configs/train/perception.yaml \
-  #           --set model.heads.distance.enabled=false --set project.experiment_tag=no_distance
   - tag: no_segmentation        # 去掉分割头，看其他任务掉多少
   - tag: no_handover            # 去掉接管头（对照组）
   - tag: no_distance            # 去掉距离头

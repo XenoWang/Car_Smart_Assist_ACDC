@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -17,11 +18,18 @@ from car_smart_assist.perception.weather_training import train_weather  # noqa: 
 def main() -> int:
     parser = argparse.ArgumentParser(description="训练 ACDC fog/night/rain/snow 小模型")
     parser.add_argument("--config", default="configs/model/weather_classifier.yaml")
-    parser.add_argument("--fresh", action="store_true", help="从头训练并覆盖天气模型检查点")
+    parser.add_argument("--fresh", action="store_true", help="新开运行；增强模式从固定原模型初始化，普通模式从头训练")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     try:
         cfg = load_weather_config(root / args.config)
+        if "enhanced" in cfg.train:
+            from car_smart_assist.perception.weather_enhanced_training import train_enhanced_weather
+
+            logging.basicConfig(level=logging.INFO, format="%(message)s")
+            result = train_enhanced_weather(cfg, root, resume=not args.fresh)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         result = train_weather(cfg, root, resume=not args.fresh)
     except (FileNotFoundError, ValueError) as exc:
         print(f"天气模型训练未开始或中断：{exc}", file=sys.stderr)

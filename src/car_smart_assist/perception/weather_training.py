@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import logging
 import random
 import re
 from collections import defaultdict
@@ -21,6 +22,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from car_smart_assist.config.weather import WeatherConfig
+from car_smart_assist.data.detection import recording_group
+from car_smart_assist.data.preprocessing import load_invalid_entries
 from car_smart_assist.perception.visibility.dataset import read_rgb_image
 from car_smart_assist.perception.weather import (
     FEATURE_NAMES,
@@ -42,7 +45,8 @@ class WeatherSample:
 
 
 def _acdc_split(
-    acdc_root: Path, split: str, attributes: tuple[str, ...]
+    acdc_root: Path, split: str, attributes: tuple[str, ...],
+    invalid: set[str] | None = None,
 ) -> list[WeatherSample]:
     if split not in ("train", "val", "test"):
         raise ValueError("ACDC 天气图片 split 必须是 train/val/test")
@@ -51,13 +55,13 @@ def _acdc_split(
     for condition in attributes:
         folder = root / condition / split
         for path in sorted(folder.rglob("*_rgb_anon.png")) if folder.is_dir() else ():
-            if not path.is_file():
+            if not path.is_file() or str(path.resolve()) in (invalid or ()):
                 continue
             labels = tuple(float(attribute == condition) for attribute in attributes)
             samples.append(
                 WeatherSample(
                     labels=labels,
-                    group=f"acdc:{condition}:{path.parent.name}",
+                    group=f"acdc:{condition}:{recording_group(path.parent.name, 'recording_family')}",
                     stratum=condition,
                     path=path,
                 )
@@ -66,12 +70,13 @@ def _acdc_split(
 
 
 def list_condition_images(
-    acdc_root: Path, split: str, attributes: tuple[str, ...]
+    acdc_root: Path, split: str, attributes: tuple[str, ...],
+    invalid: set[str] | None = None,
 ) -> list[WeatherSample]:
     """List ACDC development images; test is deliberately reserved for evaluation."""
     if split not in ("train", "val"):
         raise ValueError("训练和选优只允许读取 ACDC 官方 train/val")
-    return _acdc_split(acdc_root, split, attributes)
+    return _acdc_split(acdc_root, split, attributes, invalid)
 
 
 def split_by_sequence(
@@ -115,6 +120,7 @@ def list_pixel_accurate_images(
     archive_path: Path,
     attributes: tuple[str, ...],
     validation_scene: int,
+    invalid: set[str] | None = None,
 ) -> tuple[list[WeatherSample], list[WeatherSample]]:
     """Use filename metadata as multi-label targets and hold out one full scene."""
     pattern = re.compile(
@@ -126,6 +132,8 @@ def list_pixel_accurate_images(
     val_samples: list[WeatherSample] = []
     with ZipFile(archive_path) as archive:
         for member in archive.namelist():
+            if f"{archive_path.resolve()}::{member}" in (invalid or ()):
+                continue
             match = pattern.fullmatch(Path(member).name)
             if not match:
                 continue
@@ -183,7 +191,12 @@ class WeatherDataset(Dataset):
         self.samples = samples
         self.cfg = cfg
         self.targets = np.asarray([sample.labels for sample in samples], dtype=np.float32)
-        self.signature = _sample_signature(samples, cfg.image_size)
+        self.signature = hashlib.sha256(
+            (_sample_signature(samples, cfg.image_size)
+             + json.dumps(cfg.features, sort_keys=True)).encode()
+        ).hexdigest()
+        # Windows 下正在读取的 memmap 不能覆盖；不同数据／线索配置使用独立缓存文件。
+        cache_file = cache_file.with_name(f"{cache_file.stem}_{self.signature[:16]}.npy")
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cues_file = cache_file.with_name(cache_file.stem + "_cues.npy")
         manifest = cache_file.with_suffix(".json")
@@ -205,6 +218,7 @@ class WeatherDataset(Dataset):
             except (OSError, ValueError, json.JSONDecodeError):
                 reuse = False
         if not reuse:
+            logging.getLogger(__name__).info("构建天气缓存：%d 张 -> %s", len(samples), cache_file)
             if "cache" in locals():
                 del cache
             if "cached_cues" in locals():
@@ -236,6 +250,8 @@ class WeatherDataset(Dataset):
                         image_cache[index] = image
                         cues = visual_cues(image, cfg)
                         cue_cache[index] = [cues[name] for name in FEATURE_NAMES]
+                        if (index + 1) % 256 == 0:
+                            logging.getLogger(__name__).info("天气缓存进度：%d/%d", index + 1, len(samples))
                 image_cache.flush()
                 cue_cache.flush()
             finally:
@@ -261,12 +277,15 @@ class WeatherDataset(Dataset):
 
 
 def checkpoint_model_config(cfg: WeatherConfig) -> dict[str, Any]:
-    return {
+    result = {
         "attributes": list(cfg.attributes),
         "image_size": list(cfg.image_size),
         "channels": list(cfg.channels),
         "features": dict(cfg.features),
     }
+    if cfg.rain_adapter_channels:
+        result["rain_adapter_channels"] = cfg.rain_adapter_channels
+    return result
 
 
 def _save_checkpoint(payload: dict[str, Any], path: Path) -> None:
@@ -372,8 +391,10 @@ def train_weather(
         raise ValueError("学习率必须为正数，权重衰减和正样本权重上限必须为非负数")
 
     acdc_root = root / train_cfg["acdc_root"]
-    official_train = list_condition_images(acdc_root, "train", cfg.attributes)
-    official_val = list_condition_images(acdc_root, "val", cfg.attributes)
+    invalid = load_invalid_entries(root / train_cfg.get(
+        "acdc_cleaning_manifest", "data/processed/manifests/acdc.json"), root)
+    official_train = list_condition_images(acdc_root, "train", cfg.attributes, invalid)
+    official_val = list_condition_images(acdc_root, "val", cfg.attributes, invalid)
     if not official_train or not official_val:
         raise FileNotFoundError("ACDC 官方 train/val 图片不完整，无法训练或选优")
     acdc_train, acdc_val = split_by_sequence(
@@ -389,7 +410,9 @@ def train_weather(
         if not pixel_archive.is_file():
             raise FileNotFoundError(f"Pixel Accurate RGB 压缩包不存在：{pixel_archive}")
         pixel_train, pixel_val = list_pixel_accurate_images(
-            pixel_archive, cfg.attributes, validation_scene
+            pixel_archive, cfg.attributes, validation_scene,
+            load_invalid_entries(root / train_cfg.get("pixel_cleaning_manifest",
+                "data/processed/manifests/pixel_accurate_benchmark.json"), root),
         )
     train_samples = [*acdc_train, *pixel_train]
     val_samples = [*acdc_val, *pixel_val]

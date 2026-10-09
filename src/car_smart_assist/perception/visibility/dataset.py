@@ -1,20 +1,4 @@
-"""能见度门控的数据集。
-
-职责:
-    - 收集训练/评分用的图像路径（ACDC 正常天气参考图 / 恶劣天气图）
-    - 统一缩放到固定尺寸并归一化，供自编码器消费
-    - 用磁盘 npy 缓存规避「每个 epoch 重新解码 4006 张 1920×1080 PNG」的开销
-
-为什么需要磁盘缓存:
-    ACDC 原图 1920×1080，解码 + 缩放单张约 40~60ms。
-    4006 张一轮就是 3~4 分钟，训 50 轮要三个小时，而这些像素每轮完全一样。
-    首次读入后压成 uint8 存成 npy（约 710 MB），之后用 memmap 直接读，
-    单轮降到秒级。这不是过早优化，是没有它这个模型根本训不动。
-
-    缓存放在 data/processed/ 下，已被 .gitignore 覆盖。
-
-被谁调用: scripts/train_visibility.py, scorer.VisibilityScorer
-"""
+"能见度门控的数据集。"
 
 from __future__ import annotations
 

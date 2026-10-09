@@ -1,28 +1,4 @@
-"""统一数据清洗入口：ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。
-
-职责:
-    - 解析 configs/data/cleaning.yaml，调用 car_smart_assist.data.preprocessing.clean
-    - 把汇总结果打到控制台，明细写进 artifacts/reports/cleaning/
-    - 按严重度决定退出码，便于在流水线里判定是否该阻断
-    - 本身不含任何清洗逻辑（逻辑全在 preprocessing.py）
-
-用法:
-    python scripts/clean_data.py                          # 全量清洗
-    python scripts/clean_data.py --only acdc              # 只洗 ACDC
-    python scripts/clean_data.py --only kitti --workers 8
-    python scripts/clean_data.py --only acdc pixel_accurate_benchmark --corrupt-images-only
-    python scripts/clean_data.py --config configs/data/cleaning_lost_and_found.yaml
-
-产物（**不修改任何原始文件**）:
-    artifacts/reports/cleaning/report.json    完整明细（Lost & Found 专用配置写入其子目录）
-    artifacts/reports/cleaning/report.md      可读摘要
-    data/processed/manifests/{acdc,kitti,pixel_accurate_benchmark,lost_and_found}.json
-
-退出码:
-    0  无 ERROR
-    1  存在 ERROR（有样本须剔除）
-    2  执行失败
-"""
+"统一数据清洗入口：ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。"
 
 from __future__ import annotations
 

@@ -1,27 +1,4 @@
-"""能见度门控的消融实验驱动器。
-
-职责:
-    - 读 configs/model/visibility.yaml 的 ablations 段，逐个预设训练 + 评估
-    - 保证所有预设用**完全相同的划分**与**相同的评估口径**，否则结果不可比
-    - 产出对比表（json + markdown）到 artifacts/reports/visibility/
-
-为什么要写成驱动器而不是手动跑七次:
-    1. **划分必须一致**。手改配置容易连划分种子一起动，那结果就没法比了。
-    2. **checkpoint 目录必须隔离**。默认目录共用一个，第二次训练会捡起第一次的
-       权重续训 —— 那测的是「继续训练」而不是「换个结构重训」，结论完全错。
-    3. **参考图只解码一次**。4006 张 1080p 解码要一分多钟，七组就是七分钟白费。
-
-设计:
-    - 每组独立 checkpoint 目录，强制 resume='none'
-    - 结果落盘后**跳过已完成**的组，长任务可以中断重入
-    - 评估只算对比需要的关键指标，不复用 evaluate_visibility.py 的全量流程
-      （那个流程会跑完整的 4×4 合成退化扫描，七组太慢）
-
-用法:
-    python scripts/run_visibility_ablations.py                # 全部
-    python scripts/run_visibility_ablations.py --only baseline plain_encoder
-    python scripts/run_visibility_ablations.py --list         # 只列出预设
-"""
+"能见度门控的消融实验驱动器。"
 
 from __future__ import annotations
 
@@ -71,9 +48,9 @@ def load_refs(paths, size) -> list[np.ndarray]:
     return [read_rgb_image(path, size) for path in paths]
 
 
-# ---------------------------------------------------------------------------
+
 # 评估（对比用的精简指标）
-# ---------------------------------------------------------------------------
+
 
 
 def evaluate_run(
@@ -131,9 +108,9 @@ def evaluate_run(
     }
 
 
-# ---------------------------------------------------------------------------
+
 # 主流程
-# ---------------------------------------------------------------------------
+
 
 
 def main() -> int:

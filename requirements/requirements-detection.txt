@@ -1,4 +1,2 @@
-# 在项目 .venv 已装好基础依赖和 CUDA PyTorch 后安装；避免重装 torch：
-# .venv\Scripts\python.exe -m pip install --no-deps -r requirements/requirements-detection.txt
 ultralytics==8.3.162
 ultralytics-thop==2.0.14

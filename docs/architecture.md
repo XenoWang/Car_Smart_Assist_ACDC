@@ -1,164 +1,67 @@
-# 系统架构
+# 架构示意图
 
-## 1. 整体数据流
+## 当前推理链路
 
-天气与光照由独立 `perception/weather.py` 模型输出 `fog/rain/snow/night` 多标签，Stage 1 的重复天气头已禁用。
-非 BLIND 帧在 pipeline 中运行该模型，输出 `weather_warning`；主感知结果存在时，天气属性作为独立字段传入策略。
-天气单独不触发接管，fog/rain/snow 与 DEGRADED 能见度的组合可按配置作为辅助接管条件。
-
-当前常规目标检测使用独立 `perception/detection_yolo.py`，有配置权重时由 pipeline 自动加载；
-输出原八类交通目标和新增道路杂物候选的框、置信度及类别覆盖范围。多任务测距／方向等仍未实现。
-当前采用同一 YOLO 模型联合训练，两来源的监督类别及 Lost & Found 忽略区域分别处理；
-基于可行驶区域／自车路径的完整障碍关系判断仍待实现。
-设计与数据需求见 `road_obstacle_detection.md`；以下多任务结构表示后续目标架构。
-
-```
-                     ┌──────────────────────────────────────────┐
-   单帧图像  ────────► │  ⓪ 能见度门控（perception/visibility/）    │
-   (ACDC 恶劣天气)     │    降采样到 144×256 后判定                 │
-                     │    VISIBLE / DEGRADED / BLIND             │
-                     └──────────────┬───────────────────────────┘
-                                    │
-                        ┌───────────┴────────────┐
-                     BLIND                 DEGRADED / VISIBLE
-                        │                        │
-                        │                        ▼
-                        │        ┌──────────────────────────────────────────┐
-                        │        │  Stage 1  多任务感知（perception/）        │
-                        │        │    用**原始分辨率**（非降采样图）           │
-                        │        │                                          │
-                     │  共享骨干 SegFormer-MiT                   │
-                     │      ├── 分割头      → 可行驶区域/场景结构  │
-                     │      ├── 接管边界头  → 0 / 1 / 2 分级      │
-                     │      └── 检测+距离头 → 前车/来车 + 距离(m)  │
-                     └──────────────────┬───────────────────────┘
-                                        │
-                                        ▼
-                              PerceptionResult（结构化契约）
-                              advisory/schema.py
-                                        │
-                     ┌──────────────────┴───────────────────────┐
-                     │                                          │
-                     ▼                                          ▼
-        ┌────────────────────────┐              ┌──────────────────────────┐
-        │ 规则策略（决策）          │              │ 提示词渲染                │
-        │ advisory/policy/       │              │ advisory/prompt/         │
-        │  ├ handover_rules.py   │              │                          │
-        │  └ risk.py             │              │                          │
-        │                        │              │                          │
-        │ 输出：要不要接管          │              │ 输出：给模型的结构化上下文  │
-        │      风险等级            │              └────────────┬─────────────┘
-        │      触发原因（可追溯）    │                           │
-        └───────────┬────────────┘                           ▼
-                    │                          ┌──────────────────────────┐
-                    │                          │ Stage 2 语言生成          │
-                    │                          │ advisory/llm/            │
-                    │                          │  4-bit QLoRA VLM         │
-                    │                          └────────────┬─────────────┘
-                    │                                       │
-                    └───────────────┬───────────────────────┘
-                                    ▼
-                        ┌───────────────────────────┐
-                        │ 一致性校验与后处理           │
-                        │ advisory/generator.py     │
-                        │  · 结论冲突时以规则为准       │
-                        │  · 禁词/长度/要素校验         │
-                        │  · 失败降级到模板文案         │
-                        └───────────────┬───────────┘
-                                        ▼
-                              AdvisoryResult
-                        给司机的最终提示文本 + 证据链
+```mermaid
+flowchart TD
+    Image[单帧图片] --> RGB[读取并转换为 RGB]
+    RGB --> Gate[能见度评分与门控]
+    Gate --> Level{门控结果}
+    Level -->|BLIND| Blind[阻断天气与目标感知]
+    Blind --> Direct[直接生成接管提示]
+    Level -->|VISIBLE / DEGRADED| Weather[当前默认四属性天气模型]
+    Level -->|VISIBLE / DEGRADED| YOLO[联合 YOLO：八类交通目标＋道路杂物候选]
+    Weather --> Warning[独立天气提醒 weather_warning]
+    Weather -->|属性与概率| Perception[PerceptionResult]
+    YOLO -->|原图框、类别、置信度、分支可用状态| Perception
+    Gate -->|能见度与置信度倍率| Perception
+    Perception --> Risk[风险评估与判断可靠性]
+    Perception -->|结构化接管证据| Handover
+    Risk --> Handover[接管请求规则]
+    Handover --> Template[模板提示与证据]
+    Template --> Result[PipelineResult / AdvisoryResult]
+    Direct --> Result
+    Warning --> Result
+    Gate -.->|评分运行故障| Fallback[不可用状态与兜底提示]
+    YOLO -.->|检测运行故障| Fallback
+    Fallback --> Result
 ```
 
-## 2. 三个关键设计决策
+当前天气属性用于独立提醒及恶劣天气＋DEGRADED 的辅助接管；目标天气倍率仍读取旧字段。
+YOLO 当前没有距离与方向预测。学习式接管分类头、分割和 LLM 尚未接入。
 
-### 2.1 决策与表达分离
+## 天气增强训练
 
-**安全决策由规则引擎做，语言模型只负责表达。**
-
-理由：生成模型对同一输入可能给出不一致的结论。措辞有波动可以接受，
-但「今天说接管、明天说不用」在驾驶场景是不可接受的。
-规则引擎是确定性的、可单测的、可审计的，它的输出构成安全底线。
-
-语言模型的角色是把这个结论说得自然、简洁、贴合当前场景，
-以及描述规则没覆盖到的细节（比如「前方是施工路段」这类视觉信息）。
-当两者结论冲突时，**以规则的保守结论为准**。
-
-### 2.2 两个 Stage 之间只有一份契约
-
-`advisory/schema.py` 中的 `PerceptionResult` 是唯一的耦合点。
-
-好处：
-- Stage 1 可以独立替换模型架构而不影响 Stage 2
-- Stage 2 可以用模板实现（baseline）也可以用 VLM，接口不变
-- 每条最终建议都能追溯到具体的结构化证据 —— 这是可解释性的落点
-
-代价：新增感知输出需要同时改两侧。这是有意的约束，防止接口随意膨胀。
-
-### 2.3 单帧推理，不引入时序
-
-当前设计是单帧的。这意味着：
-
-- ✅ 实现简单，延迟可控，易于调试
-- ❌ 无法利用时序信息（目标运动趋势、相对速度）
-
-**相对速度的缺失是一个真实的能力边界**：仅有单帧距离无法判断前车是在接近还是远离，
-因此策略层只能使用距离的绝对值和保守的先验，而不能计算 TTC（碰撞时间）。
-
-后续若引入时序，最自然的做法是在 `engine/` 加一个轻量的帧间状态缓存，
-把距离序列提供给 `advisory/policy/risk.py`，接口不变。这已在 `docs/roadmap.md` 中列为 v1.1 候选。
-
-## 3. 分层与依赖方向
-
-```
-        cli / scripts          ← 最外层：只做装配与参数解析
-              │
-              ▼
-        inference / evaluation  ← 编排：串流程、算指标
-              │
-              ▼
-        perception / advisory   ← 业务：模型、策略、提示
-              │
-              ▼
-        data / engine           ← 基础设施：数据管道、训练循环
-              │
-              ▼
-        config / utils          ← 最底层：无业务依赖
+```mermaid
+flowchart TD
+    Raw[已有 ACDC / Pixel Accurate] --> Clean[集中损坏清单过滤]
+    Clean --> Split[录制组／场景划分，固定种子]
+    Split --> Train[train：更新雨分支]
+    Split --> Val[validation：分来源选 best]
+    Split --> Calibration[calibration：独立保留]
+    Original[增强前原四属性天气权重] --> Reference[冻结原模型，提供蒸馏参照]
+    Original --> Frozen[冻结原骨干、BN 与四属性输出头]
+    Train --> Sampling[来源均衡／雨样本／漏检雨样本采样]
+    Sampling --> Augment[光度增强与视觉线索同步重算]
+    Augment --> Frozen
+    Sampling --> OriginalInput[原图与原视觉线索]
+    OriginalInput --> Reference
+    Frozen --> Residual[可训练雨天残差分支]
+    Frozen --> BaseOutput[原四属性 logits]
+    BaseOutput --> Combined[原 rain logit＋残差，其余属性保持原输出]
+    Residual --> Combined
+    Reference --> Loss[监督损失＋可靠原输出蒸馏]
+    Combined --> Loss
+    Loss --> Update[仅更新雨天残差参数]
+    Update --> Val
+    Val --> Guard{原能力保持条件通过？}
+    Guard -->|通过且雨 F1 提升| Best[增强候选 best.pt]
+    Guard -->|未通过| Retain[保留此前 best]
+    Update --> Last[last.pt：权重、优化器、随机状态与签名]
+    Best --> Verify[用户验证与误判复核]
+    Verify -.->|验证后决定切换| Default[默认天气配置]
+    Original --> Default
 ```
 
-**依赖只能向下，不能向上，也不能同层横向乱连。**
-具体约束：
-
-- `utils/` 不导入任何业务模块
-- `data/` 不导入 `perception/` 或 `advisory/`
-- `perception/` 与 `advisory/` 之间不直接互相导入，只通过 `advisory/schema.py` 的契约通信
-- `engine/` 不感知具体模型结构，只依赖 forward 返回的 dict 与配置里的 loss 权重
-
-之所以把这些写下来，是因为这类项目最容易在「快速加个功能」的过程中
-把分层破坏掉，几个月后变成一团 ImportError 循环。
-
-## 4. 目录职责速查
-
-| 目录 | 职责 | 不该放什么 |
-|------|------|------------|
-| `configs/` | 所有可调参数的单一来源 | 任何代码 |
-| `data/` | 数据集与产物（不进版本库） | 代码 |
-| `docs/` | 设计文档、口径定义、ADR | 代码 |
-| `scripts/` | 面向人的薄入口脚本 | 业务逻辑（应在 src 里） |
-| `src/car_smart_assist/` | 全部业务逻辑 | 一次性实验代码 |
-| `tests/` | 单元与集成测试 | 测试数据（放 fixtures） |
-| `notebooks/` | 探索性分析 | 最终结论（应固化成脚本） |
-| `artifacts/` | 训练产物：权重、日志、报告（不进版本库） | 代码 |
-
-## 5. 硬件约束及其影响
-
-| 约束 | 值 | 对设计的影响 |
-|------|-----|-------------|
-| GPU | RTX 5070, **12 GB** | 骨干网选 MiT-B1 而非 B4+；Stage 2 必须 4-bit 量化 |
-| 计算能力 | sm_120 (Blackwell) | torch ≥ 2.8 才原生支持；低版本会退回 PTX JIT，极慢 |
-| CUDA | 12.9 | 与 nvcc 版本一致 |
-| 训练 batch | 4（1024×512） | 靠梯度累积凑等效批量 |
-| Stage 2 batch | 1 | 靠梯度累积 16 步 |
-
-**所有显存相关的取舍都应记录在这里**，因为它们直接解释了「为什么模型选得这么小」
-—— 这类问题在面试中出现频率很高。
+原模型权重保留；增强候选独立保存，当前默认 pipeline 仍使用原模型。
+训练策略、结果与雨天效果分析集中在本地开发文档。

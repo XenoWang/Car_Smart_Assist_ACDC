@@ -1,22 +1,4 @@
-"""能见度门控的无监督训练入口。
-
-职责:
-    - 解析 configs/model/visibility.yaml，调用 VisibilityTrainer 训练自编码器
-    - 打印训练记录与零校准统计，供阈值标定时参考
-    - 本身不含训练逻辑（全在 perception/visibility/trainer.py）
-
-用法:
-    python scripts/train_visibility.py
-    python scripts/train_visibility.py --config configs/model/visibility.yaml --epochs 10
-
-产物:
-    artifacts/checkpoints/visibility/best.pt   权重 + 模型配置 + 零校准统计
-    data/processed/visibility/*.npy            图像缓存（首次运行生成）
-
-关于「无监督」:
-    损失是自重建 ||x - AE(x)||²，输入即目标，没有任何人工标注参与。
-    参考图之所以能充当「正常」的定义，是数据集构造决定的属性，不是我们标的。
-"""
+"能见度门控的无监督训练入口。"
 
 from __future__ import annotations
 

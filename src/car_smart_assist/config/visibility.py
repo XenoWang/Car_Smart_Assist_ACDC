@@ -1,8 +1,4 @@
-"""能见度模块的兼容默认值，供库接口与不完整配置共用。
-
-项目运行参数统一在 configs/model/visibility.yaml 修改；这里保留既有库接口的
-默认行为（例如 base_channels=32），YAML 中的实验配置优先。调用方应复制字典后修改。
-"""
+"能见度模块的兼容默认值，供库接口与不完整配置共用。"
 
 from copy import deepcopy
 

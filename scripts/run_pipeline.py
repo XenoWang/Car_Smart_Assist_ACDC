@@ -1,20 +1,4 @@
-"""端到端管线演示：图像 -> 能见度门控 -> 司机提示。
-
-职责:
-    - 按配置构建 InferencePipeline，在样例图上跑一遍并打印结果
-    - 输出各阶段耗时与跳过原因，便于确认链路状态
-    - 本身不含任何管线逻辑（全在 inference/pipeline.py）
-
-用法:
-    python scripts/run_pipeline.py                       # 每个天气子集抽一张
-    python scripts/run_pipeline.py --image path/to.png   # 指定单张
-    python scripts/run_pipeline.py --synthetic           # 额外跑合成退化对照
-    python scripts/run_pipeline.py --json                # 输出 json
-
-当前实现状态:
-    门控、天气与 YOLO 常规检测按现有权重加载；测距、方向及道路障碍分支待实现。
-    输出 `skipped` 记录被跳过的阶段。BLIND 帧直接请求接管。
-"""
+"端到端管线演示：图像 -> 能见度门控 -> 司机提示。"
 
 from __future__ import annotations
 

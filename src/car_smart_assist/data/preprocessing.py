@@ -1,51 +1,4 @@
-"""数据清洗：集中检查 ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。
-
-职责:
-    - 图像完整性：能否解码、是否截断、尺寸是否异常、是否退化（纯色/极低方差）
-    - ACDC 配对：每张图与它的 5 个标注变体是否配套；掩码是否有效（非全 ignore、类别在范围内）
-    - 检测标注：bbox 是否越界/零面积、是否引用了不存在的图像、是否有孤儿标注
-    - KITTI 三元组：image / label / calib 是否齐全，每帧内参是否可解析
-    - Pixel Accurate Benchmark：直接检查子 ZIP 中图片能否完整解码
-    - Lost & Found：只检查 RGB 与 PNG 标注是否损坏，其他文件和内容全部保留
-    - 重复检测：精确重复（内容哈希）与近重复（dHash 汉明距离）
-    - 统计离群（可选）：抓「能正常解码但统计特征异常」的图，这是完整性检查抓不到的
-    - 产出清洗报告与「有效样本清单」，供数据集类过滤
-
-设计原则（重要，改这个文件前先读）:
-    1. **绝不修改原始数据。**
-       清洗的产物是清单与报告，不是被删掉的文件。原始数据保持只读。
-       理由：raw 层是不可再生资产 —— ACDC 是审批制获取的，误删的代价
-       不是「重新下载一次」能弥补的。对训练而言，按清单过滤与物理删除等价。
-    2. **只有「数据不可用」才排除；「图像不寻常」一律不排除。**（最重要的一条）
-       ERROR   （→ 进 invalid 清单，被数据集类过滤）
-           · 图像无法解码 / 截断
-           · 必需的配套文件缺失（ACDC 掩码、KITTI 的 calib）
-           · 结构不一致（掩码尺寸 ≠ 图像尺寸、类别 ID 越界、标注引用不存在的图像）
-           判据是「这条数据**无法**用于训练」。
-       WARNING （→ 进 suspect 清单，仍然参与训练，仅提示复核）
-           · 灰度方差偏低、尺寸偏小、宽高比异常、疑似重复、统计离群、bbox 过小
-           判据是「这张图**看起来**不寻常」，决定权必须留给人。
-       INFO    记录备查，不影响使用（如 KITTI 尺寸天然不统一）
-
-       ⚠️ 这条区分的必要性：ACDC 的核心内容就是大雾、夜路、暴雨、雪天。
-       浓雾画面接近均匀灰白、夜路画面整体偏暗，都会压低灰度方差 ——
-       如果按方差阈值自动排除，会**系统性删掉最该被学会的那部分数据**，
-       而且报告上只会显示「排除 N 张退化图」，看起来像个正常结论，没人会察觉。
-       实测全量 23011 张图：ACDC 最低灰度方差 12.96、KITTI 46.61，
-       与默认阈值 2.0 相距甚远 —— 但这是这两份数据碰巧没有「糊成一片」的帧，
-       换数据集/加自采数据后不成立。所以默认按 WARNING 处理，不赌运气。
-
-       内容类检查的严重度可在 cleaning.yaml 的 image_statistics.severity 里改，
-       但改之前请先看报告里的实际分布并人工抽查 —— 不要直接调阈值硬排除。
-    3. 阈值一律从 configs/data/cleaning.yaml 读，代码里不出现魔数。
-    4. 报告里必须同时写明「检查了什么」和「跳过了什么」，
-       避免「跑过了 = 数据干净」的错觉。跳过的项要给出跳过原因。
-
-依赖: Pillow, numpy（均为已有依赖）。统计离群项额外需要 scikit-learn。
-      RLE 解码校验需要 pycocotools —— 未安装时该项自动跳过并记 INFO，不报错。
-
-被谁调用: scripts/prepare_acdc.py, car_smart_assist.cli.main
-"""
+"数据清洗：集中检查 ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。"
 
 from __future__ import annotations
 
@@ -82,6 +35,23 @@ ACDC_MASK_SUFFIXES: tuple[str, ...] = (
 ACDC_ANNOTATED_SPLITS: frozenset[str] = frozenset({"train", "val"})
 
 
+def load_invalid_entries(manifest_path: str | Path, project_root: str | Path) -> set[str]:
+    """读取集中清洗的损坏清单；可疑图片保留，ZIP 成员沿用 archive::member 标识。"""
+    path = Path(manifest_path)
+    if not path.is_file():
+        return set()
+    root = Path(project_root)
+    entries = json.loads(path.read_text(encoding="utf-8"))["invalid"]
+    invalid = set()
+    for entry in entries:
+        source, separator, member = entry.partition("::")
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            source_path = root / source_path
+        invalid.add(str(source_path.resolve()) + ("::" + member if separator else ""))
+    return invalid
+
+
 class Severity(str, Enum):
     """问题严重度。决定该项是否影响样本可用性。"""
 
@@ -111,9 +81,9 @@ def _severity(cfg: dict[str, Any], key: str, default: Severity) -> Severity:
     return _SEVERITY_BY_NAME.get(str(cfg.get(key, default.value)).lower(), default)
 
 
-# =============================================================================
+
 # 报告容器
-# =============================================================================
+
 
 
 @dataclass(frozen=True)
@@ -269,9 +239,9 @@ class CleaningReport:
         return out / "report.json"
 
 
-# =============================================================================
+
 # 图像探测（多进程 worker，必须是模块级函数以便 pickle）
-# =============================================================================
+
 
 
 def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
@@ -488,9 +458,9 @@ def check_zip_image_integrity(
     return checked_paths
 
 
-# =============================================================================
+
 # 尺寸与退化检查
-# =============================================================================
+
 
 
 def _check_dimensions_and_degeneracy(
@@ -583,9 +553,9 @@ def _check_dimensions_and_degeneracy(
         )
 
 
-# =============================================================================
+
 # ACDC 检查
-# =============================================================================
+
 
 
 def _acdc_mask_path(image_path: Path, acdc_root: Path, suffix: str) -> Path:
@@ -842,9 +812,9 @@ def _check_detection_jsons(
     report.mark_checked("detection.files", len(jsons))
 
 
-# =============================================================================
+
 # KITTI 检查
-# =============================================================================
+
 
 
 def check_kitti(
@@ -962,9 +932,9 @@ def check_kitti(
             )
 
 
-# =============================================================================
+
 # 重复检测
-# =============================================================================
+
 
 
 def _file_digest(path: Path, nbytes: int) -> str:
@@ -1049,9 +1019,9 @@ def check_duplicates(
         )
 
 
-# =============================================================================
+
 # 统计离群（可选）
-# =============================================================================
+
 
 
 def check_statistical_outliers(
@@ -1108,9 +1078,9 @@ def check_statistical_outliers(
     report.stats[f"{label}_statistical_outliers"] = n_out
 
 
-# =============================================================================
+
 # 顶层入口
-# =============================================================================
+
 
 
 def _write_manifest(

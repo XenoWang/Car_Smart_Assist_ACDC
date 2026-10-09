@@ -1,4 +1,3 @@
-# 使用同一个 preprocessing.py；仅以结构验证和完整解码剔除损坏图片。
 cleaning:
   datasets: [lost_and_found]
   lost_and_found:
