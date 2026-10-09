@@ -186,6 +186,7 @@ def main() -> int:
             "training_mode": plan["mode"],
             "source_checkpoint": str(plan["checkpoint"]),
             "epochs_before_run": plan["epochs_before_run"],
+            "joint_foreground_exclusive": cfg.get("joint_foreground_exclusive", True),
         }
         run.mkdir(parents=True, exist_ok=True)
         model = load_yolo_model(root, plan["checkpoint"])
@@ -206,6 +207,13 @@ def main() -> int:
         print(
             f"YOLO training mode: {plan['mode']}; source: {plan['checkpoint']}; target epochs: {train['epochs']}"
         )
+        trainer_class = detection_trainer_for_resume(plan["resume_state"])
+        if manifest.get("joint_supervision"):
+            from car_smart_assist.perception.joint_yolo_backend import joint_trainer
+
+            trainer_class = joint_trainer(
+                plan["resume_state"], cfg.get("joint_foreground_exclusive", True)
+            )
         results = model.train(
             data=str(data),
             project=str(project),
@@ -213,7 +221,7 @@ def main() -> int:
             device=resolve_yolo_device(cfg["device"]),
             exist_ok=True,
             resume=plan["mode"] == "resume",
-            trainer=detection_trainer_for_resume(plan["resume_state"]),
+            trainer=trainer_class,
             **train,
         )
         summary = {

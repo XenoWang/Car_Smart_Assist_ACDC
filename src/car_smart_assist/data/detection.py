@@ -340,6 +340,22 @@ def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict
             raise ValueError(f"Label contents no longer match converted annotations: {label_path}")
         if verify_hashes and hashlib.sha256(image_path.read_bytes()).hexdigest() != row["sha256"]:
             raise ValueError(f"Exported image content changed: {image_path}")
+        if manifest.get("joint_supervision"):
+            known = manifest["known_class_count"]
+            expected = list(range(known)) if row["dataset"] == "acdc" else [known]
+            if row["supervised_classes"] != expected:
+                raise ValueError("Joint annotation coverage changed")
+            if any(int(box[0]) not in expected for box in row["boxes"]):
+                raise ValueError("Joint labels contain an unsupported class for this source")
+            if row.get("roi_mask"):
+                roi = Path(row["roi_mask"])
+                if not roi.is_file():
+                    raise FileNotFoundError(f"Missing obstacle ROI: {roi}")
+                if (
+                    verify_hashes
+                    and hashlib.sha256(roi.read_bytes()).hexdigest() != row["roi_sha256"]
+                ):
+                    raise ValueError("Joint ROI contents changed")
         expected_lists[split].append("./" + row["image"])
         counts[split] += 1
     for split, expected in expected_lists.items():

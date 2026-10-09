@@ -20,6 +20,9 @@ def load_yolo_config(path: Path) -> dict[str, Any]:
         raise ValueError("YOLO epochs/imgsz/batch must be positive")
     if not isinstance(train["deterministic"], bool):
         raise ValueError("YOLO deterministic must be boolean")
+    for name in ("enabled_for_inference", "joint_foreground_exclusive", "evaluation_matches_prediction"):
+        if name in cfg and not isinstance(cfg[name], bool):
+            raise ValueError(f"YOLO {name} must be boolean")
     extra = train.get("resume_extra_epochs")
     if extra is not None and (type(extra) is not int or extra <= 0):
         raise ValueError("YOLO resume_extra_epochs must be null or a positive integer")

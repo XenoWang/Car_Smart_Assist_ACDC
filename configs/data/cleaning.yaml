@@ -19,6 +19,8 @@ cleaning:
   # --- 外部数据集路径 ---
   pixel_accurate_benchmark:
     root: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark
+  lost_and_found:
+    root: data/external/lost_and_found
 
   # --- 检查开关：按需关闭，便于分步排查 ---
   checks:

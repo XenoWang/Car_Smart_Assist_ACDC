@@ -8,11 +8,11 @@
 
 当前可运行的推理链路是：能见度门控 → 天气多属性识别与 YOLO 常规目标检测 → 规则与模板建议。
 模型按配置中的现有权重加载；检测未运行和成功运行但未检出目标分别记录。
-常规检测仅覆盖八个已知类别，空框不能排除掉落货物等未知障碍。
+当前检测覆盖八类交通目标与新增道路杂物候选；空框仍不能排除所有未知障碍。
 
 > **实现状态：部分功能可运行，完整两阶段系统仍在开发中。**
 > 能见度门控、独立天气模型、YOLO 框检测、风险/接管规则和模板提示已实现；
-> 距离、方向、道路分割、通用道路障碍物及 LLM/VLM 生成后端尚未实现。下面的架构图表示目标设计，
+> 距离、方向、道路分割、基于行驶路径的完整异常障碍判断及 LLM/VLM 后端尚未实现。下面的架构图表示目标设计，
 > 不代表当前所有模块都已运行。详细状态见 [`TECH_STACK.md`](TECH_STACK.md)；
 > 开发计划见 [`docs/roadmap.md`](docs/roadmap.md)。
 
@@ -166,6 +166,24 @@ unzip -q 'data/raw/distance/data_object_*.zip' -d data/external/kitti
 > 只有距离这一项是 ACDC 没有的。不要下 `data_object_velodyne.zip`（27.4 GB），
 > 距离可直接从 `label_2` 的 3D 位置取，用不上点云。
 
+**道路障碍数据 Lost & Found（已获取，2026-10-08）：**
+匿名下载入口：[埃斯林根大学公开镜像](https://huggingface.co/datasets/iis-esslingen/LostAndFoundDataset)。
+数据位于 `data/external/lost_and_found/`，保留 `leftImg8bit.zip`、`gtCoarse.zip`、
+标签说明及官方 `leftImg8bit/{train,test}`、`gtCoarse/{train,test}` 目录。
+实际有 2,239 组图像／标签（train 1,036、test 1,203），压缩包 SHA256、ZIP CRC 和所有 PNG
+完整性检查通过。获取记录为 `download_manifest.json`；道路杂物候选已通过联合 YOLO 训练接入 pipeline。
+
+Lost & Found 日常清洗统一使用已有入口，逻辑全部位于 `data/preprocessing.py`：
+
+```powershell
+.venv\Scripts\python.exe scripts\clean_data.py --config configs/data/cleaning_lost_and_found.yaml
+```
+
+该配置只完整解码 RGB 和 PNG 标注，损坏文件进入 `data/processed/manifests/lost_and_found.json`
+的 `invalid` 列表；`retained` 列出保留图片，其他文件单独列为原样保留。
+不按亮度、清晰度、尺寸、重复、标签内容或配对情况剔除文件；权限等未完成读取记录待复核。
+原始文件和压缩包不删除、不改写。报告位于 `artifacts/reports/cleaning/lost_and_found/`。
+
 **预处理：**
 
 ```bash
@@ -227,13 +245,15 @@ Pixel Accurate 训练使用 scene 1–3，scene 4 整组留作验证，避免同
 
 #### YOLO 检测：数据准备、训练与四分评估
 
-检测参数在 `configs/model/yolo_detection.yaml`，数据参数在 `configs/data/acdc_detection.yaml`。
+当前联合检测参数在 `configs/model/yolo_detection.yaml`，联合数据参数在
+`configs/data/acdc_lost_and_found_detection.yaml`；原 ACDC 配置保留于 `configs/model/yolo_acdc_baseline.yaml`。
 YOLO11n 使用 PyTorch 后端，`device: auto` 优先使用可用 CUDA。
 
 ```powershell
 # 保留当前 CUDA PyTorch，在项目 .venv 添加检测依赖
 .venv\Scripts\python.exe -m pip install --no-deps -r requirements\requirements-detection.txt
 .venv\Scripts\python.exe scripts\prepare_detection.py
+.venv\Scripts\python.exe scripts\prepare_detection.py --config configs/data/acdc_lost_and_found_detection.yaml
 .venv\Scripts\python.exe scripts\prepare_detection.py --verify-only --verify-hashes
 .venv\Scripts\python.exe scripts\train_detection.py
 # 默认检测已有模型并续训；显式重新开始与另外两个模型统一为 --fresh
@@ -277,6 +297,23 @@ calibration 雪天仅 3 张；少量天气子集指标不能代表可靠泛化�
 重新开始或进入下一轮前，旧权重与训练记录保存在运行目录 `history/round_XXXX/`。
 权重更新后应重新运行校准与测试，pipeline 不会误用与新权重不匹配的旧校准阈值。
 
+**联合道路杂物检测（2026-10-08）：**
+原八类 ID 保持 0–7，新增 `road_obstacle=8`，含义是标注杂物候选。
+从原 ACDC 权重扩展时复制原八类分类输出行；联合回放 ACDC 与 Lost & Found，训练 20 轮后微调 8 轮。
+联合 train/val/calibration/test 为 1,914/289/313/1,394；ACDC 原四分保持不变，
+Lost & Found 官方 train 按地点分为 861/88/87，官方 test 1,203 张完整留出。
+
+未标注类别／区域不提供背景负样本，正样本类别按互斥监督；真值 ROI 只用于训练和定义评估范围，
+推理不读取真值。为保持 ROI 对齐，空间混合增强暂关闭，保留颜色／轻度模糊增强。
+验证采用与实际推理一致的单类别 NMS，按来源等权选 best；校准集确定分类阈值。
+
+最终测试：Lost & Found 已标注 ROI 的 mAP50/mAP50–95 为 **71.48%/41.43%**，
+杂物 Precision/Recall/F1 为 **82.32%/59.57%/69.12%**。原八类 ACDC mAP50/mAP50–95 为
+**26.91%/14.78%**，低于同口径旧基线 **33.02%/16.94%**；当前存在旧任务退化，不能宣称整体精度提升。
+框图也出现车头误报、极小杂物漏检，尚未验证所有未知类型与恶劣天气中的杂物泛化。
+详细报告见 `artifacts/reports/detection/yolo11n_acdc_laf_v2/summary.md`。
+默认推理加载联合模型；设 `enabled_for_inference: false` 可使用保留的旧八类配置回退。
+
 #### 测试和当前推理链路
 
 ```powershell
@@ -289,8 +326,8 @@ calibration 雪天仅 3 张；少量天气子集指标不能代表可靠泛化�
 
 推理演示自动加载已配置的 YOLO best 权重及匹配的校准阈值。
 检测返回原图坐标框、类别与置信度；距离为 `None`，方向为 `unknown`，不会编造测距结果。
-`object_detection_classes` 明确类别覆盖范围，`road_obstacle_detection_available=false`
-与 `skipped.road_obstacle_detection` 明确通用道路障碍分支未运行。
+`object_detection_classes` 明确类别覆盖范围；成功运行联合检测时
+`road_obstacle_detection_available=true` 表示已运行杂物候选检测，不能理解为覆盖全部异常障碍。
 
 #### 尚不能运行的完整训练
 

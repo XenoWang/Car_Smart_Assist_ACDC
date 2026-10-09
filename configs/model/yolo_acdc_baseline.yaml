@@ -1,0 +1,34 @@
+yolo_detection:
+  model: artifacts/checkpoints/yolo_pretrained/yolo11n.pt
+  data: data/processed/acdc_detection_yolo/data.yaml
+  project: artifacts/runs/detection
+  name: yolo11n_acdc
+  device: auto
+  checkpoint: artifacts/runs/detection/yolo11n_acdc/weights/best.pt
+  calibration_file: artifacts/reports/detection/yolo11n_acdc/calibration.json
+  inference:
+    imgsz: 960
+    confidence: 0.25
+    iou: 0.5
+    max_det: 100
+  train:
+    epochs: 30
+    resume_extra_epochs: null
+    patience: 8
+    seed: 42
+    deterministic: true
+    imgsz: 640
+    batch: 8
+    workers: 2
+    amp: true
+    cache: false
+    optimizer: AdamW
+    lr0: 0.001
+    warmup_bias_lr: 0.0
+    warmup_epochs: 3.0
+    weight_decay: 0.0005
+    mosaic: 0.5
+    close_mosaic: 5
+    mixup: 0.0
+    plots: true
+  evaluation_matches_prediction: true

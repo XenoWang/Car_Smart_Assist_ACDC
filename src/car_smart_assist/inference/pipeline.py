@@ -22,7 +22,7 @@
       │            ▼
       │     ┌─────────────────────┐
       │     │ ② YOLO 常规目标检测  │  ← 用**原始分辨率**
-      │     │   测距/障碍物待实现  │
+      │     │   杂物框/测距待完善  │
       │     └──────┬──────────────┘
       │            ▼
       │     ┌─────────────────────┐
@@ -43,7 +43,7 @@
 
 当前实现状态:
     ① 已实现且已验证（召回/误报/单调性见 artifacts/reports/visibility/）
-    ② 天气和 YOLO 常规目标检测已接入；测距、方向、道路障碍分支未实现
+    ② 天气和 YOLO 交通目标／杂物候选已接入；测距、方向、道路／路径关系未实现
     ③ 已实现 —— 门控接管与结构化感知规则路径可用（advisory/generator）
 
     已训练的检测权重按配置自动加载；输出明确记录未实现的道路障碍能力。
@@ -233,12 +233,16 @@ class InferencePipeline:
         elif weather_checkpoint is not None:
             raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
 
-        detection_config_path = root / "configs/model/yolo_detection.yaml"
-        if predictor is None and detection_config_path.is_file():
+        detection_paths = (root / "configs/model/yolo_detection.yaml", root / "configs/model/yolo_acdc_baseline.yaml")
+        for detection_config_path in detection_paths:
+            if predictor is not None or not detection_config_path.is_file():
+                continue
             from car_smart_assist.config.detection import load_yolo_config
             from car_smart_assist.perception.detection_yolo import YoloDetectionPredictor
 
             detection_cfg = load_yolo_config(detection_config_path)
+            if not detection_cfg.get("enabled_for_inference", True):
+                continue
             detection_checkpoint = root / detection_cfg["checkpoint"]
             if detection_checkpoint.is_file():
                 predictor = YoloDetectionPredictor.from_config(detection_cfg, root)

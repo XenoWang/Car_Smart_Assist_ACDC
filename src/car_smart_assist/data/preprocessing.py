@@ -1,4 +1,4 @@
-"""数据清洗：对 ACDC、KITTI 与 Pixel Accurate Benchmark 做完整性检查。
+"""数据清洗：集中检查 ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。
 
 职责:
     - 图像完整性：能否解码、是否截断、尺寸是否异常、是否退化（纯色/极低方差）
@@ -6,6 +6,7 @@
     - 检测标注：bbox 是否越界/零面积、是否引用了不存在的图像、是否有孤儿标注
     - KITTI 三元组：image / label / calib 是否齐全，每帧内参是否可解析
     - Pixel Accurate Benchmark：直接检查子 ZIP 中图片能否完整解码
+    - Lost & Found：只检查 RGB 与 PNG 标注是否损坏，其他文件和内容全部保留
     - 重复检测：精确重复（内容哈希）与近重复（dHash 汉明距离）
     - 统计离群（可选）：抓「能正常解码但统计特征异常」的图，这是完整性检查抓不到的
     - 产出清洗报告与「有效样本清单」，供数据集类过滤
@@ -371,6 +372,7 @@ def _run_probes(
     want_stats: bool,
     downsample: int,
     num_workers: int,
+    corruption_only: bool = False,
 ) -> list[dict[str, Any]]:
     """并行探测一批图像，把完整性/尺寸/退化问题直接记入 report。
 
@@ -392,8 +394,53 @@ def _run_probes(
 
     for r in results:
         if not r["ok"]:
-            report.error(check, r["path"], f"无法解码: {r['error']}")
+            error_type = str(r["error"]).split(":", 1)[0]
+            if corruption_only and error_type in {
+                "PermissionError", "FileNotFoundError", "IsADirectoryError",
+                "MemoryError", "DecompressionBombError",
+            }:
+                report.warn(check, r["path"], f"读取未完成，不能确认文件损坏，保留待复核: {r['error']}")
+            else:
+                report.error(check, r["path"], f"无法解码: {r['error']}")
     return results
+
+
+def check_lost_and_found(
+    dataset_root: Path, report: CleaningReport, *, num_workers: int
+) -> list[Path]:
+    """Only exclude structurally corrupt/undecodable PNGs; preserve every source file."""
+    if not dataset_root.is_dir():
+        report.mark_skipped("lost_and_found", f"路径不存在: {dataset_root}")
+        return []
+    paths = sorted(
+        list((dataset_root / "leftImg8bit").rglob("*.png"))
+        + list((dataset_root / "gtCoarse").rglob("*.png"))
+    )
+    if not paths:
+        report.mark_skipped("lost_and_found", "未找到已解压的 leftImg8bit/gtCoarse PNG")
+        return []
+    results = _run_probes(
+        paths, report, check="lost_and_found/image_integrity", force_load=True,
+        want_stats=False, downsample=1, num_workers=num_workers, corruption_only=True,
+    )
+    for path in paths:
+        report._status.setdefault(str(path), SampleStatus.VALID)
+    report.mark_checked("lost_and_found.images_probed", len(results))
+    report.stats["lost_and_found_total_images"] = len(paths)
+    report.stats["lost_and_found_corrupt_images"] = sum(
+        report.status_of(path) is SampleStatus.INVALID for path in paths
+    )
+    report.stats["lost_and_found_unverified_images"] = sum(
+        report.status_of(path) is SampleStatus.SUSPECT for path in paths
+    )
+    report.stats["lost_and_found_dimensions"] = dict(Counter(
+        f"{result['width']}x{result['height']}" for result in results if result["ok"]
+    ))
+    report.mark_skipped(
+        "lost_and_found/content_filters",
+        "只过滤损坏图片；不按亮度、清晰度、尺寸、重复、标签内容或配对情况剔除其他文件",
+    )
+    return paths
 
 
 def check_zip_image_integrity(
@@ -1121,7 +1168,7 @@ def clean(
     out_cfg = cfg.get("output", {})
     max_samp = int(out_cfg.get("max_samples_per_issue", 50))
 
-    targets = set(only) if only else {"acdc", "kitti"}
+    targets = set(only) if only else set(cfg.get("datasets", ("acdc", "kitti")))
 
     if "acdc" in targets:
         acdc_root = root / "data" / "raw" / "acdc"
@@ -1202,6 +1249,27 @@ def clean(
                     root / out_cfg.get("manifest_dir", "data/processed/manifests"),
                     "pixel_accurate_benchmark",
                 )
+
+    if "lost_and_found" in targets:
+        dataset_root = root / cfg.get("lost_and_found", {}).get(
+            "root", "data/external/lost_and_found"
+        )
+        paths = check_lost_and_found(dataset_root, report, num_workers=workers)
+        if paths:
+            manifest_path = _write_manifest(
+                report, paths, root / out_cfg.get("manifest_dir", "data/processed/manifests"),
+                "lost_and_found",
+            )
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload["policy"] = "corrupt_images_only"
+            payload["retained"] = [str(path) for path in paths if report.status_of(path) is not SampleStatus.INVALID]
+            image_paths = set(paths)
+            payload["preserved_non_image_files"] = [
+                str(path) for path in sorted(dataset_root.rglob("*"))
+                if path.is_file() and path not in image_paths
+            ]
+            payload["original_files_modified_or_deleted"] = False
+            manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     report.write(root / out_cfg.get("report_dir", "artifacts/reports/cleaning"), max_samp)
     return report

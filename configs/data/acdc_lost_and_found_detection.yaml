@@ -1,0 +1,16 @@
+joint_detection_data:
+  acdc_manifest: data/processed/acdc_detection_yolo/manifest.json
+  lost_and_found_root: data/external/lost_and_found
+  cleaning_manifest: data/processed/manifests/lost_and_found.json
+  output_root: data/processed/acdc_lost_and_found_yolo
+  report_root: artifacts/reports/detection_data_joint
+  seed: 42
+  development_ratios: {train: 0.8, val: 0.1, calibration: 0.1}
+  group_strategy: location
+  obstacle_train_id: 2
+  valid_roi_ids: [1, 2]
+  additional_class: {source_id: 'lost_and_found:obstacle', name: road_obstacle}
+  image_mode: hardlink
+  integrity_workers: 4
+  source_weights: {acdc: 0.5, lost_and_found: 0.5}
+  classification_loss_weights: {acdc: 1.0, lost_and_found: 4.0}

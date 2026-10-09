@@ -57,6 +57,7 @@ class YoloDetectionPredictor:
         self.cfg = cfg
         self.device = resolve_yolo_device(cfg["device"])
         self.confidence = float(cfg["inference"]["confidence"])
+        self.class_thresholds = {}
         calibration = project_root / cfg["calibration_file"]
         if calibration.is_file():
             result = json.loads(calibration.read_text(encoding="utf-8"))
@@ -70,6 +71,14 @@ class YoloDetectionPredictor:
                 if result[report_key] != cfg["inference"][arg]:
                     raise ValueError("Detection inference settings changed; recalibrate first")
             self.confidence = float(result["confidence_threshold"])
+            self.class_thresholds = result.get("class_confidence_thresholds", {})
+            if self.class_thresholds:
+                if any(
+                    not math.isfinite(float(value)) or not 0 < float(value) <= 1
+                    for value in self.class_thresholds.values()
+                ):
+                    raise ValueError("Detection class calibration thresholds must be in (0, 1]")
+                self.confidence = min(float(value) for value in self.class_thresholds.values())
             if not math.isfinite(self.confidence) or not 0 < self.confidence <= 1:
                 raise ValueError("Detection calibration confidence must be in (0, 1]")
 
@@ -101,9 +110,12 @@ class YoloDetectionPredictor:
             result.boxes.cls.cpu().tolist(),
             strict=True,
         ):
+            category = result.names[int(label)]
+            if float(score) < float(self.class_thresholds.get(category, self.confidence)):
+                continue
             objects.append(
                 TargetObject(
-                    category=result.names[int(label)],
+                    category=category,
                     bbox=tuple(box),
                     confidence=float(score),
                 )
@@ -112,4 +124,8 @@ class YoloDetectionPredictor:
             objects=objects,
             object_detection_available=True,
             object_detection_classes=tuple(result.names[i] for i in sorted(result.names)),
+            road_obstacle_detection_available=(
+                self.cfg["inference"].get("obstacle_class", "road_obstacle")
+                in result.names.values()
+            ),
         )

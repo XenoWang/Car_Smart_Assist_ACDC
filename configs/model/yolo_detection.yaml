@@ -1,34 +1,49 @@
-# YOLO11 nano 检测基线；YOLO 的训练/推理后端仍是 PyTorch。
 yolo_detection:
-  model: artifacts/checkpoints/yolo_pretrained/yolo11n.pt
-  data: data/processed/acdc_detection_yolo/data.yaml
+  model: artifacts/runs/detection/yolo11n_acdc_laf/weights/best.pt
+  data: data/processed/acdc_lost_and_found_yolo/data.yaml
   project: artifacts/runs/detection
-  name: yolo11n_acdc
-  device: auto                  # 优先 CUDA；不可用时 CPU
-  checkpoint: artifacts/runs/detection/yolo11n_acdc/weights/best.pt
-  calibration_file: artifacts/reports/detection/yolo11n_acdc/calibration.json
+  name: yolo11n_acdc_laf_v2
+  device: auto
+  checkpoint: artifacts/runs/detection/yolo11n_acdc_laf_v2/weights/best.pt
+  calibration_file: artifacts/reports/detection/yolo11n_acdc_laf_v2/calibration.json
   inference:
-    imgsz: 960                  # 仅在 val 上比较 640/960 后选定；训练保持 640
-    confidence: 0.25             # calibration 完成且权重匹配时使用其选出的阈值
+    imgsz: 960
+    confidence: 0.25
     iou: 0.5
     max_det: 100
+    obstacle_class: road_obstacle
   train:
-    epochs: 30
-    resume_extra_epochs: null    # 可设正整数：已有完整训练状态时追加指定轮数
-    patience: 8
+    epochs: 8
+    resume_extra_epochs: null
+    patience: 4
     seed: 42
     deterministic: true
-    imgsz: 640
-    batch: 8
+    imgsz: 960
+    batch: 4
     workers: 2
     amp: true
-    cache: false                # 不将全量高清图常驻内存
+    cache: false
     optimizer: AdamW
-    lr0: 0.001
-    warmup_bias_lr: 0.0          # 新的 AdamW 训练不沿用 SGD 的 0.1 bias warmup 默认值
+    lr0: 0.0002
+    warmup_bias_lr: 0.0
     warmup_epochs: 3.0
     weight_decay: 0.0005
-    mosaic: 0.5
+    mosaic: 0.0
     close_mosaic: 5
     mixup: 0.0
     plots: true
+    copy_paste: 0.0
+    cutmix: 0.0
+    degrees: 0.0
+    translate: 0.0
+    scale: 0.0
+    shear: 0.0
+    perspective: 0.0
+    fliplr: 0.0
+    flipud: 0.0
+    multi_scale: false
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+  enabled_for_inference: true
+  joint_foreground_exclusive: true

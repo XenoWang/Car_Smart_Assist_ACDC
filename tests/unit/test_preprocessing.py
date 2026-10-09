@@ -22,6 +22,70 @@ from PIL import Image
 from car_smart_assist.data import preprocessing as pp
 
 
+class TestLostAndFoundCleaning:
+    def test_only_corrupt_pngs_filtered_and_all_sources_preserved(self, tmp_path):
+        dataset = tmp_path / "data/external/lost_and_found"
+        rgb_dir = dataset / "leftImg8bit/train/scene"
+        labels_dir = dataset / "gtCoarse/train/scene"
+        rgb_dir.mkdir(parents=True)
+        labels_dir.mkdir(parents=True)
+        images = []
+        # Black, white, low contrast, repeated and tiny images are all legitimate files.
+        for index, value in enumerate((0, 255, 127, 127)):
+            path = rgb_dir / f"scene_{index}_leftImg8bit.png"
+            Image.fromarray(np.full((8, 24, 3), value, np.uint8)).save(path)
+            images.append(path)
+        ignore = labels_dir / "scene_0_gtCoarse_labelIds.png"
+        Image.fromarray(np.full((5, 6), 255, np.uint8)).save(ignore)
+        images.append(ignore)  # Different dimensions and all-ignore content do not imply damage.
+        broken = rgb_dir / "broken_leftImg8bit.png"
+        broken.write_bytes(images[0].read_bytes()[:20])
+        broken_label = labels_dir / "broken_gtCoarse_labelIds.png"
+        broken_label.write_bytes(b"not a PNG")
+        notes = dataset / "README.md"
+        notes.write_text("Keep original documentation")
+        polygon = labels_dir / "scene_0_gtCoarse_polygons.json"
+        polygon.write_text('{"objects": []}')
+        sources = {path: path.read_bytes() for path in dataset.rglob("*") if path.is_file()}
+        cfg = {
+            "datasets": ["lost_and_found"], "num_workers": 1,
+            "lost_and_found": {"root": "data/external/lost_and_found"},
+            "checks": {"image_statistics": True, "duplicates_exact": True, "acdc_mask_validity": True},
+            "image_statistics": {"min_side_px": 100, "severity": {"min_side": "error", "low_std": "error"}},
+            "output": {"report_dir": "artifacts/reports/laf", "manifest_dir": "data/processed/manifests"},
+        }
+        report = pp.clean(cfg, project_root=tmp_path)
+        manifest = json.loads((tmp_path / "data/processed/manifests/lost_and_found.json").read_text())
+        assert set(manifest["invalid"]) == {str(broken), str(broken_label)}
+        assert set(manifest["retained"]) == {str(path) for path in images}
+        assert manifest["counts"] == {"valid": 5, "suspect": 0, "invalid": 2}
+        assert set(manifest["preserved_non_image_files"]) == {str(notes), str(polygon)}
+        assert report.stats["lost_and_found_corrupt_images"] == 2
+        assert not manifest["original_files_modified_or_deleted"]
+        assert all(path.read_bytes() == contents for path, contents in sources.items())
+
+    def test_read_permission_failure_retained_for_review(self, tmp_path, monkeypatch):
+        dataset = tmp_path / "leftImg8bit"
+        dataset.mkdir()
+        path = dataset / "blocked.png"
+        path.write_bytes(b"permission fixture")
+
+        def denied(_tasks):
+            return [{"path": str(path), "ok": False, "error": "PermissionError: denied",
+                     "width": None, "height": None}]
+
+        monkeypatch.setattr(pp, "_probe_batch", denied)
+        report = pp.CleaningReport()
+        assert pp.check_lost_and_found(tmp_path, report, num_workers=1) == [path]
+        assert not report.invalid_paths()
+        assert report.status_of(path) is pp.SampleStatus.SUSPECT
+
+    def test_missing_dataset_recorded_as_not_checked(self, tmp_path):
+        report = pp.CleaningReport()
+        assert pp.check_lost_and_found(tmp_path / "missing", report, num_workers=1) == []
+        assert "lost_and_found" in report.skipped
+
+
 # ---------------------------------------------------------------------------
 # 夹具
 # ---------------------------------------------------------------------------

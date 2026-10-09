@@ -1,0 +1,10 @@
+# 使用同一个 preprocessing.py；仅以结构验证和完整解码剔除损坏图片。
+cleaning:
+  datasets: [lost_and_found]
+  lost_and_found:
+    root: data/external/lost_and_found
+  output:
+    report_dir: artifacts/reports/cleaning/lost_and_found
+    manifest_dir: data/processed/manifests
+    max_samples_per_issue: 50
+  num_workers: 4

@@ -1,4 +1,4 @@
-"""数据清洗入口：校验 ACDC、KITTI 与 Pixel Accurate Benchmark 图像完整性。
+"""统一数据清洗入口：ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。
 
 职责:
     - 解析 configs/data/cleaning.yaml，调用 car_smart_assist.data.preprocessing.clean
@@ -11,11 +11,12 @@
     python scripts/clean_data.py --only acdc              # 只洗 ACDC
     python scripts/clean_data.py --only kitti --workers 8
     python scripts/clean_data.py --only acdc pixel_accurate_benchmark --corrupt-images-only
+    python scripts/clean_data.py --config configs/data/cleaning_lost_and_found.yaml
 
 产物（**不修改任何原始文件**）:
-    artifacts/reports/cleaning/report.json    完整明细
+    artifacts/reports/cleaning/report.json    完整明细（Lost & Found 专用配置写入其子目录）
     artifacts/reports/cleaning/report.md      可读摘要
-    data/processed/manifests/{acdc,kitti,pixel_accurate_benchmark}.json
+    data/processed/manifests/{acdc,kitti,pixel_accurate_benchmark,lost_and_found}.json
 
 退出码:
     0  无 ERROR
@@ -42,8 +43,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="数据清洗：完整性、一致性与重复性校验")
     p.add_argument("--config", default="configs/data/cleaning.yaml", help="清洗配置文件")
     p.add_argument(
-        "--only", nargs="*", choices=["acdc", "kitti", "pixel_accurate_benchmark"], default=None,
-        help="只清洗指定数据集；未指定时清洗 ACDC 与 KITTI",
+        "--only", nargs="*", choices=["acdc", "kitti", "pixel_accurate_benchmark", "lost_and_found"], default=None,
+        help="只清洗指定数据集；未指定时按配置 datasets 清洗（兼容默认 ACDC 与 KITTI）",
     )
     p.add_argument(
         "--corrupt-images-only",

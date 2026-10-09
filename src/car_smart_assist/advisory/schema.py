@@ -49,7 +49,7 @@ class TargetDirection(str, Enum):
 
 @dataclass
 class TargetObject:
-    """一个被检出的交通参与者。
+    """一个被检出的交通目标或道路杂物候选。
 
     方向与距离是**独立**的两个属性：前车近该减速、来车近该注意会车，
     两者的驾驶建议完全相反，因此方向未知时必须显式标注，
@@ -102,7 +102,7 @@ class PerceptionResult:
     object_detection_available: bool = False
     # 检测器支持的类别；成功返回空框也不能排除这些类别之外的道路障碍。
     object_detection_classes: tuple[str, ...] = ()
-    # 独立道路障碍分支尚未训练，不能用常规类别检测替代该能力。
+    # 本帧是否成功运行支持道路障碍候选的检测器；不代表覆盖所有未知物体。
     road_obstacle_detection_available: bool = False
 
     def to_dict(self) -> dict[str, Any]:
