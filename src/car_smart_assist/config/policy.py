@@ -32,7 +32,7 @@ class PolicyConfig:
 
     @classmethod
     def from_mapping(cls, cfg: Mapping[str, Any]) -> PolicyConfig:
-        # 配置模块也可独立导入，避免 advisory 的公开入口与配置形成循环依赖。
+        # 配置模块也可独立导入，避免 advisory 的公开入口和配置形成循环依赖。
         from car_smart_assist.advisory.schema import RiskLevel
 
         def number(value: Any, name: str, minimum: float = 0.0) -> float:

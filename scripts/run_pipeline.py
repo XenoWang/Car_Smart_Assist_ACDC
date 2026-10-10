@@ -76,7 +76,7 @@ def main() -> int:
         for kind in ("fog", "darkness", "occlusion", "blur"):
             samples.append((f"合成 {kind} @1.0", degrade(base, kind, 1.0, seed=0)[0]))
 
-    # 全黑帧：不属于任何数据集，但是「看不见」最纯粹的形式，值得作为对照
+    # 全黑帧：不属于任何数据集，但它是「看不见」最直接的形式，值得做对照
     samples.append(("全黑帧（对照）", np.zeros((1080, 1920, 3), dtype=np.uint8)))
 
     results = pipe.run_batch([img for _, img in samples])

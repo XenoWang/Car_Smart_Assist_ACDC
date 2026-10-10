@@ -1,4 +1,4 @@
-"""ACDC replay plus Lost & Found obstacle boxes, with partial annotation coverage."""
+"""把 ACDC replay 和 Lost & Found 障碍物框一起用，标注只覆盖一部分。"""
 
 from __future__ import annotations
 

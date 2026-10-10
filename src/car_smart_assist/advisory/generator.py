@@ -1,4 +1,4 @@
-"Stage 2 编排：结构化感知结果 -> 给司机的最终提示。"
+"""Stage 2 编排：把结构化感知结果转成给司机的最终提示。"""
 
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ class AdvisoryGenerator:
     Args:
         cfg: configs/model/advisory_llm.yaml 的 ``advisory`` 段。
             policy 段覆盖集中配置；LLM 后端尚未接入。
-        llm_backend: 语言模型后端（尚未实现）。为 None 时全部走模板 ——
-            模板路径不是「临时方案」，它是 LLM 失效时的固定兜底，要长期保留。
+        llm_backend: 语言模型后端（尚未实现）。为 None 时全部走模板。
+            模板路径要长期保留：LLM 失效时由它固定兜底。
     """
 
     def __init__(self, cfg: dict[str, Any] | None = None, llm_backend: Any | None = None) -> None:
@@ -47,7 +47,7 @@ class AdvisoryGenerator:
         """门控结果 -> 司机提示。不需要感知、不需要 LLM。
 
         这是 pipeline 在 BLIND 时唯一会走的路径，因此它不依赖任何
-        尚未实现的模块 —— 少一个依赖就少一个失效点。
+        尚未实现的模块。依赖越少，失效点越少。
         """
         text, risk = render_visibility(verdict.level)
 
@@ -103,8 +103,8 @@ class AdvisoryGenerator:
     ) -> AdvisoryResult:
         """按可用信息选择路径。
 
-        优先级：BLIND 直接出接管提示（不浪费算力跑感知）；
-        否则若有感知结果则走感知路径，没有则请求接管。
+        优先级：BLIND 直接出接管提示，不浪费算力跑感知；
+        否则有感知结果就走感知路径，没有就请求接管。
         """
         if visibility is not None and visibility.level is VisibilityLevel.BLIND:
             return self.from_visibility(visibility)

@@ -36,17 +36,17 @@ class PipelineResult:
     perception: PerceptionResult | None = None
     advisory: AdvisoryResult | None = None
     weather: WeatherPrediction | None = None
-    # 天气模块给司机的独立提醒；不参与 should_takeover 计算。
+    # 天气模块给司机的单独提醒；不参与 should_takeover 计算。
     weather_warning: str | None = None
     # 各阶段耗时（毫秒）。分开计是因为三者的优化手段完全不同，
-    # 只给一个总耗时说明不了任何问题。
+    # 只给一个总耗时说明不了问题。
     timings_ms: dict[str, float] = field(default_factory=dict)
-    # 被跳过的阶段及原因。空字典表示全链路都跑了。
+    # 记录跳过或失败的阶段。空字典只表示本次没有记录跳过项。
     skipped: dict[str, str] = field(default_factory=dict)
 
     @property
     def blocked(self) -> bool:
-        """管线是否因能见度不足而阻断了感知。"""
+        """管线是否因为能见度不足阻断了感知。"""
         return self.visibility is not None and self.visibility.level is VisibilityLevel.BLIND
 
     def to_dict(self) -> dict[str, Any]:
@@ -82,11 +82,11 @@ class InferencePipeline:
     """端到端推理管线。
 
     Args:
-        scorer: 能见度打分器。为 None 则跳过门控（**不推荐**，见 from_config）
+        scorer: 能见度打分器。为 None 就跳过门控（**不推荐**，见 from_config）
         gate: 判定器
         generator: Stage 2 建议生成器
-        predictor: Stage 1 感知模型封装。为 None 表示感知阶段尚未接入，
-            管线会把它记进 skipped 而不是假装跑过
+        predictor: Stage 1 感知模型封装。为 None 表示感知阶段还没接入，
+            管线会把它记进 skipped，而不是假装跑过
         gate_input_size: 门控的输入尺寸，必须与 AE 训练时一致
         cfg: 完整配置，供各阶段读取自己的参数
     """
@@ -255,7 +255,7 @@ class InferencePipeline:
         try:
             verdicts = self._run_gate(arrays)
         except Exception as exc:  # noqa: BLE001
-            # 门控失败不能被解释成「可见」；记录故障并在建议阶段请求接管。
+            # 门控失败不能当成「可见」；记下故障，在建议阶段请求接管。
             logger.exception("能见度门控失败")
             verdicts = []
             for r in results:
@@ -272,7 +272,7 @@ class InferencePipeline:
             for r in results:
                 r.skipped.setdefault("gate", "门控未产出结果")
 
-        # --- ② 感知（仅对未被阻断的帧）---
+        # --- ② 感知（只对没被阻断的帧）---
         for i, r in enumerate(results):
             if self.scorer is not None and "gate" in r.skipped:
                 r.skipped["perception"] = "能见度门控失败，已跳过感知"
@@ -304,7 +304,7 @@ class InferencePipeline:
             t1 = time.perf_counter()
             try:
                 # 注意：传**原始分辨率**的图，不是门控用的降采样图。
-                # 检测框与单目测距都依赖原始像素尺度。
+                # 检测框和单目测距都依赖原始像素尺度。
                 perception = self.predictor.predict(arrays[i])
                 if not isinstance(perception, PerceptionResult):
                     raise TypeError(

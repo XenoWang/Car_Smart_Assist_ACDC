@@ -1,4 +1,4 @@
-"统一数据清洗入口：ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。"
+"""统一的数据清洗入口：ACDC、KITTI、Pixel Accurate Benchmark 和 Lost & Found。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import yaml
 
-# 让脚本能直接运行而无需先 pip install -e .
+# 让脚本能直接运行，不用先 pip install -e .
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from car_smart_assist.data import preprocessing as pp  # noqa: E402
@@ -47,9 +47,9 @@ def main() -> int:
         return 2
 
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    # NOTE: 这里直接读 yaml 是因为 config/loader.py 尚未实现。
-    #       待配置加载器落地后，改为 from car_smart_assist.config import load_config，
-    #       以便自动处理 base 继承与 schema 校验。
+    # NOTE: 这里直接读 yaml 是因为 config/loader.py 还没实现。
+    # 等配置加载器写好以后，改成 from car_smart_assist.config import load_config，
+    # 这样就能自动处理 base 继承和 schema 校验。
     cfg = raw.get("cleaning", raw)
     if args.workers is not None:
         cfg["num_workers"] = args.workers

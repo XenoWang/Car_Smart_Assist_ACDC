@@ -1,4 +1,4 @@
-"""Adapter contracts: RGB, original-image coordinates and explicit capability limits."""
+"""适配器的约定：RGB、原图坐标，以及明确的能力限制。"""
 
 import hashlib
 import json

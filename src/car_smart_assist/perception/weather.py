@@ -1,4 +1,4 @@
-"""独立天气现象/光照多标签小模型和可解释视觉线索。"""
+"""独立的天气现象/光照多标签小模型和可解释视觉线索。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ FEATURE_NAMES = (
 
 
 def prepare_image(image: np.ndarray | Image.Image, size: tuple[int, int]) -> np.ndarray:
-    """和训练使用同一 RGB 缩放口径，返回 uint8 HWC。"""
+    """和训练使用同一套 RGB 缩放口径，返回 uint8 HWC。"""
     array = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image)
     if array.ndim != 3 or array.shape[2] != 3 or array.dtype != np.uint8:
         raise ValueError("天气模型输入必须为 RGB uint8 图像")
@@ -33,7 +33,7 @@ def prepare_image(image: np.ndarray | Image.Image, size: tuple[int, int]) -> np.
 
 
 def visual_cues(image: np.ndarray, cfg: WeatherConfig) -> dict[str, float]:
-    """输出视觉代理比例；近似下部区域并不等于道路分割或物理积水深度。"""
+    """输出视觉代理比例；近似下部区域不等于道路分割，也不等于物理积水深度。"""
     if image.shape[:2] != cfg.image_size or image.ndim != 3 or image.shape[2] != 3:
         raise ValueError("视觉线索输入尺寸与模型配置不一致")
     pixels = image.astype(np.float32) / 255.0
@@ -45,11 +45,11 @@ def visual_cues(image: np.ndarray, cfg: WeatherConfig) -> dict[str, float]:
     saturation = road.max(axis=2) - road.min(axis=2)
     bright = gray >= cfg.features["bright_threshold"]
     low_saturation = saturation <= cfg.features["saturation_max"]
-    # 单帧中的亮斑、暗且平滑的区域都可能来自非雨水原因，只作为分类器输入线索。
+    # 单帧里的亮斑、暗且平滑的区域都可能来自非雨水原因，只作为分类器的输入线索。
     gradient = np.zeros_like(gray)
     gradient[:, 1:] += np.abs(gray[:, 1:] - gray[:, :-1])
     gradient[1:, :] += np.abs(gray[1:, :] - gray[:-1, :])
-    # 高亮边缘可提示反光；大块亮且平滑可提示积雪。都可能被其他物体混淆。
+    # 高亮边缘可能提示反光；大块亮且平滑可能提示积雪。两者都可能被其他物体混淆。
     reflections = bright & (gradient > cfg.features["smooth_gradient_max"])
     wet_proxy = (gray <= cfg.features["dark_threshold"]) & (
         gradient <= cfg.features["smooth_gradient_max"]
@@ -78,7 +78,7 @@ def image_tensors(
 
 
 class WeatherClassifier(nn.Module):
-    """小型 CNN 融合全图特征和四个视觉代理比例。"""
+    """小型 CNN，融合全图特征和四个视觉代理比例。"""
 
     def __init__(self, cfg: WeatherConfig) -> None:
         super().__init__()
@@ -143,7 +143,7 @@ class WeatherPrediction:
 
 
 def render_weather_warning(attributes: tuple[str, ...]) -> str | None:
-    """Build an informational warning; this text never requests handover by itself."""
+    """生成提示信息；这段文字本身不会请求接管。"""
     detected = set(attributes)
     night = "night" in detected
     fog = "fog" in detected
@@ -177,7 +177,7 @@ def select_device(requested: str) -> torch.device:
 
 
 class WeatherPredictor:
-    """只从训练检查点创建；随机初始权重不能用于真实图片判断。"""
+    """只从训练检查点创建；随机初始权重不能用来判断真实图片。"""
 
     def __init__(self, model: WeatherClassifier, cfg: WeatherConfig, device: torch.device) -> None:
         self.model = model.to(device).eval()

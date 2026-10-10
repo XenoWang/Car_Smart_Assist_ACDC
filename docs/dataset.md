@@ -25,7 +25,7 @@ rgb_anon/{fog,rain,snow,night}/{train_ref,val_ref,test_ref}/{sequence}/*_rgb_ref
 主条件目录用于天气标签；参考图用于能见度重建训练。
 GOPRxxxx 与 GP01xxxx 等章节属于同一录制组，划分时整体处理。
 语义标签使用 Cityscapes 19 类；检测框按配置中的八类映射导出。
-ACDC 不提供本项目所需的积水深度、雪厚、米制可见距离、真实接管行为与单目目标距离真值。
+ACDC 不提供本项目需要的积水深度、雪厚、米制可见距离、真实接管行为和单目目标距离真值。
 
 ## KITTI
 
@@ -37,7 +37,7 @@ training/label_2/
 training/calib/
 ```
 
-标签格式和后续距离约定见 [标签规范](label_spec.md)。当前距离训练和标签构造入口尚未实现。
+标签格式和后续距离约定见 [标签规范](label_spec.md)。距离训练和标签构造入口目前还没实现。
 
 ## Pixel Accurate
 
@@ -48,7 +48,7 @@ training/calib/
 scene{编号}_{day|night}_{clear|fog数值|rain数值}_{帧编号}.png
 ```
 
-fog／rain 与 night 分别形成标签；文件名中的数值保留为来源元数据，模型当前不输出物理雨量或雾距离。
+fog／rain 与 night 分别形成标签；文件名中的数值保留为来源元数据，模型目前不输出物理雨量或雾距离。
 同一个 scene 整体划分。增强配置使用 scene 1–2 训练、scene 4 验证、scene 3 校准。
 
 ## Lost & Found
@@ -62,13 +62,13 @@ gtCoarse/{train,test}/{scene}/
 
 保留 labelIds、labelTrainIds、instanceIds 与原说明文件。
 检测数据准备从实例标注和障碍标签的交集生成框，按拍摄地点分组；官方 test 不参与训练。
-未标注区域不视为完整背景负例，RGB 与标签几何尺寸保持一致。
+未标注区域不当作完整的背景负例，RGB 与标签几何尺寸保持一致。
 
 ## 清洗与处理产物
 
 清洗统一运行 `scripts/clean_data.py`，配置位于 `configs/data/cleaning*.yaml`。
 过滤清单在 `data/processed/manifests/`，检查报告在 `artifacts/reports/cleaning/`。
-invalid 仅表示确认损坏项；suspect 保留。原始图像、标签和 ZIP 不修改。
+invalid 只表示确认损坏的项；suspect 保留。原始图像、标签和 ZIP 不修改。
 ZIP 损坏项以 `archive::member` 标识。
 
 天气缓存位于 `data/processed/weather/`。检测准备入口为 `scripts/prepare_detection.py`，输出位置由对应数据 YAML 指定。

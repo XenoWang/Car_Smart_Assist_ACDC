@@ -1,4 +1,4 @@
-"""Weather-only fine-tuning: teacher protection, masks, augmentation and resume."""
+"""仅天气微调：原模型保护、掩码、增强和续训。"""
 from dataclasses import replace
 from pathlib import Path
 from zipfile import ZipFile
@@ -105,7 +105,7 @@ def test_wrong_teacher_rain_is_not_distilled():
     labels = torch.tensor([[0., 1., 0., 0.]])
     loss = distillation_loss(student, teacher, labels, torch.ones_like(labels), cfg, options)
     loss.backward()
-    assert student.grad[0, 1] == 0  # Teacher misses rain; supervised loss is free to correct it.
+    assert student.grad[0, 1] == 0  # 原模型漏检了雨，这里应由监督损失纠正。
     assert student.grad[0, 0] != 0
 
 

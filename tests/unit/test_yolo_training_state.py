@@ -1,4 +1,4 @@
-"""Precision and identity checks for interruption checkpoints."""
+"""中断检查点的精度和身份检查。"""
 
 import copy
 from types import SimpleNamespace
@@ -49,7 +49,7 @@ def test_adam_small_variance_and_model_restored_without_half_rounding(tmp_path, 
     assert variance.item() > 0
     assert (
         variance.half().item() == 0
-    )  # This state would be lost by the dependency's FP16 conversion.
+    )  # 这些状态会被依赖库的 FP16 转换丢掉。
     assert type(state["optimizer"]["param_groups"][0]["lr"]) is float
     restored = trainer(tmp_path)
     with torch.no_grad():

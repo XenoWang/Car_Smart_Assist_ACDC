@@ -1,5 +1,5 @@
-# 统一编辑器行为。重点解决 Windows 上的 CRLF 问题：
-# 如果不锁 LF，git diff 会显示整个文件被改写，review 时完全看不出真实变更。
+# 统一编辑器行为。主要解决 Windows 上的 CRLF 问题：
+# 如果不锁 LF，改一个文件后 git diff 会显示整个文件被改写，review 时看不出真实变更。
 root = true
 
 [*]
@@ -14,7 +14,7 @@ indent_size = 4
 indent_size = 2
 
 [*.md]
-# Markdown 里行尾两个空格是有意义的换行，不能trim掉
+# Markdown 里行尾两个空格是有意义的换行，不能 trim 掉
 trim_trailing_whitespace = false
 
 [Makefile]

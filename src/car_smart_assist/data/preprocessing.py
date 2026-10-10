@@ -1,4 +1,4 @@
-"数据清洗：集中检查 ACDC、KITTI、Pixel Accurate Benchmark 与 Lost & Found。"
+"""数据清洗：统一检查 ACDC、KITTI、Pixel Accurate Benchmark 和 Lost & Found。"""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
-# ACDC 官方标注的 5 种变体后缀，顺序即失败时的排查优先级
-# （labelIds 是训练用的，其余是可视化或辅助用的）
+# ACDC 官方标注的 5 种变体后缀，顺序就是失败时的排查优先级
+# （labelIds 是训练用的，其余用于可视化或辅助）
 ACDC_MASK_SUFFIXES: tuple[str, ...] = (
     "labelIds",        # 训练用：Cityscapes 类别 ID
     "labelTrainIds",   # 训练用：Cityscapes trainID
@@ -36,7 +36,7 @@ ACDC_ANNOTATED_SPLITS: frozenset[str] = frozenset({"train", "val"})
 
 
 def load_invalid_entries(manifest_path: str | Path, project_root: str | Path) -> set[str]:
-    """读取集中清洗的损坏清单；可疑图片保留，ZIP 成员沿用 archive::member 标识。"""
+    """读取清洗生成的损坏清单；可疑图片仍保留，ZIP 成员继续用 archive::member 标识。"""
     path = Path(manifest_path)
     if not path.is_file():
         return set()
@@ -53,7 +53,7 @@ def load_invalid_entries(manifest_path: str | Path, project_root: str | Path) ->
 
 
 class Severity(str, Enum):
-    """问题严重度。决定该项是否影响样本可用性。"""
+    """问题严重度，用来判断该项是否影响样本可用性。"""
 
     ERROR = "error"      # 必须剔除
     WARNING = "warning"  # 可疑，需人工确认
@@ -64,11 +64,11 @@ class SampleStatus(str, Enum):
     """单个样本的清洗结论。"""
 
     VALID = "valid"
-    SUSPECT = "suspect"    # 有 WARNING，可用但需留意
+    SUSPECT = "suspect"    # 有 WARNING，可用但要留意
     INVALID = "invalid"    # 有 ERROR，不可用
 
 
-# severity 字符串 -> 枚举。配置里用字符串写，代码里用枚举判断。
+# severity 字符串 -> 枚举。配置里写字符串，代码里用枚举判断。
 _SEVERITY_BY_NAME: dict[str, Severity] = {
     "error": Severity.ERROR,
     "warning": Severity.WARNING,
@@ -108,7 +108,7 @@ class Issue:
 class CleaningReport:
     """清洗结果的汇总容器。
 
-    累积 issue、统计量与「检查了什么/跳过了什么」，最后落盘为 json + markdown。
+    在这里累积 issue、统计量和「检查了什么/跳过了什么」，最后写成 json 和 markdown。
     """
 
     issues: list[Issue] = field(default_factory=list)
@@ -120,7 +120,7 @@ class CleaningReport:
     # --- 记录 ---
 
     def add(self, check: str, severity: Severity, path: str | Path, message: str) -> None:
-        """记录一条问题，并同步更新该样本的状态。"""
+        """记录一条问题，同时更新该样本的状态。"""
         p = str(path)
         self.issues.append(Issue(check, severity, p, message))
         cur = self._status.get(p, SampleStatus.VALID)
@@ -184,7 +184,7 @@ class CleaningReport:
         }
 
     def write(self, out_dir: str | Path, max_samples_per_issue: int = 50) -> Path:
-        """写出 report.json 与 report.md，返回 json 路径。"""
+        """写出 report.json 和 report.md，返回 json 路径。"""
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
 
@@ -240,19 +240,19 @@ class CleaningReport:
 
 
 
-# 图像探测（多进程 worker，必须是模块级函数以便 pickle）
+# 图像检查 worker；放在模块顶层，便于子进程 pickle。
 
 
 
 def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
-    """探测单张图像的可读性与统计特征。
+    """探测单张图像能否读取，并算统计特征。
 
     Args:
         task: (路径, 是否强制解码像素, 是否算统计量, 灰度降采样系数)
 
     Returns:
         含 ok / error / size / mode / 统计量的 dict。
-        这个函数在子进程里运行，**不能抛异常** —— 所有异常转成 error 字段。
+        这个函数在子进程里运行，**不能抛异常** —— 所有异常都写进 error 字段。
     """
     path, force_load, want_stats, downsample = task
     r: dict[str, Any] = {
@@ -280,7 +280,7 @@ def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
 
 
 def probe_image_integrity(path: str | Path) -> dict[str, Any]:
-    """只验证图片结构与完整解码，供数据准备复用；不按亮度或清晰度过滤。"""
+    """只验证图片结构并完整解码，供数据准备复用；不按亮度或清晰度过滤。"""
     return _probe_image((str(path), True, False, 1))
 
 
@@ -288,7 +288,7 @@ def _image_stats(im: Image.Image, downsample: int) -> dict[str, float]:
     """计算用于退化与离群检测的图像统计量。
 
     全部在灰度降采样图上算，兼顾速度与稳定性。
-    返回值范围固定，便于跨数据集比较。
+    返回值范围固定，方便跨数据集比较。
     """
     small = im.convert("L")
     if downsample > 1:
@@ -329,7 +329,7 @@ def _image_stats(im: Image.Image, downsample: int) -> dict[str, float]:
 
 
 def _probe_batch(tasks: Sequence[tuple]) -> list[dict[str, Any]]:
-    """批量探测，供 ProcessPoolExecutor.map 使用（模块级以便 pickle）。"""
+    """给 ProcessPoolExecutor.map 批量检查图像。函数放在模块顶层，便于子进程 pickle。"""
     return [_probe_image(t) for t in tasks]
 
 
@@ -353,7 +353,7 @@ def _run_probes(
     results: list[dict[str, Any]] = []
 
     if num_workers > 1 and len(tasks) > 64:
-        # 分块提交，避免一次性 pickl 几万个 tuple
+        # 分块提交，避免一次性把几万个 tuple 都 pickle 出去
         chunk = max(64, len(tasks) // (num_workers * 4))
         chunks = [tasks[i : i + chunk] for i in range(0, len(tasks), chunk)]
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
@@ -378,7 +378,7 @@ def _run_probes(
 def check_lost_and_found(
     dataset_root: Path, report: CleaningReport, *, num_workers: int
 ) -> list[Path]:
-    """Only exclude structurally corrupt/undecodable PNGs; preserve every source file."""
+    """只剔除结构损坏或无法解码的 PNG；源文件一个不改、一个不删。"""
     if not dataset_root.is_dir():
         report.mark_skipped("lost_and_found", f"路径不存在: {dataset_root}")
         return []
@@ -459,7 +459,7 @@ def check_zip_image_integrity(
 
 
 
-# 尺寸与退化检查
+# 检查尺寸和退化情况
 
 
 
@@ -471,7 +471,7 @@ def _check_dimensions_and_degeneracy(
     check: str,
     label: str,
 ) -> None:
-    """基于探测结果检查尺寸异常与退化图，并把尺寸分布记入 stats。
+    """根据探测结果检查尺寸异常和退化图，并把尺寸分布记入 stats。
 
     ⚠️ 本函数的三项检查**全部是内容判断**，默认严重度都是 WARNING，
     即默认**不会**把任何样本标为 INVALID。
@@ -483,7 +483,7 @@ def _check_dimensions_and_degeneracy(
 
     实测参考（全量 23011 张）：ACDC 最低灰度标准差 12.96、KITTI 46.61，
     与默认阈值 2.0 相距甚远，但那是这两份数据恰好没有「糊成一片」的帧，
-    换数据集后不一定成立。因此这里把决定权交给配置与人，而不是默认排除。
+    换数据集后不一定成立。因此这里把决定权交给配置和人，而不是默认排除。
 
     需要更激进的策略时，在 cleaning.yaml 的 image_statistics.severity 里
     把对应项改成 error —— 但改之前请先看报告里的实际分布，并人工抽查被标出的图。
@@ -544,7 +544,7 @@ def _check_dimensions_and_degeneracy(
     }
     report.stats[f"{label}_distinct_sizes"] = len(size_dist)
     if len(size_dist) > 1:
-        # 尺寸不统一本身不一定是缺陷（KITTI 天然如此），记 INFO 供人判断
+        # 尺寸不统一本身不一定是缺陷（KITTI 就多种尺寸），记 INFO 让人自己判断
         report.info(
             check,
             label,
@@ -554,7 +554,7 @@ def _check_dimensions_and_degeneracy(
 
 
 
-# ACDC 检查
+# 检查 ACDC
 
 
 
@@ -621,7 +621,7 @@ def check_acdc(
             rel = img.relative_to(root / "rgb_anon")
             split = rel.parts[1] if len(rel.parts) > 2 else ""
             if split not in ACDC_ANNOTATED_SPLITS:
-                continue  # test 与 *_ref 无标注属预期，见模块头说明
+                continue  # test 和 *_ref 没有这些标注是预期情况。
             n_paired += 1
             for suffix in ACDC_MASK_SUFFIXES:
                 mp = _acdc_mask_path(img, root, suffix)
@@ -635,7 +635,7 @@ def check_acdc(
         report.stats["acdc_missing_masks"] = n_missing
         report.stats["acdc_unannotated_images"] = len(all_images) - n_paired
 
-        # 反向：是否有孤儿掩码（有标注却没有对应图像）
+        # 反向检查：有没有孤儿掩码（有标注但没有对应图像）
         n_orphan = 0
         for mp in (root / "gt").rglob("*.png"):
             if not mp.name.endswith("_gt_labelIds.png"):
@@ -797,7 +797,7 @@ def _check_detection_jsons(
             "oob": n_oob, "tiny": n_tiny, "orphan": n_orphan,
         }
 
-        # 反向：标注里声明的图像在磁盘上是否存在
+        # 反向检查：标注里声明的图像在磁盘上是否存在
         n_missing_img = 0
         for im in images:
             if not (rgb_root / im["file_name"]).exists():
@@ -813,7 +813,7 @@ def _check_detection_jsons(
 
 
 
-# KITTI 检查
+# 检查 KITTI
 
 
 
@@ -827,9 +827,9 @@ def check_kitti(
 ) -> None:
     """KITTI 全量清洗。
 
-    重点与 ACDC 不同：KITTI 的图像尺寸逐帧不同、内参逐帧不同，
-    所以这里不做「尺寸必须统一」的判断，而是校验 image/label/calib 三元组齐全、
-    以及内参与图像尺寸是否自洽。
+    重点和 ACDC 不同：KITTI 的图像尺寸逐帧不同、内参逐帧不同，
+    所以这里不检查「尺寸必须统一」，而是校验 image/label/calib 三元组齐全，
+    以及内参和图像尺寸是否自洽。
     """
     root = Path(kitti_root)
     if not root.exists():
@@ -940,7 +940,7 @@ def check_kitti(
 def _file_digest(path: Path, nbytes: int) -> str:
     """取文件前 nbytes 字节的 sha1。
 
-    只用前 256KB 而非全文哈希：全量哈希 16GB 需要数分钟且收益有限，
+    只用前 256KB 而非全文哈希：全量哈希 16GB 要几分钟，收益也不大，
     前 256KB 足以区分不同照片（图像头部包含尺寸、调色板与起始像素数据）。
     """
     h = hashlib.sha1()
@@ -952,8 +952,8 @@ def _file_digest(path: Path, nbytes: int) -> str:
 def _dhash(path: Path, hash_size: int = 8) -> np.ndarray | None:
     """差分感知哈希。返回 bool 数组，None 表示读取失败。
 
-    自行实现而非引入 imagehash：逻辑只有几行，
-    避免为一个函数增加一个依赖。
+    自己写而不引入 imagehash：逻辑只有几行，
+    没必要为一个函数加一个依赖。
     """
     try:
         with Image.open(path) as im:
@@ -1086,7 +1086,7 @@ def check_statistical_outliers(
 def _write_manifest(
     report: CleaningReport, all_paths: Sequence[str | Path], out_dir: str | Path, name: str
 ) -> Path:
-    """写出有效样本清单 —— 清洗的实际交付物，数据集类据此过滤。"""
+    """写出有效样本清单 —— 这是清洗的实际产物，数据集类据此过滤。"""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     valid = [str(p) for p in all_paths if report.status_of(p) is SampleStatus.VALID]
@@ -1125,10 +1125,10 @@ def clean(
         corrupt_images_only: 只检查完整图像解码，不检查配对、统计特征或重复项
 
     Returns:
-        填充好的 CleaningReport
+        填好的 CleaningReport
 
     Note:
-        本函数**不修改任何原始文件**。产物是 artifacts/ 下的报告与
+        本函数**不改任何原始文件**。产物是 artifacts/ 下的报告和
         data/processed/manifests/ 下的有效样本清单。
     """
     root = Path(project_root)

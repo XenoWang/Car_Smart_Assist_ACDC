@@ -1,4 +1,4 @@
-"合成退化：为能见度门控生成「确定无疑看不见」的验证样本。"
+"""合成退化：生成「肯定看不见」的样本，用于验证能见度门控。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import numpy as np
 
 @dataclass
 class DegradationSpec:
-    """一次退化的描述。"""
+    """描述一次退化。"""
 
     kind: str
     severity: float          # 0~1，越大越严重
@@ -36,9 +36,9 @@ def add_fog(img: np.ndarray, severity: float, rng: np.random.Generator,
 
 def add_darkness(img: np.ndarray, severity: float, rng: np.random.Generator,
                  gamma_max: float = 6.0) -> tuple[np.ndarray, DegradationSpec]:
-    """黑暗模拟：gamma 拉伸压暗中间调 + 线性缩放整体亮度。
+    """黑暗模拟：gamma 拉伸压暗中间调，再线性缩放整体亮度。
 
-    两者叠加而不是只用其一：单纯缩放会让亮部仍可见，
+    两者叠加，不只用一个：单纯缩放亮部还看得见，
     单纯 gamma 又压不黑高光区，合起来才接近「完全无照明」。
     """
     gamma = 1.0 + (gamma_max - 1.0) * severity
@@ -53,8 +53,8 @@ def add_occlusion(img: np.ndarray, severity: float, rng: np.random.Generator,
                   coverage_max: float = 0.98) -> tuple[np.ndarray, DegradationSpec]:
     """遮挡模拟：模拟镜头被泥污/雪覆盖。
 
-    用低频噪声生成一块不规则的覆盖区域，而不是简单贴矩形 ——
-    矩形遮挡会让「边缘密度」这类特征突然升高（遮挡边界本身是强边缘），
+    用低频噪声生成一块不规则的覆盖区域，不贴矩形 ——
+    矩形遮挡会让「边缘密度」这类特征突然升高（遮挡边界本身就是强边缘），
     给模型一个虚假的信号。低频噪声生成的覆盖没有这种人为边缘。
     """
     h, w = img.shape[:2]
@@ -66,7 +66,7 @@ def add_occlusion(img: np.ndarray, severity: float, rng: np.random.Generator,
     )
     thr = np.quantile(mask, 1.0 - coverage) if coverage > 0 else 1.1
     m = (mask >= thr).astype(np.float32)
-    # 覆盖物取图像自身的中位亮度附近的灰白，避免引入训练集外的奇怪颜色
+    # 覆盖物取图像自身中位亮度附近的灰白，避免引入训练集外的奇怪颜色
     fill = float(np.median(img)) * 0.8 + 40.0
     out = img.astype(np.float32) * (1 - m[..., None]) + fill * m[..., None]
     return (np.clip(out, 0, 255)).astype(np.uint8), DegradationSpec(
@@ -76,7 +76,7 @@ def add_occlusion(img: np.ndarray, severity: float, rng: np.random.Generator,
 
 def add_blur(img: np.ndarray, severity: float, rng: np.random.Generator,
              kernel_max: int = 41) -> tuple[np.ndarray, DegradationSpec]:
-    """模糊模拟：高斯模糊。用可分离卷积实现，避免引入 scipy 依赖。"""
+    """模糊模拟：高斯模糊。用可分离卷积实现，不引入 scipy 依赖。"""
     sigma = 0.5 + (kernel_max / 6.0 - 0.5) * severity
     radius = int(max(1, round(sigma * 3)))
     x = np.arange(-radius, radius + 1, dtype=np.float32)
@@ -93,8 +93,9 @@ def add_blur(img: np.ndarray, severity: float, rng: np.random.Generator,
 
 
 def _bicubic_resize(arr: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
-    """双线性放大。手写而非调 cv2/PIL：这里只需要一个平滑的低频掩膜，
-    不值得为它引入额外的图像库调用路径，也便于单测。"""
+    """双线性放大。手写，不用 cv2/PIL：这里只需要一个平滑的低频掩膜，
+    不值得为它引入额外的图像库调用路径，也方便单测。
+    """
     h, w = shape
     sh, sw = arr.shape
     yi = np.linspace(0, sh - 1, h)
@@ -149,7 +150,7 @@ def severity_sweep(
 
 
 def kinds(cfg: dict[str, Any] | None = None) -> list[str]:
-    """可用的退化类型。cfg 传入时只返回配置中启用的那些。"""
+    """可用的退化类型。传入 cfg 时只返回配置中启用的那些。"""
     if not cfg:
         return sorted(_KINDS)
     return [k for k in sorted(_KINDS) if k in cfg]

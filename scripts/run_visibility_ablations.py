@@ -1,4 +1,4 @@
-"能见度门控的消融实验驱动器。"
+"""能见度门控的消融实验运行脚本。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# 评估用规模。七组共用同一批图，解码一次即可。
+# 评估用规模。七组用同一批图，解码一次就行。
 N_PER_SPLIT = 60          # train / val / calib / test 各抽多少张
 N_SYNTH = 60              # 合成退化实验的基准图数量
 SEVERITIES = (0.5, 0.75, 1.0)
@@ -62,7 +62,7 @@ def evaluate_run(
     ca_idx: np.ndarray,
     rng: np.random.Generator,
 ) -> dict[str, Any]:
-    """只在训练集与验证集上比较，测试集保留给最终评估。"""
+    """只用训练集和验证集比较，测试集留给最终评估。"""
 
     def pick(idx):
         return rng.choice(idx, size=min(N_PER_SPLIT, len(idx)), replace=False)
@@ -160,20 +160,20 @@ def main() -> int:
             results = {}
         logger.info("已载入 %d 组历史结果（用 --force 可全部重跑）", len(results))
 
-    # --- 有效性闸门（踩过一次坑，代价是 56 分钟 GPU 时间）---
+    # --- 有效性闸门（踩过一次坑，花了 56 分钟 GPU 时间）---
     #
-    # 门控判定在 use_recon_z=False 时**只依赖确定性信息量特征**，
+    # use_recon_z=False 时，门控判定**只依赖确定性信息量特征**，
     # 而信息量特征由 compute_information_features(图像) 直接算出，不经过模型。
-    # 于是「换编码器结构」对召回率、误报率的影响**在数学上恒等于零** ——
-    # 无论怎么消融，所有组的结果都会逐位相同。
+    # 所以「换编码器结构」对召回率、误报率的影响**在数学上恒为零** ——
+    # 不管怎么消融，所有组的结果都逐位相同。
     #
-    # 这不是「架构不重要」，而是「门控根本没用到架构」。
-    # 真要通过消融比较架构，必须让被比较的指标依赖模型：
+    # 这不是「架构不重要」，是「门控根本没用到架构」。
+    # 真要拿消融比较架构，得让被比较的指标依赖模型：
     #   · 重新启用 use_recon_z（并先证明 recon_z 有判别力），或
     #   · 比较重建质量本身（过拟合比、逐类重建误差）
-    # 在此之前跑消融只会产生七行一样的表格。
+    # 在这之前跑消融，只会得到七行一样的表格。
     #
-    # 闸门放在解码参考图**之前**：那是两分钟的开销，而且失败得越早越好。
+    # 闸门放在解码参考图**之前**：这里花两分钟，失败越早发现越好。
     gate_cfg = base.get("thresholds", {})
     if not bool(gate_cfg.get("use_recon_z", False)) and not args.force_meaningless:
         logger.error(
@@ -185,7 +185,7 @@ def main() -> int:
         )
         return 3
 
-    # --- 参考图与划分只准备一次，七组共用 ---
+    # --- 参考图和划分只准备一次，七组共用 ---
     dcfg = base.get("data", {})
     size = tuple(base.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
     ref_paths = list_ref_images(root / dcfg.get("acdc_root", "data/raw/acdc"))
@@ -224,8 +224,8 @@ def main() -> int:
         logger.info("=" * 66)
 
         cfg = apply_config_overrides(base, preset.get("set", {}))
-        # 每组独立目录：共用的话第二次会捡起第一次的权重续训，
-        # 那测的是「继续训练」而不是「换结构重训」，结论完全错
+        # 每组用独立目录：共用的话第二次会接着第一次的权重继续训，
+        # 那测的是「继续训练」而不是「换结构重训」，结论完全不对
         cfg.setdefault("train", {})["checkpoint_dir"] = (
             f"artifacts/checkpoints/visibility_ablations/{tag}"
         )
@@ -321,7 +321,7 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
             L.append(f"| {k} | {row} |")
         L.append("")
 
-    # 检测「所有组指标完全相同」这种退化情形 —— 它几乎总意味着
+    # 检测「所有组指标完全相同」这种退化情况 —— 它基本都意味着
     # 被比较的指标与模型无关，而不是「架构真的不影响」。
     recalls = {round(results[t]["mean_recall"], 6) for t in order}
     fps = {round(results[t]["val_fpr"], 6) for t in order}

@@ -1,4 +1,4 @@
-"""Prepare scene-disjoint ACDC detection data in Ultralytics YOLO format."""
+"""按场景分组、互不重叠地准备 ACDC 检测数据，输出 Ultralytics YOLO 格式。"""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ def load_detection_data_config(path: Path) -> dict[str, Any]:
 
 
 def normalize_box(bbox: list[float], width: int, height: int) -> tuple[float, ...]:
-    """COCO pixel xywh -> YOLO normalized xywh; retain valid small/truncated boxes."""
+    """COCO 像素 xywh -> YOLO 归一化 xywh；保留有效的小框/截断框。"""
     if len(bbox) != 4 or width <= 0 or height <= 0:
         raise ValueError("Invalid image dimensions or bbox length")
     x, y, w, h = (float(value) for value in bbox)
@@ -183,7 +183,7 @@ def _verify_record(record: DetectionImage) -> tuple[DetectionImage, str | None]:
 
 
 def _merge_duplicate_groups(records: list[DetectionImage]) -> list[DetectionImage]:
-    """Keep byte-identical images in one group without deleting them."""
+    """把字节完全相同的图像分到同一组，不删除它们。"""
     parent = {record.group: record.group for record in records}
 
     def find(group):
@@ -210,7 +210,7 @@ def _merge_duplicate_groups(records: list[DetectionImage]) -> list[DetectionImag
 def stratified_group_split(
     records: list[DetectionImage], ratios: dict[str, float], seed: int, class_count: int
 ) -> dict[str, list[DetectionImage]]:
-    """Seeded whole-recording allocation, optimizing image and box-class balance."""
+    """按种子做整段录制划分，让图像和框类别尽量均衡。"""
     split_names = tuple(ratios)
     target = np.asarray(list(ratios.values()))
     rng = random.Random(seed)

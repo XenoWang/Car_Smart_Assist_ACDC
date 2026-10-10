@@ -1,4 +1,4 @@
-"""Rain-focused fine-tuning with a frozen, multi-label weather teacher."""
+"""冻结的多标签天气原模型做参照，针对雨天做微调。"""
 
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def source_of(sample: WeatherSample) -> str:
 
 
 def enhanced_splits(cfg: WeatherConfig, root: Path) -> dict[str, list[WeatherSample]]:
-    """Keep recording families/scenes disjoint; never read official test here."""
+    """按完整录制片段和场景分组，避免跨集合；这里不读取官方 test。"""
     t = cfg.train
     invalid = load_invalid_entries(root / t["acdc_cleaning_manifest"], root)
     records = [sample for split in ("train", "val") for sample in list_condition_images(
@@ -68,7 +68,7 @@ def enhanced_splits(cfg: WeatherConfig, root: Path) -> dict[str, list[WeatherSam
 
 
 class EnhancedDataset(Dataset):
-    """Augment training rain images only; cues follow the augmented pixels."""
+    """只对训练用雨天图像做增强；视觉线索按增强后的像素重新计算。"""
 
     def __init__(self, base: WeatherDataset, options: dict[str, Any]):
         self.base, self.options = base, options
@@ -129,7 +129,7 @@ def metrics_by_source(dataset, values, cfg):
 
 
 def retained(candidate, baseline, options):
-    """Evaluate preservation per source; absent positive classes use FP rate."""
+    """按数据来源检查原能力是否保持；没有正样本的属性看 FP rate。"""
     reasons = []
     for source, old in baseline.items():
         new = candidate[source]
@@ -153,14 +153,14 @@ def rain_score(metrics):
 
 
 def distillation_loss(student, teacher, labels, mask, cfg, options):
-    """Bernoulli KL; known wrong/uncertain teacher attributes contribute no loss."""
+    """Bernoulli KL：跳过原模型已判错或低置信属性的蒸馏项。"""
     p = teacher.sigmoid()
     thresholds = torch.tensor([cfg.decision_thresholds[name] for name in cfg.attributes], device=p.device)
     correct = (p >= thresholds) == (labels > 0.5)
     confident = torch.maximum(p, 1 - p) >= options["teacher_confidence"]
     valid = mask * correct * confident
     if options.get("distill_unlabeled", False):
-        # 未标注属性只使用高置信原模型作软约束，不把它们伪装成已确认负标签。
+        # 未标注属性只拿高置信的原模型输出作软约束，不把它们当成已确认的负标签。
         valid = valid + (1 - mask) * confident
     temperature = options["distillation_temperature"]
     soft = (teacher / temperature).sigmoid()
@@ -296,12 +296,12 @@ def _train(cfg, root, device, resume):
         completed = previous.get("training_complete", wait >= t["patience"] or start >= t["epochs"])
         planned_epochs = previous.get("planned_epochs", t["epochs"])
     else:
-        save_best(0, baseline)  # No admissible improvement keeps the original teacher weights.
+        save_best(0, baseline)  # 没有可接受的改进就保留原模型的权重。
     epochs = start + t["resume_extra_epochs"] if completed else planned_epochs
     if completed:
         wait = 0
     for epoch in range(start + 1, epochs + 1):
-        # 骨干、BN 统计与原输出保持冻结，只有雨天残差分支参与更新。
+        # 骨干、BN 统计和原输出保持冻结，只有雨天残差分支参与更新。
         model.eval()
         model.rain_adapter.train()
         total = 0.0

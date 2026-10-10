@@ -1,4 +1,4 @@
-"""Source-aware BCE: unannotated classes/ROI never become negative supervision."""
+"""BCE 按数据来源选择监督范围；未标注的类别和 ROI 不作为负样本。"""
 
 from __future__ import annotations
 
@@ -17,12 +17,12 @@ class MaskedClassificationLoss(nn.Module):
     def forward(self, predictions, targets):
         if self.valid is None:
             raise ValueError("Joint detection requires explicit supervision coverage")
-        # Positive assignment can fall outside a sparse pixel ROI; keep its target.
+        # 正样本分配可能落在稀疏像素 ROI 之外，这种情况要保留它的目标。
         positives = targets > 0
         if getattr(self, "foreground_exclusive", False):
-            # The nine categories are mutually exclusive at a labelled object:
-            # normal traffic categories versus annotated miscellaneous cargo.
-            # Missing background annotations still supply no class negatives.
+            # 在已标注的目标上，这九类互斥：
+            # 常规交通类别与已标注的杂类货物。
+            # 缺少背景标注时仍然不产生类别负样本。
             positives = positives.any(dim=-1, keepdim=True)
         allowed = self.valid | positives
         return (
@@ -63,7 +63,7 @@ class JointDetectionLoss:
 
 
 def preserve_classification_outputs(source, target, known_classes):
-    """Adding class nine must retain the original eight output rows, not reinitialize them."""
+    """加第九类时要保留原来八类的输出权重行，不能重新初始化。"""
     if source is None or source.model[-1].nc != known_classes:
         return 0
     copied = 0

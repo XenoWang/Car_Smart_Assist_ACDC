@@ -56,7 +56,7 @@ def main() -> int:
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     cfg = raw.get("visibility", raw)
 
-    # 命令行覆盖（--set 那套等 config/loader.py 落地后再统一）
+    # 命令行覆盖（--set 那套等 config/loader.py 完成后再统一）
     if args.epochs is not None:
         cfg.setdefault("train", {})["epochs"] = args.epochs
     if args.batch_size is not None:

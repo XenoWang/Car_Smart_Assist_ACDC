@@ -1,11 +1,11 @@
 # Car Smart Assist
 
-面向复杂路况的单目驾驶辅助项目，输出能见度、天气属性、目标检测框，以及风险和驾驶提醒。
-当前可运行部分包括数据清洗、能见度模型、独立多标签天气模型、YOLO 检测和规则提示。
+这个项目用单目相机识别复杂路况，给出能见度、天气属性、目标框和风险提醒。
+目前能跑的部分有数据清洗、能见度模型、独立多标签天气模型、YOLO 检测和规则提示。
 
 ## 环境
 
-Python 3.12，使用项目 `.venv`。
+Python 3.12，用项目里的 `.venv`。
 
 ```powershell
 python -m venv .venv
@@ -21,7 +21,7 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements/requirements-dev.txt
 ```
 
-检查训练设备：
+查看训练设备：
 
 ```powershell
 .venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.cuda.is_available())"
@@ -46,7 +46,7 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\clean_data.py --config configs/data/cleaning_lost_and_found.yaml
 ```
 
-清洗输出损坏文件过滤清单，原文件保留。
+清洗会列出损坏文件，原文件不会被修改或删除。
 
 ## 训练
 
@@ -62,8 +62,8 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\train_weather.py --config configs/model/weather_enhanced.yaml
 ```
 
-增强配置引用原多标签模型，候选写入 `artifacts/checkpoints/weather_enhanced/`。
-默认续训；`--fresh` 在所选配置的输出目录开始新运行。
+增强配置引用原多标签模型，候选权重写到 `artifacts/checkpoints/weather_enhanced/`。
+默认在已有权重上继续训练；`--fresh` 在所选配置的输出目录里开一次新运行。
 
 检测：
 
@@ -79,8 +79,8 @@ python -m venv .venv
 .venv\Scripts\python.exe -X utf8 scripts\evaluate_weather.py --config configs/model/weather_enhanced.yaml --dataset calibration --compare-teacher
 ```
 
-`--compare-teacher` 使用同一批图片比较蒸馏原模型与候选。报告位于 `artifacts/reports/weather_enhanced/`。
-候选尚未切换为 pipeline 默认天气模型。
+`--compare-teacher` 用同一批图片比较作为蒸馏参照的原模型和增强候选。报告在 `artifacts/reports/weather_enhanced/`。
+候选还没有切换成 pipeline 的默认天气模型。
 
 官方天气测试及未见录制子集：
 
@@ -97,8 +97,8 @@ python -m venv .venv
 .venv\Scripts\python.exe -X utf8 -m pytest tests -q --basetemp artifacts/pytest-tmp
 ```
 
-推理结果包含 `visibility`、`weather`、`weather_warning`、`perception`、`advisory` 和 `skipped`。
-查看 `skipped` 可确认当前帧未运行的模块；距离和方向尚无预测结果。
+推理结果里有 `visibility`、`weather`、`weather_warning`、`perception`、`advisory` 和 `skipped`。
+看 `skipped` 能知道这一帧哪些模块没跑；距离和方向目前还没有预测结果。
 
 ## 配置
 

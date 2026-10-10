@@ -1,4 +1,4 @@
-"""Meaningful regression checks for box conversion, crowd deferral and four-way leakage."""
+"""检查框转换、crowd 图片暂不导出，以及四个划分之间是否有数据泄漏。"""
 
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ def write_detection_fixture(root: Path):
                 Image.fromarray(np.full((20, 30, 3), number + 10, np.uint8)).save(path)
                 raw_hashes[path] = hashlib.sha256(path.read_bytes()).hexdigest()
                 rows.append({"id": number, "file_name": relative, "width": 30, "height": 20})
-                # A valid negative frame must remain an empty label file.
+                # 一张合法的负样本帧，标签文件应为空。
                 if number != 2:
                     anns.append(
                         {
@@ -70,7 +70,7 @@ def write_detection_fixture(root: Path):
                         }
                     )
                 number += 1
-        # Add a crowd image with an additional normal object: the entire image must be deferred.
+        # 给 crowd 图片加一个普通目标；整张图仍应暂不导出。
         relative = f"fog/{source_split}/GOPR0000/crowd{source_split}_rgb_anon.png"
         path = acdc / "rgb_anon" / relative
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,4 +1,4 @@
-"""Train YOLO on the prepared fixed-seed training split; epoch selection reads val only."""
+"""在准备好的固定随机种子训练划分上训练 YOLO；选 epoch 只看验证集。"""
 
 from __future__ import annotations
 
@@ -65,8 +65,8 @@ def resolve_training_plan(
         raise ValueError("Existing model dataset/seed/classes changed; use --fresh")
     summary_path = source_run / "validation_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
-    # Unpickling a YOLO checkpoint imports Ultralytics, so configure its local
-    # settings before this read, not only before constructing the predictor.
+    # 反序列化 YOLO checkpoint 会导入 Ultralytics，所以要在这次读取之前就设好它的本地
+    # 配置，而不是只在构建 predictor 之前设。
     configure_yolo_environment(root)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     completed = int(payload.get("epoch", -1)) < 0
@@ -99,8 +99,8 @@ def resolve_training_plan(
             epochs_before_run=previous.get("epochs_before_run", 0),
         )
     else:
-        # Legacy completed checkpoints contain weights only. Continue from the
-        # trained best weights with a new optimizer, rather than the COCO model.
+        # 旧版已完成的 checkpoint 只含权重；续训从现有 best 权重开始，
+        # 优化器重新初始化，此路径不加载 COCO 预训练权重。
         best = checkpoint.parent / "best.pt"
         plan["checkpoint"] = best if best.is_file() else checkpoint
         train["epochs"] = extra or train["epochs"]

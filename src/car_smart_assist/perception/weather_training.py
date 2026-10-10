@@ -1,4 +1,4 @@
-"""Train the weather/illumination attribute model without scene leakage."""
+"""训练天气/光照属性模型，避免场景泄漏。"""
 
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def list_condition_images(
     acdc_root: Path, split: str, attributes: tuple[str, ...],
     invalid: set[str] | None = None,
 ) -> list[WeatherSample]:
-    """List ACDC development images; test is deliberately reserved for evaluation."""
+    """列出 ACDC 开发集图像；test 专门留给评估。"""
     if split not in ("train", "val"):
         raise ValueError("训练和选优只允许读取 ACDC 官方 train/val")
     return _acdc_split(acdc_root, split, attributes, invalid)
@@ -82,7 +82,7 @@ def list_condition_images(
 def split_by_sequence(
     records: list[WeatherSample], validation_fraction: float, seed: int
 ) -> tuple[list[WeatherSample], list[WeatherSample]]:
-    """Keep all frames from an ACDC weather sequence in one partition."""
+    """ACDC 同一天气序列的所有帧放在同一个划分里。"""
     grouped: dict[str, dict[str, list[WeatherSample]]] = defaultdict(lambda: defaultdict(list))
     for sample in records:
         grouped[sample.stratum][sample.group].append(sample)
@@ -122,7 +122,7 @@ def list_pixel_accurate_images(
     validation_scene: int,
     invalid: set[str] | None = None,
 ) -> tuple[list[WeatherSample], list[WeatherSample]]:
-    """Use filename metadata as multi-label targets and hold out one full scene."""
+    """用文件名元数据作多标签目标，并留出一整个场景。"""
     pattern = re.compile(
         r"scene(?P<scene>\d+)_(?P<illumination>day|night)_"
         r"(?P<condition>clear|fog\d+|rain\d+)_(?P<frame>\d+)\.png$",
@@ -181,7 +181,7 @@ def _sample_signature(samples: list[WeatherSample], size: tuple[int, int]) -> st
 
 
 class WeatherDataset(Dataset):
-    """Cache resized uint8 images and visual cues; read ZIP images without extraction."""
+    """缓存缩放后的 uint8 图像和视觉线索；直接读 ZIP 里的图像，不解压。"""
 
     def __init__(
         self, samples: list[WeatherSample], cfg: WeatherConfig, cache_file: Path
@@ -364,7 +364,7 @@ def train_weather(
     *,
     resume: bool = True,
 ) -> WeatherTrainResult:
-    """Train independent weather/light attributes using scene-safe ACDC and Pixel splits."""
+    """用按场景分组的 ACDC 和 Pixel 数据训练天气与光照属性。"""
     root = Path(project_root)
     train_cfg = cfg.train
     try:

@@ -1,4 +1,4 @@
-"""Default resume, explicit fresh, compatibility and history preservation."""
+"""默认续跑、显式从头开始、兼容性和历史记录保留。"""
 
 import hashlib
 import importlib.util

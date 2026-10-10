@@ -1,4 +1,4 @@
-"""Weather attribute labels, training, inference, and pipeline warning behavior."""
+"""天气属性标签、训练、推理，以及 pipeline 里的警告行为。"""
 
 from __future__ import annotations
 

@@ -18,7 +18,7 @@ cleaning:
     acdc_mask_validity: true       # 掩码是否全为 ignore、类别是否越界
     detection_annotations: true    # bbox 越界、零面积、引用不存在的图像
     kitti_triplets: true           # image / label / calib 三者是否齐全
-    duplicates_exact: true         # 精确重复（文件内容哈希）
+    duplicates_exact: true         # 精确重复（按文件内容哈希）
     duplicates_near: false         # 近重复（dHash），开销较大，默认关
     statistical_outliers: false    # sklearn 离群检测，默认关，见下方说明
 

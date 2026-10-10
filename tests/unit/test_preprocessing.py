@@ -20,14 +20,14 @@ class TestLostAndFoundCleaning:
         rgb_dir.mkdir(parents=True)
         labels_dir.mkdir(parents=True)
         images = []
-        # Black, white, low contrast, repeated and tiny images are all legitimate files.
+        # 黑图、白图、低对比度图、重复图和极小的图都是合法文件。
         for index, value in enumerate((0, 255, 127, 127)):
             path = rgb_dir / f"scene_{index}_leftImg8bit.png"
             Image.fromarray(np.full((8, 24, 3), value, np.uint8)).save(path)
             images.append(path)
         ignore = labels_dir / "scene_0_gtCoarse_labelIds.png"
         Image.fromarray(np.full((5, 6), 255, np.uint8)).save(ignore)
-        images.append(ignore)  # Different dimensions and all-ignore content do not imply damage.
+        images.append(ignore)  # 尺寸不同和内容全为 ignore 都不代表损坏。
         broken = rgb_dir / "broken_leftImg8bit.png"
         broken.write_bytes(images[0].read_bytes()[:20])
         broken_label = labels_dir / "broken_gtCoarse_labelIds.png"
@@ -116,7 +116,7 @@ class TestProbeImage:
         assert r["edge_density"] > 0.0
 
     def test_truncated_png_is_caught(self, tmp_path: Path):
-        """截断的 PNG 必须被判为不可用 —— 这是清洗的核心能力。"""
+        """截断的 PNG 必须被判为不可用——这是清洗的核心能力。"""
         p = tmp_path / "truncated.png"
         good = tmp_path / "good.png"
         Image.fromarray(
@@ -153,10 +153,10 @@ class TestProbeImage:
 
 
 class TestDimensionsAndDegeneracy:
-    """内容类检查的契约：只告警，不排除。
+    """内容类检查的约定：只告警，不排除。
 
-    这一组测试守住项目的核心安全约束 —— ACDC 的大雾/夜路图像
-    不能被当作「退化图」自动剔除。
+    这一组测试守住项目的核心安全约束——ACDC 的大雾/夜路图像
+    不能被当作“退化图”自动剔除。
     """
 
     CFG = {
@@ -185,10 +185,10 @@ class TestDimensionsAndDegeneracy:
         assert not rep.issues
         assert rep.status_of(r["path"]) is pp.SampleStatus.VALID
 
-    # --- 核心契约：内容异常不排除 ---
+    # --- 核心约定：内容异常不排除 ---
 
     def test_uniform_image_is_warning_not_excluded(self, tmp_image):
-        """纯色图会被标出，但**不能**被排除 —— 决定权留给人。"""
+        """纯色图会被标出，但**不能**被排除——决定权留给人。"""
         r = pp._probe_image((str(tmp_image("u.png", (320, 240), uniform=True)), True, True, 1))
         rep = self._run([r])
         assert any(i.severity is pp.Severity.WARNING for i in rep.issues)
@@ -212,7 +212,7 @@ class TestDimensionsAndDegeneracy:
     def test_foggy_low_contrast_image_not_excluded(self, tmp_path: Path):
         """模拟浓雾帧：整体亮、对比度低，但仍有微小结构。
 
-        方差会低于普通图，但不能被排除 —— 浓雾是 ACDC 的四个子集之一。
+        方差会低于普通图，但不能被排除——浓雾是 ACDC 的四个子集之一。
         """
         rng = np.random.default_rng(1)
         arr = np.full((240, 320, 3), 200.0)
@@ -236,7 +236,7 @@ class TestDimensionsAndDegeneracy:
         assert any("宽高比异常" in i.message for i in rep.issues)
 
     def test_size_variation_is_info_not_error(self, tmp_image):
-        """KITTI 天然多尺寸 —— 必须记 INFO，不能报成错误。"""
+        """KITTI 天然多尺寸——必须记 INFO，不能报成错误。"""
         rs = [
             pp._probe_image((str(tmp_image(f"s{i}.png", (320 + i, 240))), True, True, 1))
             for i in range(3)
@@ -250,7 +250,7 @@ class TestDimensionsAndDegeneracy:
     # --- 逃生阀：显式配置才允许自动排除 ---
 
     def test_severity_can_be_raised_to_error_explicitly(self, tmp_image):
-        """配置里显式写 error 时才排除 —— 保证这是有意为之而非默认行为。"""
+        """配置里显式写 error 时才排除——保证这是有意为之而非默认行为。"""
         cfg = {**self.CFG, "severity": {"low_std": "error"}}
         r = pp._probe_image((str(tmp_image("u.png", (320, 240), uniform=True)), True, True, 1))
         rep = self._run([r], cfg=cfg)
@@ -263,7 +263,7 @@ class TestDimensionsAndDegeneracy:
         assert rep.status_of(r["path"]) is pp.SampleStatus.SUSPECT
 
     def test_candidate_counts_recorded(self, tmp_image):
-        """候选数必须进 stats —— 报告要能回答「有多少张被标出来了」。"""
+        """候选数必须进 stats——报告要能回答“有多少张被标出来了”。"""
         rs = [
             pp._probe_image((str(tmp_image(f"c{i}.png", (320, 240), uniform=True)), True, True, 1))
             for i in range(3)
@@ -273,20 +273,20 @@ class TestDimensionsAndDegeneracy:
 
 
 class TestExclusionContract:
-    """整个模块的排除契约：只有「数据不可用」才进 invalid。"""
+    """整个模块的排除约定：只有“数据不可用”才进 invalid。"""
 
     def test_only_decode_failure_produces_error(self, tmp_path: Path):
         """汇总一遍：解码失败 → ERROR；内容异常 → 不产生 ERROR。"""
         rep = pp.CleaningReport()
 
-        # (a) 不可解码 —— 必须 ERROR
+        # (a) 不可解码——必须 ERROR
         broken = tmp_path / "broken.png"
         broken.write_bytes(b"\x89PNG\r\n\x1a\n" + b"junk" * 50)
         r_bad = pp._probe_image((str(broken), True, True, 1))
         if not r_bad["ok"]:
             rep.error("integrity", r_bad["path"], "无法解码")
 
-        # (b) 正常图 —— 不能 ERROR
+        # (b) 正常图——不能 ERROR
         good = tmp_path / "good.png"
         Image.fromarray(
             np.random.default_rng(0).integers(0, 256, (240, 320, 3), dtype=np.uint8)
@@ -539,9 +539,9 @@ class TestManifest:
         assert data["counts"]["valid"] == len(paths) - 2 - 1
 
     def test_manifest_valid_count_is_not_inverted(self, tmp_path: Path):
-        """回归测试：valid 计数绝不能是「非 valid」的数量。
+        """回归测试：valid 计数绝不能是“非 valid”的数量。
 
-        构造一个极端分布 —— 只有 1 张有问题、其余全部正常 ——
+        构造一个极端分布——只有 1 张有问题、其余全部正常——
         反转 bug 会把 valid 报成 1。
         """
         rep = pp.CleaningReport()

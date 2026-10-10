@@ -1,4 +1,4 @@
-"""Standalone YOLO model/training config; parameters live in configs/model."""
+"""独立的 YOLO 模型/训练配置；参数放在 configs/model。"""
 
 from __future__ import annotations
 

@@ -20,15 +20,15 @@ VISIBILITY_TEXT: dict[VisibilityLevel, str] = {
 
 # --- 能见度三档对应的风险等级 ---
 # DEGRADED 给 NOTICE 而不是 WARNING：它只要求「提高注意」，
-# 还没有到「必须做某个动作」的程度。区分这一点是为了让提示强度
-# 与真实风险匹配 —— 总是喊狼来了，真的危险时司机就不信了。
+# 还没到「必须做某个动作」的程度。区分这一点是为了让提示强度
+# 和真实风险匹配 —— 总喊狼来了，真的危险时司机就不信了。
 VISIBILITY_RISK: dict[VisibilityLevel, RiskLevel] = {
     VisibilityLevel.BLIND: RiskLevel.CRITICAL,
     VisibilityLevel.DEGRADED: RiskLevel.NOTICE,
     VisibilityLevel.VISIBLE: RiskLevel.NONE,
 }
 
-# --- 兜底文案：门控与感知都不可用时 ---
+# --- 兜底文案：门控和感知都不可用时 ---
 FALLBACK_TEXT = "系统无法判断路况，请立即接管车辆"
 
 # 文案长度上限（字符）。超过这个长度的提示在驾驶场景里读不完。
@@ -38,7 +38,7 @@ MAX_TEXT_CHARS = 30
 def render_visibility(level: VisibilityLevel) -> tuple[str, RiskLevel]:
     """能见度等级 -> (文案, 风险等级)。
 
-    未知等级退回保守文案，而不是返回空字符串 —— 空字符串会让下游
+    未知等级退回保守文案，而不是返回空字符串。空字符串会让下游
     「成功返回但内容为空」，比明确的兜底更危险。
     """
     text = VISIBILITY_TEXT.get(level)
@@ -66,10 +66,10 @@ def render_policy(decision: HandoverDecision) -> str:
 
 
 def check_wording(text: str) -> list[str]:
-    """检查一条文案是否违反措辞约束。返回违规说明列表。
+    """检查一条文案是否违反措辞约束，返回违规说明列表。
 
-    供测试与评测使用 —— 报告里「提示文案是否越权承诺」这一项
-    需要的是可编程的判据，而不是人工肉眼过一遍。
+    供测试与评测使用。报告里「提示文案是否越权承诺」这一项
+    需要的是可编程的判据，不能靠人工肉眼过一遍。
     """
     problems: list[str] = []
     if len(text) > MAX_TEXT_CHARS:

@@ -25,8 +25,8 @@ REF_SUFFIX = "_rgb_ref_anon.png"
 def list_ref_images(acdc_root: str | Path) -> list[Path]:
     """列出全部正常天气参考图。
 
-    这是 AE 的训练集 —— 它们是「清晰可见」的无标注样本，
-    用它们定义 normal 分布，才让重建误差具备判别力。
+    这是 AE 的训练集：它们是「清晰可见」的无标注样本。
+    用它们定义 normal 分布，重建误差才有判别力。
     """
     root = Path(acdc_root) / "rgb_anon"
     return sorted(p for p in root.rglob("*.png") if p.name.endswith(REF_SUFFIX))
@@ -47,8 +47,8 @@ def list_adverse_images(
 def read_rgb_image(path: str | Path, size: tuple[int, int] | None = None) -> np.ndarray:
     """读取 RGB uint8 图像；size 为 (H, W)，省略时保留原始分辨率。
 
-    缩放统一使用 BILINEAR，避免训练与评估的频率特征口径不一致。
-    读取异常交由调用方处理，文件句柄在返回前关闭。
+    缩放统一用 BILINEAR，避免训练与评估的频率特征口径不一致。
+    读取异常交给调用方处理，文件句柄在返回前关闭。
     """
     with Image.open(path) as image:
         rgb = image.convert("RGB")
@@ -98,36 +98,37 @@ def split_ref_indices(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """把参考图划成 train / val / calib / test 四份。
 
-    四个集合各自用途不同:
-        反复用同一套 calib 迭代（挑轮数、挑阈值、挑超参），calib 会被间接拟合 ——
-        这就是验证集泄漏。跑上十次之后，calib 上的指标已经不代表泛化能力了。
-        所以必须留一份**从头到尾不参与任何决策**的 test：
-        它只在最终报告里出现，你迭代一百次也污染不到它。
-        这不是洁癖，是「报告的指标要有意义」的最低条件。
+        四个集合用途不同:
+            反复用同一套 calib 迭代（挑轮数、挑阈值、挑超参），calib 会被间接拟合 ——
+            这就是验证集泄漏。跑上十次之后，calib 上的指标已经不代表泛化能力了。
+            所以必须留一份从始至终不参与任何决策的 test：
+            它只在最终报告里使用，不拿它来挑模型或调参数。
+            这样报告中的测试结果才有意义。
 
-为什么默认 fixed 而不是每轮重随机:
-        重随机会让两次运行的指标测在不同数据上，于是
-        「第二次比第一次好」无法判断是模型变好了，还是这次抽到的集合更容易。
-        迭代优化需要一个固定基准；对安全门控来说，阈值标定也必须稳定。
-        想达到「每张图都被测到」的效果，正确做法是 k 折交叉验证，
-        而不是每次换一套划分 —— 后者连可比性都丢了。
+    为什么默认 fixed 而不是每轮重随机:
+            重随机会让两次运行的指标测在不同数据上，于是
+            「第二次比第一次好」无法判断是模型变好了，还是这次抽到的集合更容易。
+            迭代优化需要一个固定基准；对安全门控来说，阈值标定也必须稳定。
+            想达到「每张图都被测到」的效果，正确做法是 k 折交叉验证，
+            而不是每次换一套划分 —— 后者连可比性都丢了。
 
-        mode='random' 仍然提供（每次用不同的种子），但只建议在
-        「不在乎跨运行可比性、只想让模型见过更多数据」时用，
-        且**不要**在这种模式下标定阈值。
+            mode='random' 仍然提供（每次用不同的种子），但只在
+            「不在乎跨运行可比性、只想让模型见过更多数据」时建议用，
+            且不要在这种模式下标定阈值。
 
-    Args:
-        mode: 'fixed' 用固定 seed（可复现、跨运行可比）；'random' 每次换种子。
-        groups: 每张图所属的组（通常是序列名）。**强烈建议传入。**
-            ACDC 的图像来自视频序列，相邻帧近乎重复。按图随机划分会把
-            某帧放进训练集、把它的邻居放进校准集 —— 等于校准集里混进了
-            训练样本的复制品，测出来的泛化能力是虚高的。
-            传入 groups 后按**整组**划分，同一序列不会跨集合。
-            None 表示按图划分（仅用于没有序列信息的数据）。
+        Args:
+            mode: 'fixed' 用固定 seed（可复现、跨运行可比）；'random' 每次换种子。
+            groups: 每张图所属的组（通常是序列名）。强烈建议传入。
+                ACDC 的图像来自视频序列，相邻帧近乎重复。按图随机划分会把
+                某帧放进训练集、把它的邻居放进校准集 —— 等于校准集里混进了
+                训练样本的复制品，测出来的泛化能力是虚高的。
+                传入 groups 后按整组划分，同一序列不会跨集合。
+                None 表示按图划分（仅用于没有序列信息的数据）。
 
-    Returns:
-        (train_idx, val_idx, calib_idx, test_idx)，均为**已排序**的索引数组。
-        排序是刻意的：缓存是按顺序 memmap 的，排序后的索引访问局部性更好。
+        Returns:
+            (train_idx, val_idx, calib_idx, test_idx)，均为已排序的索引数组。
+            排序是刻意的：缓存是按顺序 memmap 的，排序后的索引访问局部性更好。
+
     """
     if mode not in ("fixed", "random"):
         raise ValueError(f"未知 split_mode {mode!r}，可选: fixed | random")
@@ -231,7 +232,7 @@ def split_ref_indices(
         len(names), len(train_g), len(tr), len(val_g), len(va),
         len(calib_g), len(ca), len(test_g), len(te),
     )
-    # 组大小不均时比例会有偏差，实测出来而不是假装精确
+    # 组大小不均时比例会有偏差，用实测值，不假装精确
     actual = np.array([len(tr), len(va), len(ca), len(te)]) / max(n, 1)
     target = np.array([train_ratio, val_ratio, calib_ratio, test_ratio])
     if np.abs(actual - target).max() > 0.05:
@@ -248,7 +249,7 @@ def ensure_cache(
 ) -> Path | None:
     """确保磁盘缓存存在，返回它的路径（不返回数组）。cache_path 为 None 时返回 None。
 
-    单独抽出来是为了让**全量**参考图的缓存只构建一次，
+    单独抽出来是为了让全量参考图的缓存只构建一次，
     再由 train / validation / calibration 子集通过索引共享 —— 见 VisibilityImageDataset 的
     indices 参数。
 
@@ -276,13 +277,13 @@ class VisibilityImageDataset(Dataset):
     Args:
         paths: 图像路径列表（全量，与缓存的行一一对应）
         input_size: (H, W)，需与 AE 的 input_size 一致
-        cache_path: npy 缓存**路径**（不是数组）。传 None 则实时解码。
+        cache_path: npy 缓存路径（不是数组）。传 None 则实时解码。
             每个 worker 进程在首次访问时惰性打开自己的 memmap，
             因此数据集本身可以安全地被 pickle（只带一个字符串）。
         indices: 本数据集实际使用 paths 中的哪些行。None 表示全部。
             用于从同一份全量缓存切出 train / calibration 子集。
         augment: 训练时是否做轻微增强。
-            ⚠️ 只允许光度抖动，**不允许模糊、降对比度、加雾** ——
+            ⚠️ 只允许光度抖动，不允许模糊、降对比度、加雾 ——
             把退化当增强喂给 AE，等于教它「退化也是正常的」，判别力会被自己毁掉。
 
     Note:
@@ -316,7 +317,7 @@ class VisibilityImageDataset(Dataset):
             raise ValueError("augmentation.contrast_range 不能为负数")
         self.indices = list(indices) if indices is not None else None
         self.cache_path = Path(cache_path) if cache_path is not None else None
-        # 注意：这里是**每个进程各自打开**的，不是共享对象
+        # 注意：每个进程各自打开一份，不共享对象
         self._cache: np.ndarray | None = None
 
     def __getstate__(self) -> dict:
@@ -347,16 +348,16 @@ class VisibilityImageDataset(Dataset):
         else:
             img = read_rgb_image(self.paths[idx], self.input_size)
 
-        # 显式拷贝而非 ascontiguousarray：
+        # 这里显式拷贝，不用 ascontiguousarray：
         # memmap 是只读的，torch.from_numpy 会共享内存并发出
-        # 「non-writable tensor」警告；后续 div_ 又是原地操作，语义上不该写回缓存。
-        # 直接拷贝成连续 CHW float32，避免先分配 HWC float32 再复制排列。
+        # 「non-writable tensor」警告；后面的 div_ 又是原地操作，语义上不应该写回缓存。
+        # 直接拷贝成连续的 CHW float32，省掉先分配 HWC float32 再复制排列。
         x = torch.from_numpy(
             np.array(img.transpose(2, 0, 1), dtype=np.float32, order="C", copy=True)
         ).div_(255.0)
 
         if self.augment:
-            # 仅光度：轻微亮度/对比度抖动，模拟曝光差异，不改变「看得清」这一属性
+            # 只做光度变换：轻微亮度/对比度抖动，模拟曝光差异，不改变「看得清」这一属性
             x.sub_(0.5).mul_(float(torch.empty(1).uniform_(*self.contrast_range))).add_(0.5)
             x.add_(float(torch.empty(1).uniform_(*self.brightness_range))).clamp_(0.0, 1.0)
 

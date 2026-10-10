@@ -1,4 +1,4 @@
-"""YOLO detector adapter; boxes/categories are real predictions, distance/direction remain unknown."""
+"""YOLO 检测器适配层：框和类别是模型真实预测，距离和方向仍是未知。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from car_smart_assist.config.detection import resolve_yolo_device
 def configure_yolo_environment(project_root: Path) -> None:
     settings_dir = project_root / "artifacts/ultralytics_settings"
     settings_dir.mkdir(parents=True, exist_ok=True)
-    # Only this Python process and the project's artifact settings file are affected.
+    # 改动只影响当前这个 Python 进程和项目的产物配置文件。
     os.environ["YOLO_CONFIG_DIR"] = str(settings_dir)
 
 
@@ -93,7 +93,7 @@ class YoloDetectionPredictor:
         if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
             raise ValueError("YOLO pipeline input must be RGB uint8")
         args = self.cfg["inference"]
-        # PIL inputs are RGB. Ultralytics treats numpy inputs as BGR, so do not pass RGB arrays directly.
+        # PIL 输入是 RGB。Ultralytics 把 numpy 输入当 BGR 处理，所以不要把 RGB 数组直接传进去。
         result = self.model.predict(
             source=Image.fromarray(image),
             device=self.device,

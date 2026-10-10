@@ -47,14 +47,14 @@ class GateThresholds:
     # 也就是说重建误差与退化程度**系统性反相关**：雾和黑暗抹掉了高频细节，
     # 图像变得低秩、更容易重建，AE 反而重建得更好。
     #
-    # 后果是两条路都走不通：
-    #   · `z > z_blind` 永远不对退化图触发 —— 死规则
+    # 结果两条路都走不通：
+    # · `z > z_blind` 对退化图永远不触发 —— 死规则
     #   · 反过来用「z 低即退化」会命中真实浓雾（-1.58），
     #     而浓雾是 ACDC 四个合法子集之一，把它判成 BLIND 等于废掉整个子集
     #
     # 所以现在判定只依赖信息量特征，重建误差仍然计算并写进报告供人工观察，
-    # 但不参与决策。要重新启用需先证明它在新模型上具备判别力 ——
-    # 见 scripts/evaluate_visibility.py 输出的逐组 recon_z 分布。
+    # 但不参与决策。要重新启用，得先证明它在新模型上有判别力 ——
+    # 逐组 recon_z 分布见 scripts/evaluate_visibility.py 的输出。
     use_recon_z: bool = GATE_DEFAULTS["thresholds"]["use_recon_z"]
 
     @classmethod
@@ -78,7 +78,7 @@ class VisibilityVerdict:
     information: float = float("nan")
     recon_z: float = float("nan")
     degraded_confidence_multiplier: float = GATE_DEFAULTS["degraded_confidence_multiplier"]
-    # 供上游日志与人工复核：完整的打分明细
+    # 给上游日志和人工复核用：完整的打分明细
     score: VisibilityScore | None = None
 
     @property
@@ -115,8 +115,7 @@ class VisibilityGate:
 
     Args:
         thresholds: 判定阈值
-        require_calibration: 为 True 时，缺少零校准统计就拒绝给出 BLIND 判定
-            （只有信息量这一路信号时，误判代价由信息量单点承担，风险偏高）。
+        require_calibration: 为 True 时，缺少零校准统计就不给出 BLIND；信息量很低时按 DEGRADED 返回。
     """
 
     def __init__(
@@ -146,25 +145,25 @@ class VisibilityGate:
         t = self.thresholds
         info = score.information
         z = score.recon_z
-        has_cal = z == z  # NaN 检查：无校准时 z 为 NaN
+        has_cal = z == z  # NaN 检查：没有校准时 z 是 NaN
 
         triggered: list[str] = []
 
-        # --- BLIND 规则 1：信息量塌陷。这条与场景是否新奇无关 ---
+        # --- BLIND 规则 1：信息量塌陷。这条和场景是否新奇无关 ---
         if info < t.info_blind:
             triggered.append("info_low")
 
-        # --- BLIND 规则 2：极度异常 **且** 信息量已经偏低（双条件，缺一不可）---
-        # 加 info 条件的理由见模块头：高信息量的新奇场景不能被判看不见
+        # --- BLIND 规则 2：极度异常 **且** 信息量已经偏低（两个条件都要满足）---
+        # 同时检查 info，避免把信息量较高的新场景误判为看不见。
         #
-        # 默认不启用（t.use_recon_z=False），因为实测重建误差与退化反相关，
-        # 这条规则在真实数据上永远不触发 —— 详见 GateThresholds.use_recon_z 的说明
+        # 默认不启用（t.use_recon_z=False）。实测重建误差和退化反相关，
+        # 当前实测中这条规则未触发；详见 GateThresholds.use_recon_z 的说明。
         if t.use_recon_z and has_cal and z > t.z_blind and info < t.info_degraded:
             triggered.append("recon_extreme_low_info")
 
         if triggered:
             if not has_cal and self.require_calibration:
-                # 只有信息量信号可用，不足以判 BLIND —— 降级为 DEGRADED 并说明原因
+                # 只有信息量信号可用时，不足以判 BLIND —— 降级为 DEGRADED 并说明原因
                 return self._make(
                     VisibilityLevel.DEGRADED,
                     "信息量极低，但缺少零校准统计，保守降级为 DEGRADED；"

@@ -34,7 +34,7 @@ weather_classifier:
     pixel_accurate_zip: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark/rgb_left_8bit.zip
     pixel_accurate_validation_scene: 4
     pixel_accurate_calibration_scene: 3
-    pos_weight_cap: 1.0  # 已通过均衡采样强化雨样本，避免再次叠加过大正样本权重。
+    pos_weight_cap: 1.0  # 已通过均衡采样强化雨样本，避免再次叠加过大的正样本权重。
     enhanced:
       teacher_checkpoint: artifacts/checkpoints/weather_attributes/best.pt
       report_dir: artifacts/reports/weather_enhanced

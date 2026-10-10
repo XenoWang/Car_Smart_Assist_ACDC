@@ -1,4 +1,4 @@
-"能见度打分：重建误差 + 信息量特征。"
+"""能见度打分：重建误差加信息量特征。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=16)
 def _high_frequency_mask(height: int, width: int, cutoff: float) -> np.ndarray:
-    """缓存频域高频掩膜，避免每帧重新创建坐标网格与开方数组。"""
+    """缓存频域高频掩膜，省掉每帧重新创建坐标网格和开方数组。"""
     fy = (2.0 * np.fft.fftfreq(height))[:, None]
     fx = (2.0 * np.fft.fftfreq(width))[None, :]
     mask = np.hypot(fy, fx) > cutoff
@@ -43,14 +43,14 @@ def _high_frequency_mask(height: int, width: int, cutoff: float) -> np.ndarray:
 class InformationFeatures:
     """一帧的确定性信息量特征。
 
-    全部无参考（不需要真值），且每一维都能单独画分布做验证 ——
-    这是刻意选择的：当门控判错时，我们要能立刻指出是哪一维出了问题，
-    而不是面对一个 256 维黑箱潜向量无从下手。
+    全部无参考（不需要真值），而且每一维都能单独画分布做验证 ——
+    这是有意选的：门控判错时，我们要能马上说出是哪一维出了问题，
+    而不是对着一个 256 维黑箱潜向量无从下手。
     """
 
     contrast: float        # 灰度标准差，直接量对比度
-    entropy: float         # 灰度直方图熵，量灰度分布的丰富度
-    edge_density: float    # 梯度幅值超阈值的像素占比，量结构多寡
+    entropy: float         # 灰度直方图熵，量灰度分布有多丰富
+    edge_density: float    # 梯度幅值超过阈值的像素占比，量结构多少
     hf_ratio: float        # 高频能量占比（傅里叶），雾/模糊/黑暗都会压低它
 
     def to_dict(self) -> dict[str, float]:
@@ -67,8 +67,8 @@ def compute_information_features(
 ) -> InformationFeatures:
     """从 (H, W, 3) uint8 或 float[0,1] 图像算信息量特征。
 
-    实现在 numpy 上而非 torch：这些特征要为每一帧单独解释，
-    用 numpy 便于直接对照数值排查，也不需要 GPU。
+    实现在 numpy 上而不是 torch：这些特征要逐帧单独解释，
+    用 numpy 方便直接对着数值排查，也不需要 GPU。
     """
     a = img.astype(np.float32)
     if a.max() > 1.0:
@@ -78,17 +78,17 @@ def compute_information_features(
     # --- 对比度：灰度标准差 ---
     contrast = float(gray.std())
 
-    # --- 熵：直方图熵，与灰度分布是否丰富有关 ---
+    # --- 熵：直方图熵，看灰度分布是否丰富 ---
     hist, _ = np.histogram(gray, bins=256, range=(0.0, 1.0))
     p = hist.astype(np.float64) / max(1, hist.sum())
     p = p[p > 0]
     entropy = float(-(p * np.log2(p)).sum())
 
     # --- 边缘密度：梯度幅值超过阈值的像素占比 ---
-    # 用 np.gradient（中心差分）而非 Sobel：Sobel 的 3×3 核自带平滑，
-    # 会把高频噪声也一并抹掉，而这里要的恰恰是「还剩多少高频结构」。
-    # 阈值来自 scoring_cfg；默认 0.04 是 [0,1] 灰度量纲下的值（≈ 10/255，与 preprocessing.py 的
-    # 0-255 量纲阈值 10.0 等价 —— 两边量纲不同但物理含义一致）。
+    # 用 np.gradient（中心差分），不用 Sobel：Sobel 的 3×3 核自带平滑，
+    # 会把高频噪声一起抹掉，而这里要的正是「还剩多少高频结构」。
+    # 阈值来自 scoring_cfg；默认 0.04 是 [0,1] 灰度量纲下的值（≈ 10/255，和 preprocessing.py 的
+    # 0-255 量纲阈值 10.0 等价 —— 两边量纲不同，物理含义一致）。
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy)
     feature_cfg = (scoring_cfg or {}).get("features", {})
@@ -98,8 +98,8 @@ def compute_information_features(
     edge_density = float((mag > edge_threshold).mean())
 
     # --- 高频能量占比 ---
-    # 用径向掩膜把频谱分成低频(内 50% 半径)与高频(外 50%)两部分。
-    # 雾、雨、模糊、黑暗的共同效应就是高频塌陷 —— 这是四类退化里最一致的信号。
+    # 用径向掩膜把频谱分成低频（内 50% 半径）和高频（外 50%）两部分。
+    # 雾、雨、模糊、黑暗的共同效果就是高频塌陷 —— 四类退化里这是最一致的信号。
     f = np.fft.fft2(gray - gray.mean())
     power = np.abs(f) ** 2
     h, w = gray.shape
@@ -131,11 +131,11 @@ class VisibilityScore:
     """一帧的完整能见度打分。"""
 
     path: str
-    # 重建误差（原始值）与其相对正常天气分布的 z 分数
+    # 重建误差（原始值）和它相对正常天气分布的 z 分数
     recon_mean: float
     recon_p90_block: float
     recon_z: float
-    # 信息量特征与其归一化后的综合分 [0, 1]
+    # 信息量特征和归一化后的综合分 [0, 1]
     features: InformationFeatures
     information: float
 
@@ -154,23 +154,23 @@ class VisibilityScore:
 # 归一化：把各特征映射到可比的 [0,1]
 
 
-# 参考尺度。取值来自对 ACDC 全量的实测分位数（见 configs/model/visibility.yaml
+# 参考尺度。取值来自 ACDC 全量的实测分位数（见 configs/model/visibility.yaml
 # 的标定说明）。兼容默认值集中在 config/visibility.py，运行参数在 YAML 调整。
 #
 # ⚠️ 单位约定（这里踩过一次坑，务必看清）：
-#   compute_information_features 会先把图像归一化到 [0, 1] 再算特征，
-#   因此 **contrast 的量纲是 [0,1] 而不是 [0,255]**。
-#   ACDC 实测灰度标准差中位数约 61/255 ≈ 0.24，所以尺度取 0.25。
-#   早期版本误按 0-255 量纲填了 64.0，导致 contrast 归一化后恒为 ~0.004，
-#   几何平均被整体拽到接近 0 —— 所有图的信息量分数一起塌陷、阈值全线失效，
-#   而表面上不会报任何错。tests/unit/test_visibility.py 里有针对这一点的测试。
+# compute_information_features 先把图像归一化到 [0, 1] 再算特征，
+# 所以 contrast 的量纲是 [0,1]，不是 [0,255]。
+# ACDC 上实测灰度标准差中位数约 61/255 ≈ 0.24，因此尺度取 0.25。
+# 早期版本按 0-255 量纲把它填成了 64.0，contrast 归一化后恒为 ~0.004，
+# 几何平均被整体拉低到接近 0，所有图的信息量分数一起塌陷，阈值全线失效，
+# 但表面上看不出任何报错。tests/unit/test_visibility.py 里有针对这一点的测试。
 _FEATURE_SCALES: dict[str, float] = dict(SCORING_DEFAULTS["feature_scales"])
 
 
 def normalize_features(
     f: InformationFeatures, scales: dict[str, float] | None = None
 ) -> dict[str, float]:
-    """把各特征除以参考尺度并截断到 [0,1]。"""
+    """把各特征除以参考尺度，再截断到 [0,1]。"""
     scales = scales or _FEATURE_SCALES
     return {
         "contrast": min(1.0, f.contrast / scales["contrast"]),
@@ -180,20 +180,20 @@ def normalize_features(
     }
 
 
-# 信息量分数的默认聚合参数。改这里要同步重跑 scripts/evaluate_visibility.py
-# 重新标定 gate 阈值 —— 分数尺度变了，旧阈值全部失效。
+# 信息量分数的默认聚合参数。改这里要同步重跑 scripts/evaluate_visibility.py，
+# 重新标定 gate 阈值。分数尺度变了，旧阈值都不再适用。
 #
 # 权重分配的依据（逐特征实测，见 information_score 的 docstring）：
 #   contrast      0.40  雾 / 黑暗 / 遮挡 的主判据
 #   entropy       0.25  遮挡 / 黑暗
 #   edge_density  0.25  模糊的主判据（且分级良好：0.759→0.135）
-#   hf_ratio      0.10  仅作辅助。它**在轻度模糊时就饱和**（0.25~1.0 强度下
-#                       恒为 0.024），不具备分级能力，因此不给高权重
+# hf_ratio      0.10  仅作辅助。它在轻度模糊时就饱和（0.25~1.0 强度下
+# 恒为 0.024），不能分级，所以不给高权重
 _INFO_WEIGHTS: dict[str, float] = dict(SCORING_DEFAULTS["aggregation"]["weights"])
-# 广义平均的阶数：p<0 时趋近最小值
+# 广义平均的阶数：p<0 时结果趋近最小值
 _INFO_P: float = SCORING_DEFAULTS["aggregation"]["power"]
-# 单维下限。防止某一维取到接近 0 时在 p<0 的幂运算中绝对支配总分 ——
-# 那会让「一个饱和的噪声维度」把分数钉死，反而制造误报。
+# 单维下限。防止某一维接近 0 时在 p<0 的幂运算中完全主导总分，
+# 否则一个饱和的噪声维度就会把分数钉死，反而制造误报。
 # 取 0.10 的含义：任何一维最多只能把总分压到约 1/(0.1·w) 的量级。
 _INFO_EPS: float = SCORING_DEFAULTS["aggregation"]["feature_floor"]
 
@@ -207,8 +207,8 @@ def information_score(
 ) -> float:
     """把归一化后的特征合成单一信息量分数（加权广义平均）。
 
-    ⚠️ 这里用**广义平均且 p<0（趋近最小值）**，而不是算术或几何平均。
-    这是实测逼出来的修正，不是理论上更优雅的选择。
+    ⚠️ 这里用**广义平均且 p<0（趋近最小值）**，不用算术或几何平均。
+    实测发现其他平均方式会掩盖某一项特征过低的情况，所以这里采用负阶广义平均。
 
     M_p(x) = ( Σ w_i · x_i^p / Σ w_i )^(1/p)
 
@@ -225,22 +225,22 @@ def information_score(
         blur          0.904    0.929   0.135    0.024        0.228  ← 漏报
         occlusion     0.148    0.033   0.070    0.989        0.170  ← 漏报
 
-      模糊只杀高频、不动大尺度明暗，所以 contrast 纹丝不动，
-      几何平均被它撑住；遮挡则相反，覆盖区的**边界**是强边缘，
+      模糊只杀高频、不动大尺度明暗，所以 contrast 基本不变，
+      几何平均被它撑住；遮挡相反，覆盖区的**边界**是强边缘，
       hf_ratio 反而涨到 0.989，把对比度与熵的塌陷抵消掉。
 
-      每一种退化都至少有一维崩了，但加权平均把它们全部稀释掉了。
+      每种退化都至少有一维崩了，但加权平均把它们全稀释掉了。
       而「看不清」的定义就是「**只要**有一路信号说画面空了，就该报警」——
       这是「或」的逻辑，不是「与」的逻辑。广义平均 p<0 正是这个语义的平滑实现。
 
-    ⚠️ eps 下限不可省（默认 0.10）：
+    ⚠️ eps 下限不能省（默认 0.10）：
       p<0 的幂运算里，一维取到 0.024 会贡献 41.7，取到 0.001 会贡献 1000 ——
       单维就能把总分完全钉死。实测中 hf_ratio 在**轻度模糊**时就已经饱和到 0.024，
-      不加下限会导致「轻微模糊」与「完全看不见」得到同样的分数，
-      于是轻微模糊也被判 BLIND —— 把误报造了出来。
-      eps 的作用是限制任何单维的最大支配权，让分数保持分级能力。
+      不加下限会让「轻微模糊」和「完全看不见」得到同样的分数，
+      于是轻微模糊也被判 BLIND —— 误报就是这么来的。
+      eps 用来限制任何单维的最大支配权，让分数保持分级能力。
 
-    权重默认见 _INFO_WEIGHTS（contrast/entropy/edge_density 主导，hf_ratio 仅辅助）。
+    默认权重见 _INFO_WEIGHTS（contrast/entropy/edge_density 主导，hf_ratio 只做辅助）。
     """
     cfg = scoring_cfg or {}
     aggregate_cfg = cfg.get("aggregation", {})
@@ -272,7 +272,7 @@ class CalibrationStats:
 
     @classmethod
     def from_errors(cls, errors: Sequence[float] | np.ndarray) -> CalibrationStats:
-        """训练与手动校准共用统计口径，拒绝空数据及非有限误差。"""
+        """训练和手动校准共用统计口径，空数据和非有限误差都拒绝。"""
         values = np.asarray(errors, dtype=np.float64)
         if values.ndim != 1 or values.size == 0:
             raise ValueError("校准需要非空的一维重建误差序列")
@@ -294,7 +294,7 @@ class VisibilityScorer:
     Args:
         model: 已训练的 ConvAutoencoder
         calibration: 正常天气参考图上的误差分布。为 None 时 z 分数不可用，
-            只能看原始误差 —— 那种情况下不应该做判定，因此 gate 会拒绝工作。
+            仍会计算原始误差和信息量；gate 按缺少校准统计的规则处理。
         device: 推理设备
         input_size: 需与模型一致
         scoring_cfg: 特征尺度、聚合权重及分块误差参数；随训练检查点固定
@@ -324,15 +324,15 @@ class VisibilityScorer:
         cfg: dict[str, Any] | None = None,
         scoring_cfg: dict[str, Any] | None = None,
     ) -> VisibilityScorer:
-        """从训练 checkpoint 恢复。checkpoint 内嵌模型配置与校准统计。"""
+        """从训练 checkpoint 恢复。checkpoint 里嵌了模型配置和校准统计。"""
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         model_cfg = ckpt.get("model_cfg", cfg or {})
         model = build_autoencoder(model_cfg)
         model.load_state_dict(ckpt["model_state"])
         cal = ckpt.get("calibration")
         calibration = CalibrationStats(**cal) if cal else None
-        # 调用方显式提供的配置代表当前实验/部署策略，应优先于 checkpoint 快照。
-        # 未提供时再回退到训练时保存的值，保证独立加载仍可复现。
+        # 调用方显式传入的配置代表当前实验/部署策略，优先于 checkpoint 快照里的值。
+        # 未提供时再回退到训练时保存的值，独立加载也能复现。
         effective_scoring_cfg = (
             scoring_cfg if scoring_cfg is not None else ckpt.get("scoring_cfg", {})
         )
@@ -353,8 +353,8 @@ class VisibilityScorer:
 
     def _to_tensor_batch(self, images: Sequence[np.ndarray]) -> torch.Tensor:
         """一次完成 batch 堆叠、通道转换、类型转换和设备传输。"""
-        # np.stack 会生成可写的 uint8 连续数组；随后在一次 dtype/内存格式
-        # 转换中直接得到 NCHW float32，避免逐图分配张量再 torch.cat。
+        # np.stack 会生成可写的 uint8 连续数组，随后在一次 dtype/内存格式
+        # 转换中直接得到 NCHW float32，不用逐图分配张量再 torch.cat。
         batch = np.stack(images, axis=0)
         x = torch.from_numpy(batch).permute(0, 3, 1, 2).to(
             dtype=torch.float32, memory_format=torch.contiguous_format
@@ -399,7 +399,7 @@ class VisibilityScorer:
         return out
 
     def score_paths(self, paths: Sequence[str | Path]) -> list[VisibilityScore]:
-        """对文件路径逐个解码并打分。批量小、只用于调试或小规模评估。"""
+        """对文件路径逐个解码并打分。批量小，只用于调试或小规模评估。"""
         images: list[np.ndarray] = []
         ok_paths: list[str] = []
         for p in paths:

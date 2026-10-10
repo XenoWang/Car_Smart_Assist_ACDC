@@ -55,7 +55,7 @@ class TrainHistory:
 
 
 def resolve_device(spec: str = "auto") -> torch.device:
-    """auto 优先使用当前 PyTorch 可用的 CUDA GPU；显式 CUDA 不可用时明确报错。"""
+    """auto 优先用当前 PyTorch 可用的 CUDA GPU；显式指定 CUDA 但不可用时直接报错。"""
     spec = str(spec).strip().lower()
     automatic = spec == "auto"
     if automatic:
@@ -87,8 +87,8 @@ def resolve_device(spec: str = "auto") -> torch.device:
 def _atomic_save(payload: dict[str, Any], path: Path) -> None:
     """原子写检查点：先写临时文件再 rename。
 
-    直接覆盖原文件时若进程被中断（Ctrl-C、断电、OOM），会留下半个文件，
-    下次续训读它直接崩，且原始权重也一起没了 —— 训练几小时的成果就这么丢掉。
+    如果直接覆盖原文件时进程被中断（Ctrl-C、断电、OOM），会留下半个文件，
+    下次续训读它直接崩，原始权重也一起没了，训练几小时的成果就丢了。
     同目录下 rename 在 Windows 与 POSIX 上都是原子的。
     """
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,7 +102,7 @@ def apply_config_overrides(cfg: dict[str, Any], overrides: dict[str, Any]) -> di
 
     例：``{"model.kernel_sizes": [3, 5]}`` 会写进 ``cfg["model"]["kernel_sizes"]``。
 
-    放在这里而不是消融脚本里，是为了让**测试能用同一份实现**校验配置 ——
+    放在这里而不是消融脚本里，是为了让测试能用同一份实现校验配置。
     消融预设写错（比如改了 kernel_sizes 却没改 dilations）若不提前发现，
     要等跑到那一组、白等七分钟才崩。
     """
@@ -173,7 +173,7 @@ class VisibilityTrainer:
         # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
 
-        # 续训时模型结构必须与检查点一致，否则权重加载会报形状不匹配。
+        # 续训时模型结构必须与检查点一致，否则加载权重会报形状不匹配。
         # 先把检查点里的 model_cfg 读出来，以它为准构建模型。
         ckpt_model_cfg: dict[str, Any] | None = None
         if self.resume_path is not None:
@@ -194,10 +194,10 @@ class VisibilityTrainer:
                 )
             del head
 
-        # 续训时把生效的结构固化到 self.model_cfg。
-        # 不能只在建模型时用一下检查点的结构就丢掉 —— _make_payload 写的是
-        # self.model_cfg，若仍保留配置里的旧值，**下一次保存会把与权重不匹配的
-        # 结构写进检查点**，后续再续训就彻底错乱了。
+        # 续训时把生效的结构写回 self.model_cfg。
+        # 不能只在建模型时用一下检查点的结构就丢掉：_make_payload 写的是
+        # self.model_cfg，如果这里仍保留配置里的旧值，下一次保存就会把与权重不匹配的
+        # 结构写进检查点，后续再续训就彻底错乱了。
         # 同时 _build_datasets 读的是 self.model_cfg 里的 input_size，
         # 模型按检查点的尺寸训练，数据也必须按同一尺寸准备。
         if ckpt_model_cfg:
@@ -217,8 +217,8 @@ class VisibilityTrainer:
     ]:
         """构建 train / validation / calibration 数据集。
 
-        test 子集**不在这里构建** —— 它由评估脚本单独划分使用，
-        训练过程从不接触它，保证「只用于报告」的语义不被破坏。
+        test 子集不在这里构建，它由评估脚本单独划分使用，
+        训练过程不接触它，保证它只用于报告这一语义。
         """
         from car_smart_assist.perception.visibility.dataset import (
             ensure_cache,
@@ -240,12 +240,12 @@ class VisibilityTrainer:
         cache_name = dcfg.get("cache_path")
         cache_path = (self.root / cache_name) if cache_name else None
 
-        # 缓存按**全量**参考图构建一次（ensure_cache 只返回路径），
+        # 缓存按全量参考图构建一次（ensure_cache 只返回路径），
         # 各子集通过索引共享，在各自 worker 进程里惰性打开 memmap。
         cache_path = ensure_cache(paths, size, cache_path)
 
-        # ACDC 参考图来自视频序列，相邻帧近乎重复。按图随机划分会把一帧放进
-        # 训练集、它的邻居放进校准集 —— 校准集里混进了训练样本的复制品，
+        # ACDC 参考图来自视频序列，相邻帧几乎重复。按图随机划分会把一帧放进
+        # 训练集、把它的邻居放进校准集，校准集里混进了训练样本的复制品，
         # 测出来的泛化能力虚高。按序列整组划分才能反映真实的跨场景泛化。
         groups = [sequence_of(p) for p in paths] if dcfg.get("split_by_sequence", True) else None
         train_idx, val_idx, calib_idx, test_idx = split_ref_indices(
@@ -278,7 +278,7 @@ class VisibilityTrainer:
             json.dumps(split_payload, separators=(",", ":")).encode("utf-8")
         ).hexdigest()
 
-        # 只有训练子集做增强。验证和校准均使用原图，保持评价口径一致。
+        # 只有训练子集做增强。验证和校准都用原图，保持评价口径一致。
         tcfg = training_config(self.cfg.get("train", {}))
         train_ds = VisibilityImageDataset(
             paths, size, cache_path=cache_path, indices=train_idx,
@@ -343,7 +343,7 @@ class VisibilityTrainer:
     def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
-        # 模型和优化器的 load_state_dict 负责迁移，避免完整检查点先占用显存。
+        # 用模型和优化器的 load_state_dict 迁移，避免完整检查点先占显存。
         ckpt = torch.load(self.resume_path, map_location="cpu", weights_only=False)
 
         if ckpt.get("split_signature") != self.split_signature:
@@ -385,7 +385,7 @@ class VisibilityTrainer:
         """执行无监督训练（必要时先恢复已有检查点）。"""
         tcfg = training_config(self.cfg.get("train", {}))
         dcfg = self.cfg.get("data", {})
-        # test 子集不在训练里构建 —— 它只由评估脚本使用
+        # test 子集不在训练里构建 —— 只有评估脚本会用它
         train_ds, val_ds, calib_ds, _ = self._build_datasets()
 
         nw = int(dcfg.get("num_workers", 4))
@@ -419,7 +419,7 @@ class VisibilityTrainer:
         if self.resume_path is not None:
             start_epoch = self._restore(opt, sched)
             if start_epoch >= epochs:
-                # 续训时 epochs 的语义变为「再训多少轮」，而不是「总共多少轮」，
+                # 续训时 epochs 表示「再训多少轮」，不是「总共多少轮」，
                 # 否则从第 38 轮续训、epochs=40 就只剩 2 轮，等于什么都没做。
                 extra = tcfg.get("resume_extra_epochs")
                 extra = int(extra) if extra else epochs
@@ -448,9 +448,9 @@ class VisibilityTrainer:
             scaler.load_state_dict(self._pending_scaler_state)
         self.scaler = scaler
         clip = float(tcfg["grad_clip_norm"])
-        # 去噪自编码器：只给**输入**加噪，重建目标仍是无噪的原图。
-        # 这是重建类任务上最有效的正则化手段之一，且不像 weight decay 那样
-        # 把输出推向「保守的模糊均值」（那会恰好抹掉我们要检测的高频信号）。
+        # 去噪自编码器：只给**输入**加噪，重建目标还是无噪的原图。
+        # 这是重建类任务里最有效的正则化手段之一，而且不像 weight decay 那样
+        # 把输出推向「保守的模糊均值」（那正好会抹掉我们要检测的高频信号）。
         denoise_sigma = float(tcfg["denoise_sigma"])
         if denoise_sigma > 0:
             logger.info("去噪自编码器已启用：输入加高斯噪声 sigma=%.3f（目标保持干净）", denoise_sigma)
@@ -480,7 +480,7 @@ class VisibilityTrainer:
             n = 0
             for x in train_loader:
                 clean = x.to(self.device, non_blocking=True)
-                # 去噪目标：输入被污染，重建目标仍是 clean
+                # 去噪目标：输入被污染，重建目标还是 clean
                 noisy = clean
                 if denoise_sigma > 0:
                     noisy = (clean + denoise_sigma * torch.randn_like(clean)).clamp_(0.0, 1.0)
@@ -515,8 +515,8 @@ class VisibilityTrainer:
             else:
                 since_best += 1
 
-            # 每轮都写：last.pt 用于续训与崩溃恢复，best.pt 仅在创新低时更新。
-            # 写 last.pt 时若尚未有 best，先用当前轮顶替，保证 best.pt 始终可用。
+            # 每轮都写：last.pt 用于续训和崩溃恢复，best.pt 只在误差创新低时更新。
+            # 写 last.pt 时如果还没有 best，就先用当前轮顶上，保证 best.pt 一直可用。
             _atomic_save(self._make_payload(epoch, opt, sched, val_loss), last_path)
             if improved or not best_path.exists():
                 _atomic_save(self._make_payload(epoch, opt, sched, val_loss), best_path)
@@ -535,7 +535,7 @@ class VisibilityTrainer:
 
         self.history.seconds = time.time() - t0
 
-        # 回滚到验证集选出的最优权重，再用独立校准集计算零校准统计。
+        # 回滚到验证集选出的最优权重，再用独立校准集算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
         best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
         self.model.load_state_dict(best_payload["model_state"])
@@ -572,7 +572,7 @@ class VisibilityTrainer:
 
     @torch.no_grad()
     def _calibrate(self, loader: DataLoader) -> CalibrationStats:
-        """在留出的参考图上算重建误差分布 —— z 分数的零点与尺度。"""
+        """在留出的参考图上算重建误差分布，得到 z 分数的零点与尺度。"""
         self.model.eval()
         vals: list[float] = []
         for x in loader:

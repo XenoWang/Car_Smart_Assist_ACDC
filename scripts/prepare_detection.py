@@ -1,4 +1,4 @@
-"""Build fixed-seed train/val/calibration/test ACDC data for YOLO detection."""
+"""为 YOLO 检测构建固定随机种子的 train/val/calibration/test ACDC 数据。"""
 
 from __future__ import annotations
 

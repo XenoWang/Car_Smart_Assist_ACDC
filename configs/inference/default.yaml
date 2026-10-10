@@ -43,7 +43,7 @@ inference:
       - distance_error_curve    # 误差随距离变化的曲线，按天气分组
       - pr_curve                # 接管边界的 precision-recall 曲线 + 阈值扫描
       - failure_gallery         # 失败案例拼图
-      - qualitative_samples     # 好例子拼图（报告里不能只有坏例子）
+      - qualitative_samples     # 好例子拼图（报告里不能只放坏例子）
     compare_previous: true
 
   profiling:

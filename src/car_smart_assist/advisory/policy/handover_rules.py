@@ -32,7 +32,7 @@ def evaluate_handover(
     perception: PerceptionResult | None,
     config: PolicyConfig,
 ) -> HandoverDecision:
-    """无法可靠判断就请求接管；天气仅与能见度下降组合时辅助触发接管。"""
+    """无法可靠判断就请求接管；天气只在和能见度下降组合时辅助触发接管。"""
     risk = assess_risk(perception, config)
     reasons = [*risk.unavailable_reasons, *risk.diagnostics]
     unable_to_judge = not risk.reliable

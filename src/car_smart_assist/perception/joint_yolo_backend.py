@@ -1,4 +1,4 @@
-"""Ultralytics dataset/trainer integration for partially annotated joint detection."""
+"""Ultralytics 数据集和 trainer 的接入，用于部分标注的联合检测。"""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from car_smart_assist.perception.joint_yolo import (
 )
 from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
 
-# Importing Ultralytics initializes settings; keep that initialization in the project.
+# 导入 Ultralytics 时会初始化 settings，这份初始化要留在项目里。
 if not os.environ.get("YOLO_CONFIG_DIR"):
     configure_yolo_environment(Path(__file__).resolve().parents[3])
 from ultralytics.data.dataset import YOLODataset  # noqa: E402
@@ -38,7 +38,7 @@ def native_roi(row, manifest):
     with Image.open(row["roi_mask"]) as image:
         mask = np.isin(np.asarray(image), manifest["valid_roi_ids"])
     height, width = mask.shape
-    # Sparse semantic annotations may leave holes inside a positive instance box.
+    # 稀疏语义标注可能在正样本框内部留下空洞。
     for _, xc, yc, w, h in row["boxes"]:
         x1, x2 = int((xc - w / 2) * width), int(np.ceil((xc + w / 2) * width))
         y1, y2 = int((yc - h / 2) * height), int(np.ceil((yc + h / 2) * height))
@@ -129,8 +129,8 @@ class JointMetrics(DetMetrics):
 
 class DeploymentValidator(DetectionValidator):
     def postprocess(self, predictions):
-        # YOLO.predict uses one class per anchor. Validation must use the same
-        # class selection, rather than recover a lower-scoring second class.
+        # YOLO.predict 每个 anchor 只取一个类别。验证必须用同一个
+        # 类别选择方式，而不是再找回分数更低的第二个类别。
         outputs = ops.non_max_suppression(
             predictions,
             self.args.conf,
@@ -201,8 +201,8 @@ def joint_trainer(resume_state, foreground_exclusive=True):
     class Trainer(base):
         def build_dataset(self, img_path, mode="train", batch=None):
             if mode == "train":
-                # ROI must undergo the same geometric transform as the image.
-                # This version allows colour/blur augmentation, not spatial mixing.
+                # ROI 必须和图像做同样的几何变换。
+                # 这一版只允许颜色和模糊增强，不做空间混合。
                 for name in (
                     "mosaic",
                     "mixup",

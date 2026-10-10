@@ -1,4 +1,4 @@
-"""Separate YOLO validation, confidence calibration and final held-out test reporting."""
+"""把 YOLO 验证、置信度校准和最终留出测试报告分开做。"""
 
 from __future__ import annotations
 
@@ -96,7 +96,7 @@ def main() -> int:
                 for row, label in enumerate(metrics.box.ap_class_index):
                     curve = metrics.box.f1_curve[row]
                     best = int(np.argmax(np.where(metrics.box.px > 0, curve, -np.inf)))
-                    # A class with no true positives cannot be calibrated from this split.
+                    # 这一类在该划分里没有正确检出的正例，暂时没法校准阈值。
                     class_thresholds[model.names[int(label)]] = (
                         float(metrics.box.px[best])
                         if float(curve.max()) > 0
@@ -146,7 +146,7 @@ def main() -> int:
             report["evaluation_scope"] = (
                 "Per-source annotated classes only; Lost & Found ignores unannotated ROI"
             )
-            # Operating metrics must use the deployed per-class thresholds, not a new test optimum.
+            # 实际运行指标要用部署时每类的阈值，不能改用测试集上新找的最优阈值。
             per_class = {}
             for row, label in enumerate(metrics.box.ap_class_index):
                 name = model.names[int(label)]

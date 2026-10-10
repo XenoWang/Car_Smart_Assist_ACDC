@@ -1,4 +1,4 @@
-"能见度门控的自编码器与重建误差计算。"
+"""能见度门控用的自编码器和重建误差计算。"""
 
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ class ConvAutoencoder(nn.Module):
             )
         elif encoder_type == "plain":
             # 单尺度对照：全 4×4 卷积，结构与本模块早期版本一致，
-            # 仅用于消融，验证多尺度确实带来增益
+            # 仅用于消融，看多尺度是否真的带来增益
             self.encoder = nn.Sequential(
                 nn.Conv2d(in_channels, chans[0], 4, stride=2, padding=1), nn.GELU(),
                 nn.Conv2d(chans[0], chans[1], 4, stride=2, padding=1), nn.GELU(),
@@ -237,7 +237,7 @@ class ConvAutoencoder(nn.Module):
             self.post_latent = nn.Identity()
 
         # --- 解码器：镜像回去。保持单尺度反卷积。
-        # 解码只是重建，不承担判别职责；判别力来自编码器的多尺度表示。
+        # 解码器负责重建图像；当前门控的判断主要读取信息量特征。
         # 在这里也上多尺度会显著增加计算，对重建质量的增益却很有限。
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(chans[3], chans[3], 4, stride=2, padding=1), nn.GELU(),
@@ -253,7 +253,7 @@ class ConvAutoencoder(nn.Module):
         return self.to_latent(f.flatten(1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """自重建。输出与输入同尺寸（用 interpolate 兜底非 16 倍数的输入）。"""
+        """自重建。输出与输入同尺寸；输入尺寸不是 16 的倍数时用 interpolate 对齐。"""
         z = self.encode(x)
         y = self.from_latent(z).view(x.shape[0], self.latent_spatial_ch, *self.feat_hw)
         y = self.post_latent(y)
@@ -316,7 +316,7 @@ def reconstruction_error(
     """
     model.eval()
     recon = model(x)
-    # (B, 1, H, W)：先对通道取平均，保证误差量纲与颜色无关
+    # (B, 1, H, W)：先在 RGB 通道上取平均，得到每个像素的单通道误差。
     err = F.mse_loss(recon, x, reduction="none").mean(dim=1, keepdim=True)
     if err.shape[0] == 0:
         return []
@@ -334,10 +334,9 @@ def reconstruction_error(
 
 
 def effective_kernel_size(kernel_sizes: Sequence[int], dilations: Sequence[int]) -> tuple[int, ...]:
-    """各分支的有效感受野尺寸：k_eff = d*(k-1) + 1。
+    """各分支的有效感受野：k_eff = d*(k-1) + 1。
 
-    用于在报告与日志里说明「这一组配置实际看多大范围」，
-    避免只看 kernel_sizes 而误判感受野。
+    在报告和日志里用它说明这组配置实际看多大范围，避免只看 kernel_sizes 而判断错感受野。
     """
     return tuple(
         d * (k - 1) + 1 for k, d in zip(kernel_sizes, dilations, strict=True)

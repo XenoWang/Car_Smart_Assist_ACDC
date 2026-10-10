@@ -1,4 +1,4 @@
-"能见度门控的验证：召回率、误报率、单调性。"
+"""检查能见度门控：召回率、误报率、单调性。"""
 
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def load_images(paths: list[Path], size: tuple[int, int]) -> list[np.ndarray]:
-    """解码并缩放到指定尺寸，返回 uint8 数组列表。"""
+    """解码后缩放到指定尺寸，返回 uint8 数组列表。"""
     out: list[np.ndarray] = []
     for p in paths:
         try:
@@ -48,7 +48,7 @@ def load_images(paths: list[Path], size: tuple[int, int]) -> list[np.ndarray]:
 
 
 def summarize(verdicts) -> dict[str, Any]:
-    """把一组判定压成各档占比。"""
+    """把一组判定汇总成各档占比。"""
     n = max(len(verdicts), 1)
     counts = defaultdict(int)
     for v in verdicts:
@@ -58,7 +58,7 @@ def summarize(verdicts) -> dict[str, Any]:
         "visible": counts["visible"] / n,
         "degraded": counts["degraded"] / n,
         "blind": counts["blind"] / n,
-        "blocked": counts["blind"] / n,  # BLIND 即阻断感知
+        "blocked": counts["blind"] / n,  # BLIND 表示阻断感知
     }
 
 
@@ -70,7 +70,7 @@ def summarize(verdicts) -> dict[str, Any]:
 def eval_clean_control(
     scorer: VisibilityScorer, gate: VisibilityGate, refs: list[np.ndarray], n: int, seed: int
 ) -> dict[str, Any]:
-    """误报率：清晰的正常天气图有多少被拦下。期望接近 0。"""
+    """误报率：清晰的正常天气图有多少被拦下，期望接近 0。"""
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(refs), size=min(n, len(refs)), replace=False)
     scores = scorer.score_arrays([refs[i] for i in idx])
@@ -91,26 +91,26 @@ def eval_fit_quality(
     gate: VisibilityGate,
     n: int,
 ) -> dict[str, Any]:
-    """过拟合 / 欠拟合检查，并在**测试集**上给出最终误报率。
+    """检查过拟合 / 欠拟合，并在**测试集**上给出最终误报率。
 
-    四划分的角色必须分清：
-        train  模型拟合过      —— 指标最好，但不代表泛化
+    四个划分的角色要分清：
+        train  模型在这些数据上拟合过 —— 指标最好，但不代表泛化
         val    参与早停与权重选择
-        calib  只用于计算零校准统计
+        calib  只用来算零校准统计
         test   **不参与任何决定** —— 这里报出的数字才是可引用的
 
-    ⚠️ 必须直接测**原始图像**的重建误差，不能拿训练日志里的 train_loss 对比。
-    训练损失是在开了增强的数据上算的，而验证/测试损失没有增强；
+    ⚠️ 测重建误差必须直接用**原始图像**，不能拿训练日志里的 train_loss 对比。
+    训练损失算在开了增强的数据上，验证/测试损失没有增强；
     所以这里分别在原始图像上抽样，统一重算重建误差。
 
-    使用与 trainer 完全相同的划分函数，保证切分一致。
+    划分函数与 trainer 完全一致，保证切分相同。
     """
     from car_smart_assist.perception.visibility.dataset import (
         sequence_of,
         split_ref_indices,
     )
 
-    # 必须与 trainer 用完全相同的划分参数，否则各集合会错位
+    # 划分参数必须和 trainer 完全一致，否则各集合会错位
     groups = (
         [sequence_of(p) for p in ref_paths]
         if dcfg.get("split_by_sequence", True)
@@ -152,7 +152,7 @@ def eval_fit_quality(
     else:
         verdict = "⚠️ 测试集泛化差距明显，需检查模型容量与数据分布"
 
-    # 测试集上的误报率 —— 这是唯一没被任何决策污染过的数字
+    # 测试集误报率 —— 只有这个数字没被任何决策影响过
     te_verdicts = gate.judge_many(te_scores)
     te_fpr = summarize(te_verdicts)["blind"]
 
@@ -199,7 +199,7 @@ def eval_real_adverse(
     n: int,
     seed: int,
 ) -> dict[str, Any]:
-    """真实恶劣天气图：这些是「难但可用」，不应大量落入 BLIND。"""
+    """真实恶劣天气图：这些图「难但可用」，不应大量落进 BLIND。"""
     rng = np.random.default_rng(seed)
     result: dict[str, Any] = {}
     for cond in ("fog", "night", "rain", "snow"):
@@ -237,7 +237,7 @@ def eval_synthetic(
     n: int,
     seed: int,
 ) -> dict[str, Any]:
-    """合成退化：度量召回率与单调性。"""
+    """合成退化：度量召回率和单调性。"""
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(refs), size=min(n, len(refs)), replace=False)
     base = [refs[i] for i in idx]
@@ -258,8 +258,8 @@ def eval_synthetic(
                     "blind_rate": s["blind"],
                     "blocked_rate": s["blocked"],
                     "information_mean": float(info.mean()),
-                    # 一并记录 recon_z：退化越重它若反而越低，
-                    # 说明重建误差与退化反相关（见 gate.py 的 use_recon_z 说明）
+                    # 同时记录 recon_z：退化越重它反而越低时，
+                    # 说明重建误差与退化反相关（见 gate.py 里 use_recon_z 的说明）
                     "recon_z_median": float(np.nanmedian(zs)) if np.isfinite(zs).any() else None,
                 }
             )
@@ -269,7 +269,7 @@ def eval_synthetic(
                 np.nanmedian(zs) if np.isfinite(zs).any() else float("nan"),
             )
 
-        # 单调性：information 应随 severity 单调下降（等价于能见度单调变差）
+        # 单调性：information 随 severity 单调下降（等价于能见度单调变差）
         infos = [c["information_mean"] for c in curve]
         monotonic = all(
             infos[i] >= infos[i + 1] - 1e-6 for i in range(len(infos) - 1)
@@ -460,7 +460,7 @@ def main() -> int:
         "thresholds": vars(gate.thresholds),
     }
 
-    # 先做过拟合检查 —— 若模型本身没训好，后面的召回率数字都没有意义
+    # 先做过拟合检查 —— 模型本身没训好的话，后面的召回率数字都没有意义
     ref_paths = list_ref_images(acdc_root)
     report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)

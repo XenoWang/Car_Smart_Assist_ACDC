@@ -1,4 +1,4 @@
-"""Keep full-precision training state alongside Ultralytics inference checkpoints."""
+"""在 Ultralytics 推理检查点之外，另外保留全精度训练状态。"""
 
 from __future__ import annotations
 
@@ -76,8 +76,8 @@ def attach_training_state_callbacks(
             torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
 
     def finalize_state(trainer):
-        # Ultralytics strips optimizer/epoch from last.pt at completion. Bind the
-        # independent FP32 state to the final file so completed runs can resume too.
+        # Ultralytics 在训练完成时会从 last.pt 里删掉 optimizer/epoch。把
+        # 独立的 FP32 状态绑到最终文件上，这样跑完的训练也能续训。
         path = trainer.wdir / "last_training_state.pt"
         if not path.is_file():
             return
@@ -93,7 +93,7 @@ def attach_training_state_callbacks(
 
 
 def detection_trainer_for_resume(resume_state: dict | None):
-    """Lazy import after project-local Ultralytics settings have been initialized."""
+    """等项目本地的 Ultralytics 设置初始化完成后再延迟导入。"""
     from ultralytics.models.yolo.detect import DetectionTrainer
 
     class ProjectDetectionTrainer(DetectionTrainer):

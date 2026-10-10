@@ -1,11 +1,11 @@
 # =============================================================================
-# 常用命令入口
+# 常用命令
 # =============================================================================
-# Windows 提示：如果没装 make（或不在 Git Bash 里），可以
-#   (a) 直接执行 `python -m car_smart_assist.cli.main <子命令>`
+# Windows 没有 make 时，可直接运行 README 中列出的脚本。
+# (a) `python -m car_smart_assist.cli.main <子命令>` 是预留入口，当前还未实现。
 #   (b) 或安装 make：choco install make
-# 这里保留 Makefile 是为了让「项目怎么跑」有一个单一、可读的入口 ——
-# 面试时对方看 Makefile 三秒就能知道你项目的完整生命周期。
+# Makefile 汇总常用命令，具体可运行入口以 README 为准。
+# 部分训练、数据准备和导出目标还只是预留脚本。
 # =============================================================================
 
 PYTHON     ?= python
@@ -23,7 +23,7 @@ venv:  ## 创建虚拟环境（Python 3.12）
 	$(PYTHON) -m venv .venv
 
 .PHONY: install
-install:  ## 安装依赖：先 torch（官方 CUDA 索引），再运行时依赖（镜像源）
+install:  ## 安装依赖：先装 torch（官方 CUDA 索引），再装运行时依赖（镜像源）
 	$(PIP) install -r requirements/requirements-torch.txt
 	$(PIP) install -r requirements/requirements.txt -i $(MIRROR)
 	$(PIP) install -e . --no-deps
@@ -34,7 +34,7 @@ install-dev: install  ## 安装依赖 + 开发工具
 	pre-commit install
 
 .PHONY: freeze
-freeze:  ## 冻结精确版本，保证实验可复现
+freeze:  ## 冻结精确版本，方便复现实验
 	$(PIP) freeze > requirements/requirements.lock.txt
 
 .PHONY: check-env

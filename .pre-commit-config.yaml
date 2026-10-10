@@ -2,10 +2,10 @@
 #     pip install pre-commit
 #     pre-commit install
 #
-# 价值不在于「代码更漂亮」，而在于挡住后面这几类会真正污染实验结论的低级错误：
+# 这些检查主要用来拦住下面几类问题：
 #   - 误提交 .pt 权重或大数据文件
 #   - 手滑把 yaml 改坏导致配置静默回退默认值
-#   - 提交笔记本时带上了巨大的输出单元格
+# - 提交 notebook 时带上了巨大的输出单元格
 default_language_version:
   python: python3.12
 

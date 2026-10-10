@@ -1,4 +1,4 @@
-"能见度门控：无监督判断「这一帧是否已经看不清」。"
+"""能见度门控：无监督判断这一帧是不是已经看不清。"""
 
 from car_smart_assist.perception.visibility.autoencoder import (
     DEFAULT_KERNEL_SIZES,

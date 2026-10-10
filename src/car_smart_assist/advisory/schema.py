@@ -1,4 +1,4 @@
-"Stage 1 -> Stage 2 之间传递的结构化数据契约。"
+"""Stage 1 传给 Stage 2 的结构化数据。"""
 
 from __future__ import annotations
 
@@ -8,10 +8,10 @@ from typing import Any
 
 
 class RiskLevel(str, Enum):
-    """风险等级。决定提示强度。"""
+    """风险等级，决定提示强度。"""
 
     UNKNOWN = "unknown"    # 识别信息不足，无法评估场景风险
-    NONE = "none"          # 当前识别证据未触发风险规则，不代表道路安全
+    NONE = "none"          # 当前识别证据没触发风险规则，不代表道路安全
     NOTICE = "notice"      # 轻提示：注意即可
     WARNING = "warning"    # 需要动作：减速 / 提高注意
     CRITICAL = "critical"  # 必须立即接管
@@ -29,14 +29,14 @@ class TargetDirection(str, Enum):
 class TargetObject:
     """一个被检出的交通目标或道路杂物候选。
 
-    方向与距离是**独立**的两个属性：前车近该减速、来车近该注意会车，
-    两者的驾驶建议完全相反，因此方向未知时必须显式标注，
+    方向和距离是两个独立的属性：前车近该减速，来车近该注意会车，
+    两者的驾驶建议完全相反，所以方向未知时必须显式标注，
     不能默认成「前车」。
     """
 
     category: str
     direction: TargetDirection = TargetDirection.UNKNOWN
-    # 到**自车**的距离（米）。None 表示未测出 —— 不要用 0 表示未知。
+    # 到自车的距离（米）。None 表示未测出 —— 不要用 0 表示未知。
     distance_m: float | None = None
     # 距离估计的不确定度（米，1σ）。供下游做保守决策：不确定度大就该更保守。
     distance_uncertainty_m: float | None = None
@@ -51,13 +51,13 @@ class TargetObject:
 
 @dataclass
 class PerceptionResult:
-    """Stage 1 的输出。门控结果一并带上，因为下游需要知道这一帧的可信度。"""
+    """Stage 1 的输出。门控结果也带上，因为下游需要知道这一帧的可信度。"""
 
     # --- 门控（第一级判断：这一帧到底能不能用）---
     # 取值来自 perception.visibility.gate.VisibilityLevel
     visibility_level: str = "unknown"
     # 能见度门控提供的置信度乘子：默认 BLIND=0，DEGRADED=0.6，VISIBLE=1.0。
-    # 下游所有置信度都应乘上它，而不是各自重复判断能见度好不好。
+    # 下游所有置信度都要乘上它，不要各自重复判断能见度好不好。
     visibility_confidence_multiplier: float = 1.0
     # 触发门控判定的原因，便于追溯
     visibility_reasons: list[str] = field(default_factory=list)
@@ -65,7 +65,7 @@ class PerceptionResult:
     # --- 路况 ---
     road_condition: str | None = None
     road_condition_confidence: float = 0.0
-    # 独立天气模型的多标签输出。用于提醒；只有与其他信号组合时才参与接管判断。
+    # 独立天气模型的多标签输出。用于提醒；只有和其他信号组合时才参与接管判断。
     weather_attributes: tuple[str, ...] = ()
     weather_probabilities: dict[str, float] = field(default_factory=dict)
 
@@ -103,7 +103,7 @@ class PerceptionResult:
     def effective_confidence(self, raw: float) -> float:
         """把门控降级乘到某个原始置信度上。
 
-        统一在这里做，而不是让每个下游模块自己乘 ——
+        统一在这里做，不让每个下游模块自己乘 ——
         否则总有一处会忘记，而忘记的那处恰好是最需要保守的地方。
         """
         return float(raw) * self.visibility_confidence_multiplier
@@ -129,17 +129,17 @@ class PerceptionResult:
 
 @dataclass
 class AdvisoryResult:
-    """Stage 2 的输出：给司机的最终提示 + 可追溯的证据。"""
+    """Stage 2 的输出：给司机的最终提示和可追溯的证据。"""
 
     should_takeover: bool = False
     risk_level: RiskLevel = RiskLevel.NONE
-    # 给司机的文本。**任何情况下都不能为空** ——
+    # 给司机的文本。任何情况下都不能为空 ——
     # 失败时降级到模板文案，绝不允许「本帧无输出」。
     text: str = ""
-    # 触发这条建议的证据链。每条都应能被独立验证。
+    # 触发这条建议的证据链。每条都应该能被独立验证。
     evidence: list[str] = field(default_factory=list)
-    # 这条结果是哪个环节产生的：visibility_gate | policy | template | llm
-    # 用它区分「规则判定的」与「模型生成的」，出问题时能快速定位。
+    # 这条结果由哪个环节产生：visibility_gate | policy | template | llm
+    # 用它区分「规则判定的」和「模型生成的」，出问题时能快速定位。
     source: str = "unknown"
     # 感知策略的分级依据、未知项和接管决定；门控/兜底路径可为 None。
     policy_details: dict[str, Any] | None = None

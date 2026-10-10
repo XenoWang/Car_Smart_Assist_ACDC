@@ -43,10 +43,10 @@ from car_smart_assist.perception.visibility.trainer import (
 
 
 def structured_image(h: int = 144, w: int = 256, seed: int = 0) -> np.ndarray:
-    """造一张有明确结构的合成图（强边缘 + 多个灰度层次）。
+    """造一张结构明确的合成图（强边缘 + 多个灰度层次）。
 
-    用它而不是随机噪声：随机噪声的高频能量拉满，
-    无法代表「清晰场景」，会让特征测试失去意义。
+    不用随机噪声，是因为随机噪声的高频能量是满的，
+    代表不了「清晰场景」，拿它做特征测试没有意义。
     """
     rng = np.random.default_rng(seed)
     img = np.full((h, w, 3), 90, dtype=np.float32)
@@ -101,11 +101,11 @@ class TestMultiScaleBlock:
         assert y.shape[1] == 32
 
     def test_bottleneck_reduces_parameters(self):
-        """1×1 降维应当显著减少参数量 —— 这是它存在的理由。
+        """1×1 降维应当显著减少参数量 —— 这就是它存在的理由。
 
         这里全部用关键字参数：先前用位置参数写 `MultiScaleBlock(64,128,(3,5,7),2,True)`，
         后来在 stride 前面插入了 dilations，位置 2 就被当成空洞率，
-        报出与参数数量毫无关系的 TypeError。多参数构造一律用关键字。
+        报出与参数数量毫无关系的 TypeError。参数多的构造一律用关键字。
         """
         kw = {"kernel_sizes": (3, 5, 7), "stride": 2}
         with_b = sum(
@@ -134,9 +134,9 @@ class TestMultiScaleBlock:
 class TestCheckpointResume:
     """检查点保存与续训。
 
-    这里锁的是「每次训练都存档、有存档就接着训」这条要求。
-    测试不碰真实数据 —— VisibilityTrainer.__init__ 只建模型、不建数据集，
-    所以可以用临时目录完整验证存档/载入逻辑。
+    这里守住的是「每次训练都存档、有存档就接着训」。
+    测试不用真实数据 —— VisibilityTrainer.__init__ 只建模型、不建数据集，
+    所以用临时目录就能把存档/载入逻辑完整跑一遍。
     """
 
     def _cfg(self, tmp_path, **model_over):
@@ -231,7 +231,7 @@ class TestCheckpointResume:
         opt1 = torch.optim.AdamW(t1.model.parameters(), lr=1e-3)
         sched1 = torch.optim.lr_scheduler.CosineAnnealingLR(opt1, T_max=10)
 
-        # 把权重改成一个可识别的值，再额外走一步让优化器留下状态
+        # 把权重改成一个可识别的值，再额外走一步，让优化器留下状态
         with torch.no_grad():
             for p in t1.model.parameters():
                 p.add_(0.123)
@@ -299,9 +299,9 @@ class TestCheckpointResume:
 class TestAblationPresetsAreValid:
     """配置里的消融预设必须都能真的建出模型。
 
-    加这组测试的直接原因：`kernels_3_5` 预设只改了 kernel_sizes 没改 dilations，
+    加这组测试是因为：`kernels_3_5` 预设只改了 kernel_sizes 没改 dilations，
     长度对不上，消融跑到第 4 组才崩 —— 前面三组各花 7 分钟训练，
-    等于白跑了 25 分钟。配置错误应该在跑之前、用一次 import 的代价发现。
+    等于白跑 25 分钟。配置错误应该在开跑之前、用一次 import 的代价发现。
     """
 
     @staticmethod
@@ -355,8 +355,8 @@ class TestAblationPresetsAreValid:
 class TestSplitRefIndices:
     """train / val / calib / test 四划分。
 
-    这里守两个属性：
-    1. 四分互不重叠、并集为全集 —— 重叠会造成训练集泄漏
+    这里守两个性质：
+    1. 四分互不重叠、并集为全集 —— 重叠会让训练集泄漏
     2. fixed 模式可复现、random 模式每次不同 —— 前者是可比性的前提
     """
 
@@ -374,7 +374,7 @@ class TestSplitRefIndices:
         assert len(te) == 100
 
     def test_indices_sorted(self):
-        """排序让 memmap 访问局部性更好，也便于与缓存行对齐。"""
+        """排序让 memmap 访问的局部性更好，也便于与缓存行对齐。"""
         tr, va, ca, te = split_ref_indices(500, 0.8, 0.05, 0.05, 0.1, seed=1)
         for arr in (tr, va, ca, te):
             assert np.all(np.diff(arr) > 0)
@@ -391,7 +391,7 @@ class TestSplitRefIndices:
         assert not np.array_equal(a[0], b[0])
 
     def test_random_mode_varies(self):
-        """random 模式每次换种子 —— 这是被明确要求的行为，但代价是不可比。"""
+        """random 模式每次换种子 —— 这是明确要求的行为，代价是不可比。"""
         a = split_ref_indices(300, seed=42, mode="random")[0]
         b = split_ref_indices(300, seed=42, mode="random")[0]
         assert not np.array_equal(a, b), "random 模式应当每次不同"
@@ -407,7 +407,7 @@ class TestSplitRefIndices:
             split_ref_indices(100, 0.8, 0.1, 0.3)
 
     def test_test_split_is_disjoint_from_calib_used_for_thresholds(self):
-        """关键安全属性：测试集绝不能与校准集重叠。
+        """关键安全性质：测试集不能与校准集重叠。
 
         校准集参与阈值标定，若测试集与它重叠，报出的泛化指标就是乐观的。
         """
@@ -421,7 +421,7 @@ class TestSplitRefIndices:
     # --- 按序列整组划分 ---
 
     def test_groups_never_cross_splits(self):
-        """**核心属性**：同一序列的帧不能出现在两个集合里。
+        """**核心性质**：同一序列的帧不能出现在两个集合里。
 
         ACDC 参考图来自视频，相邻帧近乎重复。一旦跨集合，
         校准集里就有训练样本的复制品，泛化指标虚高。
@@ -487,9 +487,9 @@ class TestSplitRefIndices:
 class TestVisibilityDataset:
     """数据集与缓存。
 
-    这里锁的是一个真踩过的坑：DataLoader 用 spawn 启动 worker 时要 pickle 数据集，
-    若把 memmap 数组挂在数据集上，pickle 会内联整个数组（443MB），
-    在 Windows 上直接 `pickle data was truncated`。所以数据集只能持有路径。
+    这里守的是一个真踩过的坑：DataLoader 用 spawn 启动 worker 时要 pickle 数据集，
+    如果把 memmap 数组挂在数据集上，pickle 会把整个数组内联进去（443MB），
+    在 Windows 上直接 `pickle data was truncated`。所以数据集只持有路径。
     """
 
     def _make_cache(self, tmp_path, n=6, size=(16, 16)):
@@ -504,7 +504,7 @@ class TestVisibilityDataset:
         cache = self._make_cache(tmp_path)
         paths = [tmp_path / f"{i}.png" for i in range(6)]
         ds = VisibilityImageDataset(paths, (16, 16), cache_path=cache)
-        # 关键：不能有已打开的数组，否则 pickle 会内联数据
+        # 关键：不能有已打开的数组，否则 pickle 会把数据内联进去
         assert ds._cache is None
         assert isinstance(ds.cache_path, type(tmp_path))
 
@@ -566,16 +566,16 @@ def x_close(a: float, b: float, tol: float = 0.02) -> bool:
 
 
 class TestDilatedBranches:
-    """空洞卷积：扩大感受野的可选手段。"""
+    """空洞卷积：扩大感受野的一种可选做法。"""
 
     def test_dilation_applied_to_branches(self):
         blk = MultiScaleBlock(8, 9, kernel_sizes=(3, 3, 3), dilations=(1, 2, 3), stride=2)
         assert [c.dilation[0] for c in blk.branches] == [1, 2, 3]
 
     def test_dilation_keeps_branch_sizes_aligned(self):
-        """padding = d*(k-1)//2 让任意 (k,d) 组合输出同尺寸 —— 拼接的前提。
+        """padding = d*(k-1)//2 让任意 (k,d) 组合输出同尺寸 —— 这是拼接的前提。
 
-        若沿用常见的 k//2，dilation>1 时各分支尺寸会各不相同、拼接直接报错。
+        如果沿用常见的 k//2，dilation>1 时各分支尺寸会各不相同，拼接直接报错。
         """
         blk = MultiScaleBlock(8, 12, kernel_sizes=(3, 5, 7), dilations=(1, 2, 3), stride=2)
         h = blk.reduce(torch.randn(2, 8, 64, 64))
@@ -597,7 +597,8 @@ class TestDilatedBranches:
 
     def test_dilated_333_is_cheaper_than_357_same_rf(self):
         """3×3 配 (1,2,3) 的有效感受野是 3/5/7，与 3/5/7 普通卷积相同，
-        但参数量只有约三分之一 —— 这是用空洞替代大核的核心理由。"""
+        但参数量只有约三分之一 —— 这是用空洞替代大核的主要理由。
+        """
         big = MultiScaleBlock(64, 96, kernel_sizes=(3, 5, 7), dilations=(1, 1, 1), stride=2)
         dil = MultiScaleBlock(64, 96, kernel_sizes=(3, 3, 3), dilations=(1, 2, 3), stride=2)
         assert effective_kernel_size((3, 5, 7), (1, 1, 1)) == (3, 5, 7)
@@ -644,7 +645,7 @@ class TestPreLatentProjection:
     """瓶颈前的 1×1 压缩 —— 过拟合的根源就在这里。
 
     实测：不压时两个全连接占模型约 90% 参数（9.46M），
-    在 3605 张训练图上导致留出集误差比训练集高 45.6%。
+    在 3605 张训练图上，留出集误差比训练集高 45.6%。
     """
 
     def test_reduces_parameters_significantly(self):
@@ -680,10 +681,10 @@ class TestPreLatentProjection:
 
 
 class TestReconZDisabled:
-    """重建误差停用后，判定不得依赖它。
+    """重建误差停用后，判定不能再用它。
 
     实测重建误差与退化程度反相关（雾 -1.80 vs 清晰 -0.57），
-    两个方向都不成立，因此默认不参与判定。
+    两个方向都不成立，所以默认不参与判定。
     """
 
     def test_default_gate_ignores_recon_z(self):
@@ -739,9 +740,9 @@ class TestConvAutoencoder:
     def test_bottleneck_makes_multiscale_cheaper_than_plain(self):
         """多尺度 + 1×1 降维后，编码器参数量**反而低于**单尺度 4×4。
 
-        这是 bottleneck 的价值所在：5×5 / 7×7 的参数量本来是 3×3 的
+        这就是 bottleneck 的价值：5×5 / 7×7 的参数量本来是 3×3 的
         2.8 倍与 5.4 倍，但先把通道压到 out/3 再做多尺度卷积之后，
-        净效果比单尺度还省。所以「多尺度一定更重」是错的直觉。
+        净效果比单尺度还省。所以「多尺度一定更重」这个直觉是错的。
 
         只比 encoder 部分 —— 总参数被 to_latent/from_latent 两个全连接层
         （约 9.4M）主导，比 total 看不出编码器的差异。
@@ -758,7 +759,7 @@ class TestConvAutoencoder:
         assert ms < pl, f"含降维的多尺度编码器 {ms} 应少于单尺度 {pl}"
 
     def test_multiscale_without_bottleneck_is_much_heavier(self):
-        """关掉降维后多尺度明显更重 —— 这正是默认开启降维的理由。"""
+        """关掉降维后多尺度明显更重 —— 这就是默认开启降维的理由。"""
         cfg = {"input_size": (144, 256), "encoder_type": "multiscale"}
         with_b = sum(p.numel() for p in build_autoencoder({**cfg, "use_bottleneck": True}).encoder.parameters())
         without = sum(p.numel() for p in build_autoencoder({**cfg, "use_bottleneck": False}).encoder.parameters())
@@ -789,7 +790,7 @@ class TestReconstructionError:
         assert e.std_block >= 0
 
     def test_identical_to_itself_gives_zero_error(self):
-        """恒等映射应得 0 误差 —— 校验误差计算本身没写错。"""
+        """恒等映射应得 0 误差 —— 用来校验误差计算本身没写错。"""
 
         class Identity(torch.nn.Module):
             def forward(self, x):
@@ -846,7 +847,8 @@ class TestReconstructionError:
 class TestInformationFeatures:
     def test_structured_image_scores_high(self):
         """注意量纲：contrast 是 [0,1] 单位（函数内部会把图归一化），
-        不是 0-255 单位。真实 ACDC 图的典型值是 0.24 左右。"""
+        不是 0-255 单位。真实 ACDC 图的典型值在 0.24 左右。
+        """
         f = compute_information_features(structured_image())
         assert f.contrast > 0.05, f"contrast={f.contrast} 量纲疑似不对"
         assert f.entropy > 3
@@ -857,7 +859,7 @@ class TestInformationFeatures:
 
         早期版本 contrast 尺度按 0-255 量纲填了 64.0，而特征实际是 [0,1] 量纲，
         导致归一化后恒为 ~0.004，几何平均被整体拽到接近 0 ——
-        所有图的信息量分数一起塌陷、阈值全线失效，且不报任何错。
+        所有图的信息量分数一起塌陷、阈值全线失效，而且不报任何错。
         """
         from car_smart_assist.perception.visibility.scorer import (
             _FEATURE_SCALES,
@@ -960,7 +962,7 @@ class TestDegradation:
 
     @pytest.mark.parametrize("kind", ["fog", "darkness", "blur"])
     def test_information_decreases_with_severity(self, kind):
-        """退化越重，信息量越低 —— 单调性是门控可信度的前提。"""
+        """退化越重，信息量越低 —— 单调性是门控可信的前提。"""
         base = structured_image()
         scores = [
             information_score(compute_information_features(degrade(base, kind, s, seed=0)[0]))
@@ -998,7 +1000,7 @@ def make_score(info: float, z: float = 0.0) -> VisibilityScore:
 
 
 class TestGateContract:
-    """门控的判定契约。两条不对称的代价都在这里守住。
+    """门控的判定逻辑。两条不对称的代价都在这里守住。
 
     测试用的信息量取值**从阈值本身推导**，不写死数字 ——
     阈值会随标定变化（已经从 0.12/0.30 改到 0.34/0.50 一次），

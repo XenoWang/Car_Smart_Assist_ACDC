@@ -1,4 +1,4 @@
-"""Evaluate multi-label weather/illumination attributes on held-out data."""
+"""在留出数据上评测天气/光照多属性标签。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"端到端管线与数据契约的单元测试。"
+"""端到端管线与数据约定的单元测试。"""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from car_smart_assist.perception.visibility.scorer import VisibilityScore
 
 
 class StubScorer:
-    """返回预设打分的打分器桩。记录收到的图像尺寸，用于验证分辨率。"""
+    """返回预设打分的打分器桩。记录收到的图像尺寸，用来验证分辨率。"""
 
     def __init__(self, information: float = 0.9, recon_z: float = 0.0) -> None:
         self.information = information
@@ -75,7 +75,7 @@ class BrokenScorer(StubScorer):
 
 
 class StubPredictor:
-    """记录收到的图像尺寸，用于验证感知阶段拿到的是原图。"""
+    """记录收到的图像尺寸，用来验证感知阶段拿到的是原图。"""
 
     def __init__(self) -> None:
         self.seen_shapes: list[tuple[int, int]] = []
@@ -107,7 +107,7 @@ def frame(h: int = 720, w: int = 1280) -> np.ndarray:
 
 
 class TestGateBlocksPerception:
-    """BLIND 必须阻断感知 —— 这是管线最重要的行为。"""
+    """BLIND 必须阻断感知——这是管线里最重要的行为。"""
 
     def test_blind_skips_perception(self):
         predictor = StubPredictor()
@@ -141,7 +141,7 @@ class TestGateBlocksPerception:
         assert not r.perception.road_obstacle_detection_available
 
     def test_degraded_still_runs_perception(self):
-        """DEGRADED 只是降低置信度，不该阻断 —— 误报会让用户学会忽略它。"""
+        """DEGRADED 只降低置信度，不应阻断——误报会让用户学会忽略它。"""
         predictor = StubPredictor()
         r = make_pipeline(information=0.40, predictor=predictor).run(frame())
         assert r.blocked is False
@@ -192,7 +192,7 @@ class TestGateBlocksPerception:
 
 
 class TestResolutionSeparation:
-    """门控用降采样图，感知用原图 —— 混用会让距离估计整体偏掉。"""
+    """门控用降采样图，感知用原图——混用会让距离估计整体偏掉。"""
 
     def test_gate_receives_downsampled(self):
         scorer = StubScorer(information=0.95)
@@ -271,7 +271,7 @@ class TestInputHandling:
 
 
 
-# 数据契约
+# 数据约定
 
 
 
@@ -311,7 +311,7 @@ class TestSchemaContract:
         assert p.nearest_oncoming.distance_m == 80.0
 
     def test_direction_unknown_never_counted_as_leading(self):
-        """方向未知不能默认成前车 —— 两者驾驶建议完全相反。"""
+        """方向未知不能默认成前车——两者的驾驶建议完全相反。"""
         p = PerceptionResult(objects=[TargetObject("car", TargetDirection.UNKNOWN, 5.0)])
         assert p.nearest_leading is None
         assert p.nearest_oncoming is None

@@ -1,4 +1,4 @@
-"""Partial labels must not teach missing classes/regions as background."""
+"""部分标注不能把没标出的类别或区域当作背景来训练。"""
 
 from types import SimpleNamespace
 
@@ -43,7 +43,7 @@ def test_unannotated_class_and_roi_gradients_are_zero():
     predictions = torch.zeros(2, 3, 3, requires_grad=True)
     targets = torch.zeros_like(predictions)
     loss = MaskedClassificationLoss()
-    # ACDC supervises old classes; Lost & Found only obstacle class in known ROI.
+    # ACDC 监督旧类别；Lost & Found 在已知 ROI 内只监督障碍物类。
     loss.valid = torch.tensor(
         [
             [[True, True, False]] * 3,
@@ -51,12 +51,12 @@ def test_unannotated_class_and_roi_gradients_are_zero():
         ]
     )
     loss.weights = torch.ones(2, 1, 1)
-    targets[1, 2, 2] = 1  # Positive assignment outside sparse ROI must still train.
+    targets[1, 2, 2] = 1  # 稀疏 ROI 之外的正样本分配仍要参与训练。
     loss(predictions, targets).sum().backward()
     gradient = predictions.grad
     assert torch.count_nonzero(gradient[0, :, 2]) == 0
     assert torch.count_nonzero(gradient[1, :2, :2]) == 0
-    assert torch.all(gradient[1, 2, :2] > 0)  # Labelled cargo is not a traffic-category positive.
+    assert torch.all(gradient[1, 2, :2] > 0)  # 标注的货物不是交通类别正样本。
     assert gradient[1, 1, 2] == 0
     assert gradient[1, 0, 2] > 0 and gradient[1, 2, 2] < 0
 
