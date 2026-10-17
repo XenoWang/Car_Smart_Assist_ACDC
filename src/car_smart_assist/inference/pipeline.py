@@ -7,10 +7,13 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
+
+if TYPE_CHECKING:
+    from car_smart_assist.perception.weather_attention import WeatherAttentionPredictor
 
 from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
@@ -24,6 +27,7 @@ from car_smart_assist.perception.visibility.gate import (
 )
 from car_smart_assist.perception.visibility.scorer import VisibilityScorer
 from car_smart_assist.perception.weather import WeatherPrediction, WeatherPredictor
+from car_smart_assist.perception.weather_pyramid import WeatherPyramidPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +103,10 @@ class InferencePipeline:
         predictor: Any | None = None,
         gate_input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         cfg: dict[str, Any] | None = None,
-        weather_predictor: WeatherPredictor | None = None,
+        weather_predictor: WeatherPredictor
+        | WeatherPyramidPredictor
+        | WeatherAttentionPredictor
+        | None = None,
     ) -> None:
         self.scorer = scorer
         self.gate = gate or VisibilityGate()
@@ -127,6 +134,8 @@ class InferencePipeline:
         predictor: Any | None = None,
         require_visibility: bool = True,
         weather_checkpoint: str | Path | None = None,
+        weather_config: str | Path | None = None,
+        weather_loss: str = "focal",
     ) -> InferencePipeline:
         """按配置构建管线。
 
@@ -170,8 +179,59 @@ class InferencePipeline:
             logger.warning("未找到门控 checkpoint（%s），管线将不带能见度判断运行", ckpt)
 
         weather_predictor = None
+        default_route = root / "configs/model/weather_default.yaml"
+        if weather_config is None and default_route.is_file():
+            import yaml
+
+            try:
+                route = yaml.safe_load(default_route.read_text(encoding="utf-8"))["weather_default"]
+                if (
+                    not isinstance(route, dict)
+                    or set(route) != {"config", "checkpoint"}
+                    or any(not isinstance(value, str) or not value for value in route.values())
+                ):
+                    raise ValueError("需要 config 和 checkpoint 两条路径")
+                weather_config = route["config"]
+                if weather_checkpoint is None:
+                    weather_checkpoint = route["checkpoint"]
+            except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+                raise ValueError(f"默认天气路由无效：{exc}") from exc
         weather_config_path = root / "configs/model/weather_classifier.yaml"
-        if weather_config_path.is_file():
+        if weather_config is not None:
+            import yaml
+
+            from car_smart_assist.config.weather_attention import load_weather_attention_config
+            from car_smart_assist.config.weather_pyramid import load_weather_pyramid_config
+            from car_smart_assist.perception.weather_attention import WeatherAttentionPredictor
+
+            if weather_loss not in ("focal", "asl"):
+                raise ValueError("新天气候选只能选择 focal 或 asl")
+            weather_config_path = Path(weather_config)
+            if not weather_config_path.is_absolute():
+                weather_config_path = root / weather_config_path
+            weather_values = yaml.safe_load(weather_config_path.read_text(encoding="utf-8"))
+            attention_selected = "weather_attention" in weather_values
+            if attention_selected:
+                candidate_cfg = load_weather_attention_config(weather_config_path)
+                default_weather_ckpt = Path(candidate_cfg.checkpoint_root) / "best.pt"
+            else:
+                candidate_cfg = load_weather_pyramid_config(weather_config_path)
+                default_weather_ckpt = (
+                    Path(candidate_cfg.checkpoint_root) / weather_loss / "best.pt"
+                )
+            weather_ckpt = Path(weather_checkpoint) if weather_checkpoint else default_weather_ckpt
+            if not weather_ckpt.is_absolute():
+                weather_ckpt = root / weather_ckpt
+            if not weather_ckpt.is_file():
+                raise FileNotFoundError(f"天气权重不存在: {weather_ckpt}")
+            candidate_predictor = (
+                WeatherAttentionPredictor if attention_selected else WeatherPyramidPredictor
+            )
+            weather_predictor = candidate_predictor.from_checkpoint(
+                weather_ckpt, candidate_cfg, device
+            )
+            logger.info("天气候选已接入: %s", weather_ckpt)
+        elif weather_config_path.is_file():
             weather_cfg = load_weather_config(weather_config_path)
             weather_ckpt = (
                 Path(weather_checkpoint) if weather_checkpoint else Path(weather_cfg.checkpoint)
@@ -184,7 +244,10 @@ class InferencePipeline:
         elif weather_checkpoint is not None:
             raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
 
-        detection_paths = (root / "configs/model/yolo_detection.yaml", root / "configs/model/yolo_acdc_baseline.yaml")
+        detection_paths = (
+            root / "configs/model/yolo_detection.yaml",
+            root / "configs/model/yolo_acdc_baseline.yaml",
+        )
         for detection_config_path in detection_paths:
             if predictor is not None or not detection_config_path.is_file():
                 continue
@@ -296,9 +359,7 @@ class InferencePipeline:
                 r.timings_ms["weather"] = (time.perf_counter() - weather_started) * 1000.0
 
             if self.predictor is None:
-                r.skipped["perception"] = (
-                    "目标检测权重或感知 predictor 尚未接入"
-                )
+                r.skipped["perception"] = "目标检测权重或感知 predictor 尚未接入"
                 continue
 
             t1 = time.perf_counter()

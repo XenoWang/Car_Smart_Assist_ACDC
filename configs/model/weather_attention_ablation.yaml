@@ -1,0 +1,19 @@
+weather_attention_ablation:
+  base_config: configs/model/weather_attention.yaml
+  baseline_checkpoint: artifacts/checkpoints/weather_attention/best.pt
+  baseline_last: artifacts/checkpoints/weather_attention/last.pt
+  baseline_report: artifacts/reports/weather_attention/comparison.json
+  baseline_history: artifacts/reports/weather_attention/history.json
+  baseline_model_report: model_report.md
+  expected_baseline_epoch: 147
+  expected_seed: 42
+  training_epochs: 300
+  schedule_epochs: 500
+  experiments:
+    reduced_tuning:
+      backbone: {fine_tune_from: 13}
+    l2_sp:
+      train: {l2_sp: 0.0001}
+  checkpoint_root: artifacts/checkpoints/weather_attention_ablation
+  report_dir: artifacts/reports/weather_attention_ablation
+  report_file: model_report.md

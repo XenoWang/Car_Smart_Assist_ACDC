@@ -45,7 +45,9 @@ class WeatherSample:
 
 
 def _acdc_split(
-    acdc_root: Path, split: str, attributes: tuple[str, ...],
+    acdc_root: Path,
+    split: str,
+    attributes: tuple[str, ...],
     invalid: set[str] | None = None,
 ) -> list[WeatherSample]:
     if split not in ("train", "val", "test"):
@@ -70,7 +72,9 @@ def _acdc_split(
 
 
 def list_condition_images(
-    acdc_root: Path, split: str, attributes: tuple[str, ...],
+    acdc_root: Path,
+    split: str,
+    attributes: tuple[str, ...],
     invalid: set[str] | None = None,
 ) -> list[WeatherSample]:
     """列出 ACDC 开发集图像；test 专门留给评估。"""
@@ -183,17 +187,17 @@ def _sample_signature(samples: list[WeatherSample], size: tuple[int, int]) -> st
 class WeatherDataset(Dataset):
     """缓存缩放后的 uint8 图像和视觉线索；直接读 ZIP 里的图像，不解压。"""
 
-    def __init__(
-        self, samples: list[WeatherSample], cfg: WeatherConfig, cache_file: Path
-    ) -> None:
+    def __init__(self, samples: list[WeatherSample], cfg: WeatherConfig, cache_file: Path) -> None:
         if not samples:
             raise FileNotFoundError("没有可用于天气模型的图片")
         self.samples = samples
         self.cfg = cfg
         self.targets = np.asarray([sample.labels for sample in samples], dtype=np.float32)
         self.signature = hashlib.sha256(
-            (_sample_signature(samples, cfg.image_size)
-             + json.dumps(cfg.features, sort_keys=True)).encode()
+            (
+                _sample_signature(samples, cfg.image_size)
+                + json.dumps(cfg.features, sort_keys=True)
+            ).encode()
         ).hexdigest()
         # Windows 下正在读取的 memmap 不能覆盖；不同数据／线索配置使用独立缓存文件。
         cache_file = cache_file.with_name(f"{cache_file.stem}_{self.signature[:16]}.npy")
@@ -251,7 +255,9 @@ class WeatherDataset(Dataset):
                         cues = visual_cues(image, cfg)
                         cue_cache[index] = [cues[name] for name in FEATURE_NAMES]
                         if (index + 1) % 256 == 0:
-                            logging.getLogger(__name__).info("天气缓存进度：%d/%d", index + 1, len(samples))
+                            logging.getLogger(__name__).info(
+                                "天气缓存进度：%d/%d", index + 1, len(samples)
+                            )
                 image_cache.flush()
                 cue_cache.flush()
             finally:
@@ -283,8 +289,6 @@ def checkpoint_model_config(cfg: WeatherConfig) -> dict[str, Any]:
         "channels": list(cfg.channels),
         "features": dict(cfg.features),
     }
-    if cfg.rain_adapter_channels:
-        result["rain_adapter_channels"] = cfg.rain_adapter_channels
     return result
 
 
@@ -391,8 +395,9 @@ def train_weather(
         raise ValueError("学习率必须为正数，权重衰减和正样本权重上限必须为非负数")
 
     acdc_root = root / train_cfg["acdc_root"]
-    invalid = load_invalid_entries(root / train_cfg.get(
-        "acdc_cleaning_manifest", "data/processed/manifests/acdc.json"), root)
+    invalid = load_invalid_entries(
+        root / train_cfg.get("acdc_cleaning_manifest", "data/processed/manifests/acdc.json"), root
+    )
     official_train = list_condition_images(acdc_root, "train", cfg.attributes, invalid)
     official_val = list_condition_images(acdc_root, "val", cfg.attributes, invalid)
     if not official_train or not official_val:
@@ -410,9 +415,17 @@ def train_weather(
         if not pixel_archive.is_file():
             raise FileNotFoundError(f"Pixel Accurate RGB 压缩包不存在：{pixel_archive}")
         pixel_train, pixel_val = list_pixel_accurate_images(
-            pixel_archive, cfg.attributes, validation_scene,
-            load_invalid_entries(root / train_cfg.get("pixel_cleaning_manifest",
-                "data/processed/manifests/pixel_accurate_benchmark.json"), root),
+            pixel_archive,
+            cfg.attributes,
+            validation_scene,
+            load_invalid_entries(
+                root
+                / train_cfg.get(
+                    "pixel_cleaning_manifest",
+                    "data/processed/manifests/pixel_accurate_benchmark.json",
+                ),
+                root,
+            ),
         )
     train_samples = [*acdc_train, *pixel_train]
     val_samples = [*acdc_val, *pixel_val]
@@ -450,9 +463,7 @@ def train_weather(
         torch.manual_seed(seed)
         model = WeatherClassifier(cfg).to(device)
     positives = train_set.targets.sum(axis=0)
-    pos_weight = np.minimum(
-        (len(train_set) - positives) / np.maximum(positives, 1), pos_weight_cap
-    )
+    pos_weight = np.minimum((len(train_set) - positives) / np.maximum(positives, 1), pos_weight_cap)
     loss_fn = nn.BCEWithLogitsLoss(
         pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device)
     )
@@ -523,7 +534,9 @@ def train_weather(
                 {
                     "format_version": 2,
                     "model_config": model_cfg,
-                    "model_state": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+                    "model_state": {
+                        key: value.detach().cpu() for key, value in model.state_dict().items()
+                    },
                     "epoch": epoch,
                     "val_loss": val_loss,
                     "val_metrics": metrics,
@@ -536,7 +549,9 @@ def train_weather(
             {
                 "format_version": 2,
                 "model_config": model_cfg,
-                "model_state": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+                "model_state": {
+                    key: value.detach().cpu() for key, value in model.state_dict().items()
+                },
                 "optimizer_state": optimizer.state_dict(),
                 "epoch": epoch,
                 "best_epoch": best_epoch,
@@ -559,9 +574,7 @@ def train_weather(
     final_probabilities: list[np.ndarray] = []
     with torch.inference_mode():
         for images, cues, labels in val_loader:
-            logits = model(
-                images.to(device, non_blocking=True), cues.to(device, non_blocking=True)
-            )
+            logits = model(images.to(device, non_blocking=True), cues.to(device, non_blocking=True))
             final_targets.append(labels.numpy())
             final_probabilities.append(torch.sigmoid(logits.float()).cpu().numpy())
     best_metrics = attribute_metrics(

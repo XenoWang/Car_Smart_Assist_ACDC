@@ -1,0 +1,50 @@
+weather_pyramid:
+  attributes: [fog, rain, snow, night]
+  image_size: [384, 672]
+  channels: [24, 48, 96, 160, 224]
+  fpn_channels: 32
+  pool_grid: 3
+  dropout: 0.2
+  device: auto
+  data:
+    acdc_root: data/raw/acdc
+    acdc_splits: [train, val, test]  # 本实验重新四分，不沿用 ACDC 官方测试协议。
+    include_normal_references: true
+    acdc_cleaning_manifest: data/processed/manifests/acdc.json
+    pixel_zip: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark/rgb_left_8bit.zip
+    pixel_cleaning_manifest: data/processed/manifests/pixel_accurate_benchmark.json
+    cache_dir: data/processed/weather_pyramid
+    split_ratios: {train: 0.6, validation: 0.1, calibration: 0.1, test: 0.2}
+    seed: 42
+  train:
+    epochs: 100
+    force_epochs: true
+    resume_extra_epochs: 20
+    min_epochs: 15
+    patience: 12
+    batch_size: 16
+    num_workers: 0
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    gradient_clip: 5.0
+    amp: true
+    amp_dtype: auto  # CUDA 支持 BF16 就使用 BF16，否则由 GradScaler 处理 FP16。
+    brightness_range: [0.9, 1.1]
+    contrast_range: [0.9, 1.1]
+    horizontal_flip_probability: 0.5
+    rain_selection_weight: 2.0
+  loss:
+    attribute_weights: {fog: 1.0, rain: 1.0, snow: 1.0, night: 1.0}
+    focal: {gamma: 2.0, alpha: 0.5}
+    asl: {gamma_positive: 1.0, gamma_negative: 4.0, clip: 0.05}
+  evaluation:
+    batch_size: 32
+    threshold_steps: 99
+    threshold_tie_break: median
+    benchmark_iterations: 20
+    benchmark_warmup: 3
+    cpu_threads: 4
+    old_config: configs/model/weather_classifier.yaml
+    old_checkpoint: artifacts/checkpoints/weather_attributes/best.pt
+  checkpoint_root: artifacts/checkpoints/weather_pyramid
+  report_dir: artifacts/reports/weather_pyramid

@@ -1,0 +1,3 @@
+weather_default:
+  config: configs/model/weather_attention_a.yaml
+  checkpoint: artifacts/checkpoints/weather_attention_ablation/reduced_tuning/best.pt

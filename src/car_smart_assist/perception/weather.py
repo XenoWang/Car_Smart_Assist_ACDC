@@ -1,4 +1,4 @@
-"""独立的天气现象/光照多标签小模型和可解释视觉线索。"""
+"""公共天气输出和设备选择，以及历史 CNN 的只读推理接口。"""
 
 from __future__ import annotations
 
@@ -100,23 +100,10 @@ class WeatherClassifier(nn.Module):
         self.head = nn.Sequential(
             nn.Dropout(cfg.dropout), nn.Linear(in_channels + 16, len(cfg.attributes))
         )
-        self.rain_adapter = None
-        if cfg.rain_adapter_channels:
-            self.rain_adapter = nn.Sequential(
-                nn.Linear(in_channels + 16, cfg.rain_adapter_channels), nn.ReLU(inplace=True),
-                nn.Linear(cfg.rain_adapter_channels, 1),
-            )
-            # 零残差初始化保持原多标签模型的全部输出。
-            nn.init.zeros_(self.rain_adapter[-1].weight)
-            nn.init.zeros_(self.rain_adapter[-1].bias)
 
     def forward(self, images: torch.Tensor, cues: torch.Tensor) -> torch.Tensor:
         features = torch.cat((self.encoder(images), self.cue_encoder(cues)), dim=1)
-        logits = self.head(features)
-        if self.rain_adapter is not None:
-            rain = logits[:, 1:2] + self.rain_adapter(features)
-            logits = torch.cat((logits[:, :1], rain, logits[:, 2:]), dim=1)
-        return logits
+        return self.head(features)
 
 
 @dataclass(frozen=True)
@@ -156,7 +143,7 @@ def render_weather_warning(attributes: tuple[str, ...]) -> str | None:
     if rain:
         return "夜间降雨，路面可能湿滑，请减速" if night else "检测到降雨，路面可能湿滑，请减速"
     if snow:
-        return "检测到降雪，请减速并留足制动距离"
+        return "检测到降雪或积雪，请减速并留足制动距离"
     if night:
         return "夜间行车，请注意观察路况"
     return None
@@ -189,8 +176,8 @@ class WeatherPredictor:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if checkpoint.get("format_version") != 2:
             raise ValueError("天气检查点格式不兼容")
-        if checkpoint["model_config"].get("rain_adapter_channels", 0) != cfg.rain_adapter_channels:
-            raise ValueError("天气检查点的 rain_adapter_channels 与当前配置不一致")
+        if checkpoint["model_config"].get("rain_adapter_channels", 0) != 0:
+            raise ValueError("雨天残差增强权重已废弃，请使用当前天气模型")
         for key in ("attributes", "image_size", "channels", "features"):
             expected = (
                 list(getattr(cfg, key))

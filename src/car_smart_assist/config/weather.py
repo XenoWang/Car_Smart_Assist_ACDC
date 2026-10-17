@@ -1,4 +1,4 @@
-"""天气小模型配置。模型和阈值从 configs/model/weather_classifier.yaml 加载。"""
+"""历史 CNN 对照配置；当前默认模型由 weather_default.yaml 选择。"""
 
 from __future__ import annotations
 
@@ -21,7 +21,6 @@ class WeatherConfig:
     device: str
     features: dict[str, float]
     train: dict[str, Any]
-    rain_adapter_channels: int = 0
 
 
 def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
@@ -33,15 +32,18 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
     try:
         cfg = yaml.safe_load(source.read_text(encoding="utf-8"))["weather_classifier"]
         attributes = tuple(cfg["attributes"])
-        decision_thresholds = {name: float(value) for name, value in cfg["decision_thresholds"].items()}
+        decision_thresholds = {
+            name: float(value) for name, value in cfg["decision_thresholds"].items()
+        }
         size = tuple(cfg["image_size"])
         channels = tuple(cfg["channels"])
         features = dict(cfg["features"])
         train = dict(cfg["train"])
         dropout = float(cfg["dropout"])
-        rain_adapter_channels = cfg.get("rain_adapter_channels", 0)
     except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
         raise ValueError(f"天气模型配置无效：{exc}") from exc
+    if cfg.get("rain_adapter_channels", 0) != 0 or "enhanced" in train:
+        raise ValueError("雨天残差增强模型已废弃，请使用 weather_attention_swad.yaml")
     if attributes != ("fog", "rain", "snow", "night"):
         raise ValueError("天气属性顺序必须是 fog/rain/snow/night")
     if set(decision_thresholds) != set(attributes) or any(
@@ -70,8 +72,6 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
         raise ValueError("道路近似区域必须非空")
     if not isinstance(cfg["checkpoint"], str) or not isinstance(cfg["device"], str):
         raise ValueError("checkpoint/device 必须是字符串")
-    if type(rain_adapter_channels) is not int or rain_adapter_channels < 0:
-        raise ValueError("rain_adapter_channels 必须是非负整数")
     return WeatherConfig(
         attributes,
         decision_thresholds,
@@ -82,5 +82,4 @@ def load_weather_config(path: str | Path | None = None) -> WeatherConfig:
         cfg["device"],
         features,
         train,
-        rain_adapter_channels,
     )

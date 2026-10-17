@@ -1,0 +1,146 @@
+weather_attention:
+  attributes:
+  - fog
+  - rain
+  - snow
+  - night
+  image_size:
+  - 384
+  - 672
+  device: auto
+  backbone:
+    name: mobilenet_v3_large
+    weights: IMAGENET1K_V2
+    weights_file: artifacts/checkpoints/weather_attention/pretrained/mobilenet_v3_large-5c1a4163.pth
+    feature_indices:
+    - 6
+    - 12
+    - 15
+    feature_channels:
+    - 40
+    - 112
+    - 160
+    feature_strides:
+    - 8
+    - 16
+    - 32
+    fine_tune_from: 13
+    freeze_epochs: 5
+    mean:
+    - 0.485
+    - 0.456
+    - 0.406
+    std:
+    - 0.229
+    - 0.224
+    - 0.225
+  head:
+    dimension: 64
+    heads: 4
+    expansion: 2
+    dropout: 0.2
+  data:
+    acdc_root: data/raw/acdc
+    acdc_splits:
+    - train
+    - val
+    - test
+    include_normal_references: true
+    acdc_cleaning_manifest: data/processed/manifests/acdc.json
+    pixel_zip: data/external/pixel_accurate_depth_benchmark/pixel_accurate_depth_benchmark/rgb_left_8bit.zip
+    pixel_cleaning_manifest: data/processed/manifests/pixel_accurate_benchmark.json
+    cache_dir: data/processed/weather_pyramid
+    split_ratios:
+      train: 0.6
+      validation: 0.1
+      calibration: 0.1
+      test: 0.2
+    seed: 42
+  train:
+    epochs: 900
+    batch_size: 32
+    backbone_learning_rate: 1.0e-05
+    learning_rate: 0.0003
+    weight_decay: 0.001
+    warmup_epochs: 5
+    minimum_lr_ratio: 0.02
+    gradient_clip: 5.0
+    amp: true
+    channels_last: true
+    brightness_range:
+    - 0.9
+    - 1.1
+    contrast_range:
+    - 0.9
+    - 1.1
+    horizontal_flip_probability: 0.5
+    source_sampling_weights:
+      acdc: 0.85
+      pixel_accurate: 0.15
+    schedule_epochs: 900
+    swad:
+      enabled: true
+      n_converge: 3
+      n_tolerance: 6
+      tolerance_ratio: 0.3
+      start_epoch: 301
+    continuation:
+      checkpoint: artifacts/checkpoints/weather_attention_swad_readonly/original_300/last.pt
+      checkpoint_sha256: fc89792c9daadc5b62a1738c2343d8928cfa15acaab45c52e0cc75724bf2dd9e
+      single_best: artifacts/checkpoints/weather_attention_swad_readonly/original_300/single_best.pt
+      single_best_sha256: 89e95a2683a2720ea6067562bd25367dae22fb03f6f30ee7c2aa75e0afd0bbaf
+      source_epoch: 300
+      additional_epochs: 600
+      start_factor: 0.3645090160891455
+  loss:
+    attribute_weights:
+      fog: 1.0
+      rain: 1.0
+      snow: 1.0
+      night: 1.0
+    asl:
+      gamma_positive: 1.0
+      gamma_negative: 4.0
+      clip: 0.05
+  evaluation:
+    batch_size: 64
+    threshold_steps: 99
+    selection_weights:
+      fog: 2.0
+      rain: 2.0
+      snow: 1.0
+      night: 1.0
+    ap_selection_fraction: 0.5
+    benchmark_iterations: 30
+    benchmark_warmup: 5
+    cpu_threads: 4
+    old_config: configs/model/weather_classifier.yaml
+    old_checkpoint: artifacts/checkpoints/weather_attributes/best.pt
+    asl_config: configs/model/weather_pyramid.yaml
+    asl_checkpoint: artifacts/checkpoints/weather_pyramid/asl/best.pt
+    attention_references:
+      reduced_tuning:
+        config: artifacts/reports/weather_attention_ablation/reduced_tuning/resolved_config.yaml
+        checkpoint: artifacts/checkpoints/weather_attention_ablation/reduced_tuning/best.pt
+      baseline_147:
+        config: configs/model/weather_attention.yaml
+        checkpoint: artifacts/checkpoints/weather_attention/best.pt
+      previous_single_300:
+        config: configs/model/weather_attention_swad.yaml
+        checkpoint: artifacts/checkpoints/weather_attention_swad_readonly/original_300/single_best.pt
+      previous_swad_300:
+        config: configs/model/weather_attention_swad.yaml
+        checkpoint: artifacts/checkpoints/weather_attention_swad_readonly/original_300/swad.pt
+    summary_file: model_report.md
+    summary_tag: WEATHER_SWAD_EXTEND_600
+  checkpoint_root: artifacts/checkpoints/weather_attention_swad_extend_600
+  report_dir: artifacts/reports/weather_attention_swad_extend_600
+  report_file: artifacts/reports/weather_attention_swad_extend_600/REPORT.md
+weather_extension:
+  candidate: swad
+  reference: reduced_tuning
+  require_beating_single_best: true
+  min_validation_gain: 1.0e-12
+  fallback_config: configs/model/weather_attention_a.yaml
+  fallback_checkpoint: artifacts/checkpoints/weather_attention_ablation/reduced_tuning/best.pt
+  readonly_archive: artifacts/checkpoints/weather_attention_swad_readonly/extend_600

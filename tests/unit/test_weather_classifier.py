@@ -61,6 +61,22 @@ def small_config(*, epochs: int = 1):
     )
 
 
+@pytest.mark.parametrize("retired", ["rain_adapter_channels", "enhanced"])
+def test_retired_rain_adapter_configuration_is_rejected(tmp_path, retired):
+    import yaml
+
+    original = Path(__file__).resolve().parents[2] / "configs/model/weather_classifier.yaml"
+    values = yaml.safe_load(original.read_text(encoding="utf-8"))
+    if retired == "rain_adapter_channels":
+        values["weather_classifier"][retired] = 8
+    else:
+        values["weather_classifier"]["train"][retired] = {}
+    path = tmp_path / "retired.yaml"
+    path.write_text(yaml.safe_dump(values), encoding="utf-8")
+    with pytest.raises(ValueError, match="已废弃"):
+        load_weather_config(path)
+
+
 def write_dataset(root: Path, cfg) -> None:
     for attr_index, condition in enumerate(cfg.attributes):
         for split, count in (("train", 2), ("val", 1)):
@@ -257,7 +273,10 @@ def test_pipeline_uses_weather_only_as_auxiliary_with_degraded_visibility():
     assert result.weather_warning is not None
     assert result.advisory.should_takeover is True
     assert result.advisory.policy_details["unable_to_judge"] is False
-    assert "weather_visibility_auxiliary_handover" in result.advisory.policy_details["risk"]["triggered"]
+    assert (
+        "weather_visibility_auxiliary_handover"
+        in result.advisory.policy_details["risk"]["triggered"]
+    )
 
 
 def test_adverse_weather_and_degraded_visibility_jointly_request_handover():
@@ -282,7 +301,10 @@ def test_adverse_weather_and_degraded_visibility_jointly_request_handover():
     assert result.weather_warning is not None
     assert result.advisory.should_takeover is True
     assert result.advisory.policy_details["unable_to_judge"] is False
-    assert "weather_visibility_auxiliary_handover" in result.advisory.policy_details["risk"]["triggered"]
+    assert (
+        "weather_visibility_auxiliary_handover"
+        in result.advisory.policy_details["risk"]["triggered"]
+    )
 
 
 def test_missing_perception_still_requests_takeover_independently_of_weather():
@@ -297,7 +319,7 @@ def test_missing_perception_still_requests_takeover_independently_of_weather():
             )
 
     result = weather_pipeline(WeatherStub()).run(np.zeros((32, 48, 3), dtype=np.uint8))
-    assert result.weather_warning == "检测到降雪，请减速并留足制动距离"
+    assert result.weather_warning == "检测到降雪或积雪，请减速并留足制动距离"
     assert result.advisory.should_takeover
     assert result.advisory.risk_level is RiskLevel.UNKNOWN
     assert "perception" in result.skipped

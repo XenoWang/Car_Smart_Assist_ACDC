@@ -22,7 +22,7 @@ rgb_anon/{fog,rain,snow,night}/{train,val,test}/{sequence}/*_rgb_anon.png
 rgb_anon/{fog,rain,snow,night}/{train_ref,val_ref,test_ref}/{sequence}/*_rgb_ref_anon.png
 ```
 
-主条件目录用于天气标签；参考图用于能见度重建训练。
+主条件目录用于天气标签；白天正常参考图用于能见度训练，也作为四属性天气的明确负样本，与对应恶劣图保持同组。
 GOPRxxxx 与 GP01xxxx 等章节属于同一录制组，划分时整体处理。
 语义标签使用 Cityscapes 19 类；检测框按配置中的八类映射导出。
 ACDC 不提供本项目需要的积水深度、雪厚、米制可见距离、真实接管行为和单目目标距离真值。
@@ -71,5 +71,5 @@ gtCoarse/{train,test}/{scene}/
 invalid 只表示确认损坏的项；suspect 保留。原始图像、标签和 ZIP 不修改。
 ZIP 损坏项以 `archive::member` 标识。
 
-天气缓存位于 `data/processed/weather/`。检测准备入口为 `scripts/prepare_detection.py`，输出位置由对应数据 YAML 指定。
+当前天气模型缓存及固定四分清单位于 `data/processed/weather_pyramid/`；`data/processed/weather/` 是历史 CNN 的缓存。检测准备入口为 `scripts/prepare_detection.py`，输出位置由对应数据 YAML 指定。
 标签与输出字段见 [标签规范](label_spec.md)，运行命令见 [README](../README.md)。

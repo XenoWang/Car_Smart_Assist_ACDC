@@ -21,8 +21,7 @@ Cityscapes 上的预训练权重可以直接复用，19 类也是分割领域常
 
 ## 2. 天气现象与光照属性标签
 
-目前使用已经训练的独立模型 `perception/weather.py`；Stage 1 的旧 `road_condition` 头已禁用，
-不再另行训练一套天气分类。属性顺序与推理阈值以 `configs/model/weather_classifier.yaml` 为准。
+当前使用 `perception/weather_attention.py` 的独立属性注意力模型，默认路由在 `configs/model/weather_default.yaml`，训练参数在 `configs/model/weather_attention_swad.yaml`。Stage 1 的旧 `road_condition` 头已禁用；不另行训练一套天气分类。属性顺序由配置校验，四个推理阈值读取已完成独立校准的检查点。
 
 | 分组 | 属性 | 向量位置 | 含义 |
 |------|------|----------|------|
@@ -32,7 +31,7 @@ Cityscapes 上的预训练权重可以直接复用，19 类也是分割领域常
 | 光照 | night | 3 | 夜间光照属性，可与前三项共存 |
 
 固定向量顺序为 `[fog, rain, snow, night]`。每一位是独立的 0/1 标签，训练使用
-`BCEWithLogitsLoss`，推理分别使用 sigmoid 和各属性阈值；概率不要求加起来等于 1。
+ASL，SWAD 用验证 BCE 监测谷底；推理分别使用 sigmoid 和各属性阈值，分数不要求加起来等于 1。
 例如夜雾为 `[1, 0, 0, 1]`，夜雨为 `[0, 1, 0, 1]`。这些是属性组合，不是新增的互斥类别。
 
 ### 2.1 现有数据的标签映射
@@ -43,6 +42,7 @@ Cityscapes 上的预训练权重可以直接复用，19 类也是分割领域常
 | ACDC rain 子集 | `[0, 1, 0, 0]` |
 | ACDC snow 子集 | `[0, 0, 1, 0]` |
 | ACDC night 子集 | `[0, 0, 0, 1]` |
+| ACDC 白天正常参考图 | `[0, 0, 0, 0]` |
 | Pixel Accurate `day_fog*` / `night_fog*` | `[1, 0, 0, 0]` / `[1, 0, 0, 1]` |
 | Pixel Accurate `day_rain*` / `night_rain*` | `[0, 1, 0, 0]` / `[0, 1, 0, 1]` |
 | Pixel Accurate `day_clear` / `night_clear` | `[0, 0, 0, 0]` / `[0, 0, 0, 1]` |
@@ -59,12 +59,11 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 - `weather_warning` 用于独立天气提醒。接管策略只在已识别 fog/rain/snow 且能见度为 DEGRADED 时将其作为辅助条件；night 单独不触发。
 - 旧 `PerceptionResult.road_condition` 保留给既有调用方；独立模型通过 `weather_attributes` / `weather_probabilities` 传递，不将多标签压回单类别。
 
-目前使用 format_version=2 的 `artifacts/checkpoints/weather_attributes/best.pt`。
-早期互斥四分类权重已移除；天气训练、推理和蒸馏都使用独立四属性，不再保留可能被误加载的旧权重。
+当前默认是 format_version=1 的 `artifacts/checkpoints/weather_attention_swad/best.pt`，本轮按验证评分选择了第 52 轮单点模型。平均权重另存 `swad.pt`；不同版本都通过 `WeatherAttentionPredictor` 的结构和校准签名检查。
 
-雨天增强候选使用 `configs/model/weather_enhanced.yaml`，属性顺序相同。
-ACDC 目录中未确认的其他属性在增强训练中使用 mask=0；其数值标签不当作已确认的阴性。
-Pixel Accurate 的属性由文件名条件和昼夜分别确定，使用完整标签 mask。
+旧 CNN 的 format_version=2 及金字塔 ASL 的 format_version=3 只保留作历史对照，分别由原预测器读取。雨天残差增强路线已废弃，其实现、配置和多余权重已清理。
+
+本轮按 ACDC 采集协议和 Pixel Accurate 元数据生成四属性完整监督；损坏清单、完整录制组、参考配对和重复图绑定沿用现有数据入口。数据量 9,612 张，四分 5,696／796／962／2,158，种子 42。没有新增物理雨量、水深或逐像素积雪面积标签。当前预测的 `cues` 保持空字典，接口仍兼容历史字段。
 
 ---
 
@@ -345,5 +344,6 @@ Source-aware 验证只评价对应类别及已标注区域，推理不读取真�
 | 日期 | 变更 | 影响 |
 |------|------|------|
 | 2026-09-20 | 初始版本 | — |
-| 2026-10-06 | 天气规范对齐已训练的独立多属性模型，明确顺序、数据映射及旧头禁用 | 文档/旧配置对齐；现有 v2 天气权重及标签不变，无需重训 |
+| 2026-10-06 | 天气规范对齐已训练的独立多属性模型，明确顺序、数据映射及旧头禁用 | 文档/旧配置对齐；当时 v2 天气权重及标签不变 |
+| 2026-10-15 | 默认使用预训练属性注意力及验证选出的单点权重，SWAD 保留对照；移除雨残差增强 | 输出字段和四属性顺序保持兼容，阈值从各自校准检查点读取 |
 
