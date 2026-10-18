@@ -92,13 +92,16 @@ def main() -> int:
         for k, v in trainer.calibration.to_dict().items():
             print(f"    {k:8s} {v:.6f}" if isinstance(v, float) else f"    {k:8s} {v}")
 
-    out = root / "artifacts/reports/visibility"
+    out = root / cfg.get("report", {}).get("output_dir", "artifacts/reports/visibility")
     out.mkdir(parents=True, exist_ok=True)
     (out / "train_history.json").write_text(
         json.dumps(
             {
                 "history": history.to_dict(),
                 "calibration": trainer.calibration.to_dict() if trainer.calibration else None,
+                "seed": trainer.seed,
+                "split_signature": trainer.split_signature,
+                "split_sizes": trainer.split_stats,
             },
             ensure_ascii=False, indent=2,
         ),

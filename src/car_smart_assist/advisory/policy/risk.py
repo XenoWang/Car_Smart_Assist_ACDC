@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from math import isfinite
 from numbers import Real
@@ -57,6 +58,43 @@ def valid_confidence(value: Any) -> bool:
     return finite_number(value) and 0 <= value <= 1
 
 
+def confirmed_weather(
+    perception: PerceptionResult, config: PolicyConfig
+) -> tuple[tuple[str, ...], list[str]]:
+    """统一解释天气证据；现代属性已按模型各自阈值确认，不再套统一门槛。"""
+    attributes = perception.weather_attributes
+    probabilities = perception.weather_probabilities
+    known_attributes = ("fog", "rain", "snow", "night")
+    if not isinstance(attributes, (tuple, list)) or any(
+        not isinstance(attribute, str)
+        or attribute not in known_attributes
+        or attribute not in config.weather_risk_levels
+        for attribute in attributes
+    ):
+        return (), ["天气属性格式无效或包含未知类别，未用于风险及接管辅助判断"]
+    if not isinstance(probabilities, Mapping) or any(
+        not isinstance(attribute, str)
+        or attribute not in known_attributes
+        or not valid_confidence(probability)
+        for attribute, probability in probabilities.items()
+    ):
+        return (), ["天气概率格式、类别或数值无效，未用于风险及接管辅助判断"]
+
+    if attributes or probabilities:
+        if not attributes:
+            return (), ["天气模型未确认正属性；不单独触发接管，也不应用恶劣天气倍率"]
+        return tuple(dict.fromkeys(attributes)), []
+
+    weather = perception.road_condition
+    if not isinstance(weather, str) or weather not in config.weather_risk_levels:
+        return (), ["天气类别未能确认；不单独触发接管，也不应用恶劣天气倍率"]
+    if not valid_confidence(perception.road_condition_confidence) or (
+        perception.road_condition_confidence < config.min_confidence_for_clear
+    ):
+        return (), ["天气分类置信度不足；不单独触发接管，也不应用恶劣天气倍率"]
+    return (weather,), []
+
+
 def assess_risk(perception: PerceptionResult | None, config: PolicyConfig) -> RiskAssessment:
     """纯规则评估；全部阈值从 config 获取，输入对象保持不变。"""
     result = RiskAssessment()
@@ -93,17 +131,11 @@ def assess_risk(perception: PerceptionResult | None, config: PolicyConfig) -> Ri
     if visibility == "degraded":
         evidence(RiskLevel.NOTICE, "visibility_degraded", "图片能见度下降")
 
-    weather = perception.road_condition
+    weather_conditions, weather_diagnostics = confirmed_weather(perception, config)
+    result.diagnostics.extend(weather_diagnostics)
     weather_multiplier = 1.0
-    if not isinstance(weather, str) or weather not in config.weather_risk_levels:
-        result.diagnostics.append("天气类别未能确认；不单独触发接管，也不应用恶劣天气倍率")
-    elif not valid_confidence(perception.road_condition_confidence) or (
-        perception.effective_confidence(perception.road_condition_confidence)
-        < config.min_confidence_for_clear
-    ):
-        result.diagnostics.append("天气分类置信度不足；不单独触发接管，也不应用恶劣天气倍率")
-    else:
-        weather_multiplier = config.weather_risk_multiplier[weather]
+    for weather in weather_conditions:
+        weather_multiplier = max(weather_multiplier, config.weather_risk_multiplier[weather])
         evidence(
             config.weather_risk_levels[weather], "weather_recognized", f"图片识别路况：{weather}"
         )
@@ -125,9 +157,9 @@ def assess_risk(perception: PerceptionResult | None, config: PolicyConfig) -> Ri
         if not isinstance(target.category, str) or not target.category.strip():
             unknown("category_unknown", f"{prefix}类别未知")
         if not valid_confidence(target.confidence) or (
-            perception.effective_confidence(target.confidence) < config.min_confidence_for_clear
+            target.confidence < config.min_confidence_for_clear
         ):
-            unknown("target_confidence_low", f"{prefix}识别有效置信度不足")
+            unknown("target_confidence_low", f"{prefix}识别原始置信度不足")
             continue
 
         try:

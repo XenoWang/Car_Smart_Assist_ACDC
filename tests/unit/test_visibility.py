@@ -481,7 +481,34 @@ class TestSplitRefIndices:
 
     def test_sequence_of_extracts_sequence_name(self):
         p = "data/raw/acdc/rgb_anon/fog/train_ref/GOPR0475/GOPR0475_frame_000041_rgb_ref_anon.png"
-        assert sequence_of(p) == "GOPR0475"
+        assert sequence_of(p) == "gopro:0475"
+
+    @pytest.mark.parametrize("alias", ["GOPR0475", "GP010475", "GP020475"])
+    def test_recording_family_aliases_share_one_group(self, alias):
+        path = Path("data/raw/acdc/rgb_anon/fog/train_ref") / alias / f"{alias}_frame_000001_rgb_ref_anon.png"
+        assert sequence_of(path) == "gopro:0475"
+
+    def test_recording_family_split_keeps_gopro_aliases_together(self):
+        groups = [
+            sequence_of(Path("GOPR0475") / "a.png"),
+            sequence_of(Path("GP010475") / "b.png"),
+            sequence_of(Path("GP020475") / "c.png"),
+            *(f"sequence:other_{index:02d}" for index in range(12)),
+        ]
+        parts = split_ref_indices(
+            len(groups), 0.5, 0.2, 0.15, 0.15, seed=42, groups=groups
+        )
+        owners = {
+            group: {
+                split_index
+                for split_index, indices in enumerate(parts)
+                if any(groups[int(index)] == group for index in indices)
+            }
+            for group in set(groups)
+        }
+        assert len(owners["gopro:0475"]) == 1
+        assert sum(group == "gopro:0475" for group in groups) == 3
+        assert all(len(part) for part in parts)
 
 
 class TestVisibilityDataset:
@@ -1059,11 +1086,86 @@ class TestGateContract:
 
     # --- 校准缺失时的保守行为 ---
 
-    def test_missing_calibration_blocks_blind_verdict(self):
-        """没有零校准统计时不允许给 BLIND —— 单靠信息量一路信号风险太高。"""
+    def test_missing_calibration_does_not_weaken_information_blind(self):
         v = self.gate.judge(make_score(info=0.005, z=float("nan")))
-        assert v.level is VisibilityLevel.DEGRADED
-        assert "no_calibration" in v.triggered
+        assert v.level is VisibilityLevel.BLIND
+        assert "info_low" in v.triggered
+
+    @pytest.mark.parametrize("information", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_information_is_a_gate_fault(self, information):
+        with pytest.raises(ValueError, match="信息量必须为有限值"):
+            self.gate.judge(make_score(info=information))
+
+    @pytest.mark.parametrize("recon_z", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("use_recon_z", [False, True])
+    def test_low_information_takes_priority_over_reconstruction_faults(
+        self, recon_z, use_recon_z
+    ):
+        gate = VisibilityGate(
+            GateThresholds(use_recon_z=use_recon_z), require_calibration=True
+        )
+        verdict = gate.judge(make_score(info=self.blind_info, z=recon_z))
+        assert verdict.level is VisibilityLevel.BLIND
+        assert verdict.triggered == ["info_low"]
+
+    @pytest.mark.parametrize("information", [0.9, 0.4])
+    @pytest.mark.parametrize("recon_z", [float("nan"), float("inf"), float("-inf")])
+    def test_disabled_reconstruction_does_not_change_information_band(
+        self, information, recon_z
+    ):
+        gate = VisibilityGate(GateThresholds(use_recon_z=False), require_calibration=True)
+        verdict = gate.judge(make_score(info=information, z=recon_z))
+        expected = (
+            VisibilityLevel.DEGRADED
+            if information < gate.thresholds.info_degraded
+            else VisibilityLevel.VISIBLE
+        )
+        assert verdict.level is expected
+
+    def test_enabled_reconstruction_requires_calibration_only_when_configured(self):
+        required = VisibilityGate(
+            GateThresholds(use_recon_z=True), require_calibration=True
+        )
+        with pytest.raises(ValueError, match="缺少校准"):
+            required.judge(make_score(info=self.visible_info, z=float("nan")))
+
+        optional = VisibilityGate(
+            GateThresholds(use_recon_z=True), require_calibration=False
+        )
+        verdict = optional.judge(make_score(info=self.visible_info, z=float("nan")))
+        assert verdict.level is VisibilityLevel.VISIBLE
+        assert not verdict.triggered
+
+    @pytest.mark.parametrize("recon_z", [float("inf"), float("-inf")])
+    def test_enabled_reconstruction_rejects_infinite_z(self, recon_z):
+        gate = VisibilityGate(GateThresholds(use_recon_z=True), require_calibration=False)
+        with pytest.raises(ValueError, match="不能为无穷大"):
+            gate.judge(make_score(info=self.visible_info, z=recon_z))
+
+    def test_information_and_reconstruction_threshold_boundaries_are_strict(self):
+        t = self.gate.thresholds
+        assert self.gate.judge(make_score(info=t.info_blind)).level is VisibilityLevel.DEGRADED
+        assert self.gate.judge(make_score(info=t.info_degraded)).level is VisibilityLevel.VISIBLE
+
+        enabled = VisibilityGate(
+            GateThresholds(
+                info_blind=t.info_blind,
+                info_degraded=t.info_degraded,
+                z_degraded=t.z_degraded,
+                z_blind=t.z_blind,
+                use_recon_z=True,
+            ),
+            require_calibration=False,
+        )
+        assert enabled.judge(make_score(info=t.info_degraded, z=t.z_degraded)).level is (
+            VisibilityLevel.VISIBLE
+        )
+        assert enabled.judge(make_score(info=t.info_degraded - 1e-6, z=t.z_blind + 1)).level is (
+            VisibilityLevel.BLIND
+        )
+        assert enabled.judge(make_score(info=t.info_degraded - 1e-6, z=t.z_blind)).level is (
+            VisibilityLevel.DEGRADED
+        )
 
     def test_missing_calibration_allowed_if_configured(self):
         g = VisibilityGate(require_calibration=False)

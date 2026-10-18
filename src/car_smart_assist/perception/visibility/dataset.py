@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -12,6 +15,8 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 from car_smart_assist.config.visibility import AUGMENTATION_DEFAULTS, MODEL_DEFAULTS
+from car_smart_assist.data.detection import recording_group
+from car_smart_assist.data.preprocessing import load_invalid_entries
 
 logger = logging.getLogger(__name__)
 
@@ -22,18 +27,38 @@ ADVERSE_SUFFIX = "_rgb_anon.png"
 REF_SUFFIX = "_rgb_ref_anon.png"
 
 
-def list_ref_images(acdc_root: str | Path) -> list[Path]:
+def _exclude_invalid(
+    paths: Sequence[Path], cleaning_manifest: str | Path | None, project_root: str | Path
+) -> list[Path]:
+    if cleaning_manifest is None:
+        return list(paths)
+    root = Path(project_root)
+    invalid = load_invalid_entries(root / cleaning_manifest, root)
+    return [path for path in paths if str(path.resolve()) not in invalid]
+
+
+def list_ref_images(
+    acdc_root: str | Path,
+    *,
+    cleaning_manifest: str | Path | None = None,
+    project_root: str | Path = ".",
+) -> list[Path]:
     """列出全部正常天气参考图。
 
     这是 AE 的训练集：它们是「清晰可见」的无标注样本。
     用它们定义 normal 分布，重建误差才有判别力。
     """
     root = Path(acdc_root) / "rgb_anon"
-    return sorted(p for p in root.rglob("*.png") if p.name.endswith(REF_SUFFIX))
+    paths = sorted(p for p in root.rglob("*.png") if p.name.endswith(REF_SUFFIX))
+    return _exclude_invalid(paths, cleaning_manifest, project_root)
 
 
 def list_adverse_images(
-    acdc_root: str | Path, conditions: Sequence[str] | None = None
+    acdc_root: str | Path,
+    conditions: Sequence[str] | None = None,
+    *,
+    cleaning_manifest: str | Path | None = None,
+    project_root: str | Path = ".",
 ) -> list[Path]:
     """列出恶劣天气图。conditions 为 None 时返回全部四类。"""
     root = Path(acdc_root) / "rgb_anon"
@@ -41,7 +66,7 @@ def list_adverse_images(
     if conditions:
         want = set(conditions)
         paths = [p for p in paths if p.relative_to(root).parts[0] in want]
-    return sorted(paths)
+    return _exclude_invalid(sorted(paths), cleaning_manifest, project_root)
 
 
 def read_rgb_image(path: str | Path, size: tuple[int, int] | None = None) -> np.ndarray:
@@ -58,32 +83,24 @@ def read_rgb_image(path: str | Path, size: tuple[int, int] | None = None) -> np.
         return np.asarray(rgb, dtype=np.uint8)
 
 
-def _build_cache(paths: Sequence[Path], size: tuple[int, int], cache: Path) -> np.ndarray:
-    """把图像解码、缩放、存成 npy。返回 uint8 数组 (N, H, W, 3)。"""
+def _build_cache(paths: Sequence[Path], size: tuple[int, int], cache: Path) -> None:
+    """只构建临时 npy；解码失败直接报错，由调用方决定是否发布。"""
     h, w = size
     cache.parent.mkdir(parents=True, exist_ok=True)
     arr = np.lib.format.open_memmap(
         cache, mode="w+", dtype=np.uint8, shape=(len(paths), h, w, 3)
     )
-    failed: list[tuple[str, str]] = []
-    for i, p in enumerate(paths):
-        try:
+    try:
+        for i, p in enumerate(paths):
             arr[i] = read_rgb_image(p, size)
-        except Exception as exc:  # noqa: BLE001
-            failed.append((str(p), f"{type(exc).__name__}: {exc}"))
-            arr[i] = 0
-    arr.flush()
-    if failed:
-        logger.warning("%d 张图解码失败，已置零，请先跑 scripts/clean_data.py：%s", len(failed), failed[:3])
-    return np.asarray(arr)
+        arr.flush()
+    finally:
+        arr._mmap.close()
 
 
 def sequence_of(path: str | Path) -> str:
-    """从 ACDC 路径中取出序列名（文件名上一级目录）。
-
-    路径形如 .../rgb_anon/{condition}/{split}/{sequence}/{seq}_frame_{n}_rgb_ref_anon.png
-    """
-    return Path(path).parent.name
+    """按完整录制族绑定 GoPro 章节，避免同一录制跨集合。"""
+    return recording_group(Path(path).parent.name, "recording_family")
 
 
 def split_ref_indices(
@@ -213,6 +230,35 @@ def split_ref_indices(
     used = set(train_g) | set(val_g) | set(calib_g)
     test_g = [str(x) for x in names if str(x) not in used]
 
+    group_splits = [train_g, val_g, calib_g, test_g]
+    if any(not part for part in group_splits):
+        targets = [target_train, target_val, target_calib, n * test_ratio]
+        counts = [sum(len(by_group[g]) for g in part) for part in group_splits]
+        permutation_rank = {str(names[gi]): rank for rank, gi in enumerate(perm)}
+        for destination, part in enumerate(group_splits):
+            if part:
+                continue
+            moves: list[tuple[float, int, int, str]] = []
+            for donor, donor_groups in enumerate(group_splits):
+                if len(donor_groups) < 2:
+                    continue
+                for gname in donor_groups:
+                    size = len(by_group[gname])
+                    candidate_counts = counts.copy()
+                    candidate_counts[donor] -= size
+                    candidate_counts[destination] += size
+                    error = sum(
+                        (count - target) ** 2
+                        for count, target in zip(candidate_counts, targets, strict=True)
+                    )
+                    moves.append((error, permutation_rank[gname], donor, gname))
+            _, _, donor, gname = min(moves)
+            group_splits[donor].remove(gname)
+            part.append(gname)
+            size = len(by_group[gname])
+            counts[donor] -= size
+            counts[destination] += size
+
     def collect(gs: Sequence[str]) -> np.ndarray:
         out = [i for g in gs for i in by_group[g]]
         return np.sort(np.asarray(out, dtype=np.int64))
@@ -265,10 +311,66 @@ def ensure_cache(
     if cache_path is None:
         return None
     cp = Path(cache_path)
-    if not cp.exists():
+    paths = [Path(path) for path in paths]
+    shape = (len(paths), *size, 3)
+    identity = _cache_identity(paths, size)
+    manifest = cp.with_suffix(cp.suffix + ".json")
+    if cp.is_file() and manifest.is_file():
+        try:
+            recorded = json.loads(manifest.read_text(encoding="utf-8"))
+            if recorded["identity"] == identity and recorded["cache_sha256"] == _file_sha256(cp):
+                cached = np.load(cp, mmap_mode="r", allow_pickle=False)
+                try:
+                    if cached.shape == shape and cached.dtype == np.uint8:
+                        return cp
+                finally:
+                    cached._mmap.close()
+        except (OSError, ValueError, KeyError, TypeError, EOFError):
+            logger.warning("图像缓存或身份记录无效，重新构建：%s", cp)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    temporary = cp.with_name(f".{cp.name}.{uuid4().hex}.tmp")
+    temporary_manifest = temporary.with_suffix(".json")
+    try:
         logger.info("构建图像缓存（%d 张 -> %s）...", len(paths), cp)
-        _build_cache(paths, size, cp)
+        _build_cache(paths, size, temporary)
+        if _cache_identity(paths, size) != identity:
+            raise ValueError("构建缓存期间源图片发生变化，未发布该缓存")
+        temporary_manifest.write_text(
+            json.dumps(
+                {"identity": identity, "cache_sha256": _file_sha256(temporary)},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        temporary.replace(cp)
+        temporary_manifest.replace(manifest)
+    finally:
+        temporary.unlink(missing_ok=True)
+        temporary_manifest.unlink(missing_ok=True)
     return cp
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _cache_identity(paths: Sequence[Path], size: tuple[int, int]) -> dict:
+    files = []
+    for path in paths:
+        stat = path.stat()
+        files.append(
+            [str(path.resolve()), stat.st_size, stat.st_mtime_ns, _file_sha256(path)]
+        )
+    return {
+        "version": 1,
+        "algorithm": "rgb-bilinear-hwc-uint8-v1",
+        "input_size": list(size),
+        "shape": [len(paths), *size, 3],
+        "dtype": "uint8",
+        "files": files,
+    }
 
 
 class VisibilityImageDataset(Dataset):
@@ -334,7 +436,11 @@ class VisibilityImageDataset(Dataset):
                     f"图像缓存不存在: {self.cache_path}。"
                     "请先运行 scripts/train_visibility.py 让 ensure_cache 构建它"
                 )
-            self._cache = np.load(self.cache_path, mmap_mode="r")
+            cache = np.load(self.cache_path, mmap_mode="r", allow_pickle=False)
+            if cache.shape != (len(self.paths), *self.input_size, 3) or cache.dtype != np.uint8:
+                cache._mmap.close()
+                raise ValueError("图像缓存形状或类型与当前样本不匹配，请重新运行 ensure_cache")
+            self._cache = cache
         return self._cache
 
     def __len__(self) -> int:

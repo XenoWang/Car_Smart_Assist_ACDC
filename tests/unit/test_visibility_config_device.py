@@ -79,7 +79,13 @@ def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch):
     paths = [root / f"{i}.png" for i in range(20)]
     for path in paths:
         path.touch()
-    monkeypatch.setattr(visibility_dataset, "list_ref_images", lambda root: paths)
+    calls = []
+
+    def list_refs(acdc_root, *, cleaning_manifest=None, project_root="."):
+        calls.append((acdc_root, cleaning_manifest, project_root))
+        return paths
+
+    monkeypatch.setattr(visibility_dataset, "list_ref_images", list_refs)
     cfg = {
         "device": "cpu",
         "model": {"base_channels": 2, "latent_dim": 4, "input_size": [16, 16]},
@@ -90,6 +96,7 @@ def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch):
     train, val, calib, _ = trainer._build_datasets()
     assert train.augment is val.augment is calib.augment is False
     assert train.contrast_range == (1.0, 1.0)
+    assert calls == [(tmp_path / "images", None, tmp_path)]
 
 
 @pytest.mark.gpu

@@ -63,6 +63,33 @@ python -m venv .venv
 .venv\Scripts\python.exe scripts\train_detection.py
 ```
 
+## 独立三模型重训结果（2026-10-18）
+
+三模型独立重训与最终评估已完成：天气／AE／YOLO分别在74／57／65轮早停，best为34／49／35轮。新天气macro F1为90.82%，低于A85的92.55%，默认仍保留A85；新YOLO的ACDC与L&F测试mAP均高于旧联合模型，默认权重暂未替换。AE测试／训练重建误差比2.24，仍有重建泛化差距。新权重正常／雾／雨／雪／夜五张真实帧与黑帧pipeline检查通过；这不是实车或泛化验证。
+
+执行顺序为预检与缓存 → 天气效率检查 → 三模型串行训练 → 校准与最终评估。以下为本轮候选与旧模型的结果，默认模型保持不变。
+
+| 测试指标（%） | 本轮候选 | 旧模型 |
+|---|---:|---:|
+| 天气macro F1 | 90.82 | 92.55（A85） |
+| ACDC检测mAP50／mAP50–95 | 31.55／18.85 | 26.91／14.78（旧联合） |
+| Lost & Found检测mAP50／mAP50–95 | 76.00／46.73 | 71.48／41.43（旧联合） |
+| 道路杂物F1 | 72.88 | 69.12（旧联合） |
+
+天气分数来自2158图的项目开发测试；检测两次使用同一1394图划分与评估参数，各自校准操作点。L&F只统计已标注ROI，不是整图误报率。AE新旧划分不同，重建误差不能直接横比。新联合模型ACDC mAP50仍低于历史八类基线33.02%，不能宣布旧类已全面保持。
+
+
+三个新配置推荐入口：
+
+| 阶段 | 推荐入口 |
+| --- | --- |
+| weather | `configs/model/weather_attention_retrain_300.yaml` |
+| AE / 能见度 | `configs/model/visibility_retrain_300.yaml` |
+| YOLO | `configs/model/yolo_retrain_300.yaml` |
+
+各阶段 checkpoint 落在独立 `artifacts/checkpoints` 或 `artifacts/runs`，报告集中写入 `artifacts/reports/retrain_300_20261017/`。训练方案：seed 42，各模型从初始化起最多 300 轮早停——weather 用本地 ImageNet A13/ASL，输入 384x672，schedule 500，ES 40、delta 1e-4；AE 随机初始化，ES 8、delta 1e-5；YOLO 用本地 COCO 骨干加新九类头，patience 30。原默认配置与只读对照保持不改。
+
+
 ## 天气模块
 
 ### 当前默认
@@ -123,6 +150,7 @@ SWAD实验中的单点 `single_best.pt` 和平均 `swad.pt` 各自校准；实�
 | 金字塔 ASL | 77.70 | 42.86 | 75.79 | 95.26 | 96.89 |
 | 147 基线 | 90.26 | 89.85 | 84.68 | 95.04 | 91.49 |
 | A85（当前默认） | 92.55 | 89.62 | 87.82 | 97.95 | 94.82 |
+| 本轮早停候选，best34 | 90.82 | 90.66 | 85.42 | 96.92 | 90.26 |
 | 单点52（保留对照） | 92.69 | 94.25 | 88.02 | 97.71 | 90.77 |
 | 原300轮 SWAD | 90.85 | 89.94 | 84.63 | 97.95 | 90.87 |
 | 追加阶段 SWAD（301—526） | 90.50 | 86.53 | 84.47 | 96.74 | 94.27 |
@@ -163,6 +191,7 @@ SWAD实验中的单点 `single_best.pt` 和平均 `swad.pt` 各自校准；实�
 | 历史 CNN / ASL 对照 | `configs/model/weather_classifier.yaml` / `configs/model/weather_pyramid.yaml` |
 | 能见度 | `configs/model/visibility.yaml` |
 | 联合 YOLO / 旧八类 YOLO | `configs/model/yolo_detection.yaml` / `configs/model/yolo_acdc_baseline.yaml` |
+| 独立300轮重训 | `configs/model/weather_attention_retrain_300.yaml` / `visibility_retrain_300.yaml` / `yolo_retrain_300.yaml` |
 | 风险与接管规则 | `configs/model/advisory_llm.yaml` |
 
 ## 文档

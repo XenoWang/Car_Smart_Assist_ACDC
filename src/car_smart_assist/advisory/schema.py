@@ -57,7 +57,7 @@ class PerceptionResult:
     # 取值来自 perception.visibility.gate.VisibilityLevel
     visibility_level: str = "unknown"
     # 能见度门控提供的置信度乘子：默认 BLIND=0，DEGRADED=0.6，VISIBLE=1.0。
-    # 下游所有置信度都要乘上它，不要各自重复判断能见度好不好。
+    # 保留供诊断和兼容调用；规则可靠性用原始置信度，能见度另作风险证据。
     visibility_confidence_multiplier: float = 1.0
     # 触发门控判定的原因，便于追溯
     visibility_reasons: list[str] = field(default_factory=list)
@@ -101,11 +101,7 @@ class PerceptionResult:
         }
 
     def effective_confidence(self, raw: float) -> float:
-        """把门控降级乘到某个原始置信度上。
-
-        统一在这里做，不让每个下游模块自己乘 ——
-        否则总有一处会忘记，而忘记的那处恰好是最需要保守的地方。
-        """
+        """保留门控折减值的兼容计算，不用于规则的原始置信度门槛。"""
         return float(raw) * self.visibility_confidence_multiplier
 
     @property

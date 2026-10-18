@@ -4,6 +4,33 @@
 
 ## [Unreleased]
 
+### 三模型重训评估与收尾（2026-10-18，Alpha）
+
+- 三模型从各自初始化起实际完成训练并早停：天气74轮best34、AE57轮best49、YOLO65轮best35；seed42、最多300轮，新权重与报告独立保存。
+- 天气开发macro F1为90.82%，低于A85的92.55%，默认继续使用A85。雨F1提升到90.66%，雾／雪／夜仍有下降。
+- 联合YOLO同口径test：ACDC mAP50／50–95为31.55%／18.85%，L&F为76.00%／46.73%，杂物F1为72.88%；均高于旧联合模型对应汇总指标，未自动替换默认。
+- AE完成新录制族划分评估，抽样测试／训练重建误差比2.24；默认重建z仍关闭，不把重训结果写成门控准确率提升。
+- 修复本地评估runner在隔离工作目录下的checkpoint路径，以及smoke入口重复包装配置的问题；补做4项与1项定向用例、真实AE／YOLO评估及六帧pipeline检查，均通过。此前571项回归未重跑，新旧权重哈希保持不变。
+- README与架构／接管说明同步结果和边界；本地model_report补齐来源、昼夜雨、AE泛化与检测对照，保留首次失败证据。
+
+### 接管、门控与可复现训练修复（2026-10-18，Alpha）
+
+#### 新增
+- 新增三份重训配置：`configs/model/weather_attention_retrain_300.yaml`、`configs/model/visibility_retrain_300.yaml`、`configs/model/yolo_retrain_300.yaml`；独立 checkpoint / runs 与报告目录。
+- 新增测试与 runner（`AI_Skills/Test_Cases`）：7 个模块、group 专项、训练准备、all 套件及三模型训练入口 suite。
+- 天气可选早停：保存终态实际轮数；旧配置默认不启用。
+
+#### 修复
+- policy 风险 / 接管使用 raw 置信度比较 0.7，不再与 DEGRADED 0.6 混用。
+- 现代确认 weather attrs 取最高等级最大倍率，共享 helper，不再二次按概率 0.7 筛选；invalid 天气诊断不单独接管；仅在缺现代信息时回退 legacy。
+- 信息量极低时直接BLIND，不受AE缺校准弱化；info 非 finite 按故障接管；verdict JSON 中非 finite 诊断置 null，内部语义不变。
+- 能见度按完整录制族分组并消费invalid清单；缓存核验源图／缓存SHA及尺寸身份，解码失败不置零；固定初始化与采样随机状态。累计分配出现空集时整组补位，划分签名记录算法身份。
+
+#### 验证
+- 全 tests 实测 571 pass，用时 23.11s。
+- 真实能见度best／last 黑帧按 strict JSON 校验；fingerprint 稳定，14 项保护项 unchanged。
+- AE 4006 图 26 族实测 3207/335/165/299，分组与 duplicate SHA 跨集合交集为空，13 suspect 保留、invalid 0；检测 1914/289/313/1394 无交集。
+
 ### SWAD追加阶段与条件回退（2026-10-17，Alpha）
 
 - 新增从已完成last开启追加阶段的独立配置，保留参数、优化器、AMP、随机状态和源历史；新阶段重新收集SWAD，不沿用已关闭的谷底。

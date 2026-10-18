@@ -15,7 +15,7 @@ flowchart TD
     Weather --> Warning[独立天气提醒 weather_warning]
     Weather -->|属性与概率| Perception[PerceptionResult]
     YOLO -->|原图框、类别、置信度、分支可用状态| Perception
-    Gate -->|能见度与置信度倍率| Perception
+    Gate -->|能见度与兼容乘子| Perception
     Perception --> Risk[风险评估与判断可靠性]
     Perception -->|结构化接管证据| Handover
     Risk --> Handover[接管请求规则]
@@ -28,7 +28,9 @@ flowchart TD
     Fallback --> Result
 ```
 
-天气结果先用来提醒驾驶员；识别到恶劣天气、同时能见度降到 DEGRADED 时，也会给接管规则提供辅助信息。目标风险计算目前仍读旧的天气字段。
+天气结果用于独立提醒，也参与目标风险：risk与接管规则共用已确认属性，多属性取最高基础风险和最大距离倍率；仅完全缺少新结果时兼容旧字段。恶劣天气与DEGRADED可联合辅助接管，night单独不触发该辅助条件。目标和接管头按原始置信度判断可靠性，可见度下降另作风险证据。
+
+极低信息量直接BLIND，不受AE缺校准弱化；信息量NaN／无穷大走现有故障接管兜底。AE仍运行，门控故障仍整批兜底。上述规则已通过本轮571项回归，包含真实best／last黑帧及严格JSON验证；非有限诊断值在对外JSON中写为null，内部判定不变。
 YOLO 目前给出检测框，还不预测距离和方向。学习式接管分类头、分割模型和 LLM 也还没接上。
 
 ## 预训练属性注意力天气模型
@@ -44,7 +46,7 @@ flowchart TD
     Queries --> ASL[雾／雨／雪／夜独立输出与 ASL]
     ASL --> Validation[每轮验证：来源等权 AP＋F1，雨雾加权]
     Validation --> Best[验证选 best；每轮保存 last 与随机状态]
-    Best --> Fusion[推理副本合并卷积与 BN]
+    Best -->|预算完成或配置的早停触发| Fusion[推理副本合并卷积与 BN]
     Fusion --> Calibration[独立校准集确定四属性阈值]
     Calibration --> Test[开发测试：最后评估]
     Old[原模型及已有金字塔 ASL，仅作对照] --> Test
@@ -54,6 +56,8 @@ flowchart TD
 
 A组配方完成300轮，沿用原500轮学习率计划的前300轮；SWAD另做300轮首轮与600轮续接，累计900轮。验证选权重，校准选阈值，预算结束后再评估开发测试。
 推理优化作用于独立副本，训练权重结构不变；天气不确定仍不单独触发接管。
+
+2026-10-18的独立三模型重训已完成：天气74轮、AE57轮、YOLO65轮早停，分别选第34／49／35轮best。能见度使用修复后的录制族、invalid清单与缓存身份，四分空集整组补位；新权重显式接入的六帧pipeline检查通过。新天气整体F1低于A85，YOLO同口径测试有所提高，默认路由和旧权重保持不变；候选与旧模型分开保存。
 
 ## A 组与 SWAD
 

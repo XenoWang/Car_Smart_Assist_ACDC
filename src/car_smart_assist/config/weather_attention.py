@@ -100,6 +100,17 @@ def validate_weather_attention_config(cfg: WeatherAttentionConfig):
     coefficient = t.get("l2_sp", 0.0)
     if type(coefficient) not in (int, float) or not isfinite(coefficient) or coefficient < 0:
         raise ValueError("l2_sp 系数必须是有限非负数")
+    if "early_stopping" in t:
+        stopping = t["early_stopping"]
+        if not isinstance(stopping, dict) or set(stopping) != {"enabled", "patience", "min_delta"}:
+            raise ValueError("early_stopping 须明确 enabled、patience 和 min_delta")
+        if type(stopping["enabled"]) is not bool:
+            raise ValueError("early_stopping.enabled 必须是布尔值")
+        if type(stopping["patience"]) is not int or stopping["patience"] < 1:
+            raise ValueError("early_stopping.patience 必须是正整数")
+        delta = stopping["min_delta"]
+        if type(delta) not in (int, float) or not isfinite(delta) or delta < 0:
+            raise ValueError("early_stopping.min_delta 必须是有限非负数")
     continuation = t.get("continuation")
     if "continuation" in t:
         required = {

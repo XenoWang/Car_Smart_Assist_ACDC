@@ -256,6 +256,12 @@ def prepare_attention_datasets(cfg, root):
 
 
 def model_report(cfg, root, progress, comparison=None):
+    stopping = cfg.train.get("early_stopping", {})
+    stopping_text = (
+        f"验证评分连续 {stopping['patience']} 轮未超过参考分数 {stopping['min_delta']:g} 时早停"
+        if stopping.get("enabled", False)
+        else "不提前早停"
+    )
     lines = [
         "# 天气模型报告",
         "",
@@ -264,7 +270,8 @@ def model_report(cfg, root, progress, comparison=None):
         "## 当前状态",
         "",
         f"- 状态：{progress['status']}",
-        f"- 已完成轮数：{progress.get('epoch', 0)}／{cfg.train['epochs']}；不提前早停。",
+        f"- 已完成轮数：{progress.get('epoch', 0)}／{cfg.train['epochs']}；{stopping_text}。",
+        f"- 终止原因：{progress.get('termination_reason') or '尚未终止'}。",
         f"- 验证集最佳轮次：{progress.get('best_epoch', '尚未选出')}。",
         "- 新候选：预训练 MobileNetV3 三层特征＋四属性注意力，使用 ASL。",
         "- 原模型、已训练的金字塔 ASL 仅作对照，不强制蒸馏其错误输出。",
@@ -383,7 +390,7 @@ def model_report(cfg, root, progress, comparison=None):
         lines += [
             "## 待完成的成绩",
             "",
-            f"新候选尚未完成本轮训练和独立校准，暂不填写新模型测试分数。{cfg.train['epochs']} 轮结束后程序会自动写入最佳权重与两份对照的分数。",
+            "新候选尚未完成本轮训练和独立校准，暂不填写新模型测试分数。训练正常结束（预算完成或早停）后，程序会写入最佳权重与对照的分数。",
             "",
         ]
     if progress.get("error"):
@@ -581,6 +588,8 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
     destination = root / cfg.checkpoint_root
     swad_options = cfg.train.get("swad", {})
     use_swad = swad_options.get("enabled", False)
+    stopping = cfg.train.get("early_stopping", {})
+    use_early_stopping = stopping.get("enabled", False)
     best_path = destination / ("single_best.pt" if use_swad else "best.pt")
     last_path = destination / "last.pt"
     if "continuation" in cfg.train and any(
@@ -661,6 +670,7 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
         scaler = torch.amp.GradScaler("cuda", enabled=amp and dtype == torch.float16)
         generator = torch.Generator().manual_seed(cfg.data["seed"])
         epoch, best_epoch, best_score, history, elapsed_before = 0, 0, -1.0, [], 0.0
+        stopping_state = {"best_score": None, "wait": 0, "stopped": False}
         own_resume = last_path.exists() and not fresh
         if own_resume or "continuation" in cfg.train:
             if own_resume:
@@ -701,6 +711,10 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
             )
             elapsed_before = payload["training_seconds"]
             initial_model_sha256 = payload.get("initial_model_sha256", initial_model_sha256)
+            if use_early_stopping:
+                if "early_stopping" not in payload:
+                    raise ValueError("检查点缺少早停状态，不能按当前早停配方恢复；请新开实验")
+                stopping_state = dict(payload["early_stopping"])
         probabilities = None
         start = time.perf_counter()
         train = datasets["train"]
@@ -712,7 +726,8 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
             cfg.train["epochs"],
             dtype if amp else "关闭",
         )
-        for current in range(epoch + 1, cfg.train["epochs"] + 1):
+        remaining = () if stopping_state["stopped"] else range(epoch + 1, cfg.train["epochs"] + 1)
+        for current in remaining:
             tick = time.perf_counter()
             model.set_training_epoch(current)
             model.train()
@@ -784,6 +799,23 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                     },
                     best_path,
                 )
+            if use_early_stopping:
+                reference = stopping_state["best_score"]
+                if reference is None or selection["score"] > reference + stopping["min_delta"]:
+                    stopping_state["best_score"] = selection["score"]
+                    stopping_state["wait"] = 0
+                else:
+                    stopping_state["wait"] += 1
+                stopping_state["stopped"] = (
+                    stopping_state["wait"] >= stopping["patience"]
+                    and current < cfg.train["epochs"]
+                )
+            training_complete = stopping_state["stopped"] or current == cfg.train["epochs"]
+            termination_reason = (
+                "early_stopping" if stopping_state["stopped"] else (
+                    "budget_completed" if current == cfg.train["epochs"] else None
+                )
+            )
             row = {
                 "epoch": current,
                 "loss": float(accumulated / examples),
@@ -810,7 +842,9 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                     "scaler_state": scaler.state_dict(),
                     "epoch": current,
                     "planned_epochs": cfg.train["epochs"],
-                    "training_complete": current == cfg.train["epochs"],
+                    "training_complete": training_complete,
+                    "termination_reason": termination_reason,
+                    **({"early_stopping": dict(stopping_state)} if use_early_stopping else {}),
                     "best_epoch": best_epoch,
                     "best_score": best_score,
                     "history": history,
@@ -825,15 +859,19 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                 last_path,
             )
             progress = {
-                "status": "训练中"
-                if current < cfg.train["epochs"]
-                else "训练预算完成，正在校准和对照",
+                "status": (
+                    "已早停，正在校准和对照" if stopping_state["stopped"] else (
+                        "训练预算完成，正在校准和对照" if training_complete else "训练中"
+                    )
+                ),
                 "epoch": current,
                 "planned_epochs": cfg.train["epochs"],
                 "best_epoch": best_epoch,
                 "best_validation_score": best_score,
                 "training_seconds": elapsed,
                 "last_epoch_seconds": row["seconds"],
+                "termination_reason": termination_reason,
+                **({"early_stopping": dict(stopping_state)} if use_early_stopping else {}),
                 "updated": datetime.now().isoformat(timespec="seconds"),
             }
             write_json(root / cfg.report_dir / "progress.json", progress)
@@ -852,6 +890,9 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                 best_epoch,
                 row["seconds"],
             )
+            if stopping_state["stopped"]:
+                logger.info("验证评分连续 %d 轮未达改善门槛，提前停止于 epoch %d", stopping_state["wait"], current)
+                break
         payload = torch.load(best_path, map_location="cpu", weights_only=True)
         model.load_state_dict(payload["model_state"])
         export = {}
@@ -884,7 +925,9 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
     return inference, {
         "checkpoint": str(destination / "best.pt"),
         "best_epoch": payload["epoch"],
-        "trained_through_epoch": cfg.train["epochs"],
+        "trained_through_epoch": last["epoch"],
+        "termination_reason": last.get("termination_reason", "budget_completed"),
+        **({"early_stopping": last["early_stopping"]} if use_early_stopping else {}),
         "thresholds": thresholds,
         "validation": payload["validation"],
         "selection": payload["selection"],
@@ -980,6 +1023,10 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
             results[name]["sha256"] = current_hash
     output = {
         "status": "完成",
+        "trained_through_epoch": trained.get("trained_through_epoch", cfg.train["epochs"]),
+        "planned_epochs": cfg.train["epochs"],
+        "termination_reason": trained.get("termination_reason", "budget_completed"),
+        **({"early_stopping": trained["early_stopping"]} if "early_stopping" in trained else {}),
         "protocol": "project_fourfold_development_regression",
         "official_test_protocol": False,
         "split_signature": split_info["signature"],
@@ -1037,8 +1084,10 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
                     )
     progress = {
         "status": "完成",
-        "epoch": cfg.train["epochs"],
+        "epoch": trained.get("trained_through_epoch", cfg.train["epochs"]),
         "best_epoch": trained["best_epoch"],
+        "termination_reason": trained.get("termination_reason", "budget_completed"),
+        **({"early_stopping": trained["early_stopping"]} if "early_stopping" in trained else {}),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
     write_json(root / cfg.report_dir / "progress.json", progress)

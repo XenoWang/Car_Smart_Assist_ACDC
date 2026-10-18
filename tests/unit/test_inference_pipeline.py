@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +73,27 @@ class ShortScorer(StubScorer):
 class BrokenScorer(StubScorer):
     def score_arrays(self, images, paths=None):
         raise RuntimeError("synthetic scorer failure")
+
+
+class NonfiniteScorer(StubScorer):
+    def __init__(self, information_values):
+        super().__init__()
+        self.information_values = information_values
+
+    def score_arrays(self, images, paths=None):
+        from car_smart_assist.perception.visibility.scorer import InformationFeatures
+
+        return [
+            VisibilityScore(
+                path=f"<fault:{i}>",
+                recon_mean=0.01,
+                recon_p90_block=0.01,
+                recon_z=float("nan"),
+                features=InformationFeatures(1.0, 1.0, 1.0, 1.0),
+                information=value,
+            )
+            for i, value in enumerate(self.information_values)
+        ]
 
 
 class StubPredictor:
@@ -184,6 +206,31 @@ class TestGateBlocksPerception:
         assert all("gate" in result.skipped for result in results)
         assert all(result.advisory.should_takeover for result in results)
         assert predictor.seen_shapes == []
+
+    @pytest.mark.parametrize("bad_information", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_information_fails_closed_for_entire_batch(self, bad_information):
+        predictor = StubPredictor()
+        pipe = InferencePipeline(
+            scorer=NonfiniteScorer([0.95, bad_information]),
+            gate=VisibilityGate(GateThresholds(), require_calibration=False),
+            predictor=predictor,
+        )
+        inputs = [frame(), frame()]
+        originals = [image.copy() for image in inputs]
+        results = pipe.run_batch(inputs)
+
+        assert len(results) == len(inputs)
+        assert [result.blocked for result in results] == [False, False]
+        assert all("gate" in result.skipped for result in results)
+        assert all("ValueError" in result.skipped["gate"] for result in results)
+        assert all(result.perception is None for result in results)
+        assert all(result.advisory.should_takeover for result in results)
+        assert all(result.advisory.source == "fallback" for result in results)
+        assert predictor.seen_shapes == []
+        for actual, original in zip(inputs, originals, strict=True):
+            np.testing.assert_array_equal(actual, original)
+        for result in results:
+            json.dumps(result.to_dict(), ensure_ascii=False, allow_nan=False)
 
 
 

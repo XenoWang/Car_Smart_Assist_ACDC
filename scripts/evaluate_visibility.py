@@ -37,14 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 def load_images(paths: list[Path], size: tuple[int, int]) -> list[np.ndarray]:
-    """解码后缩放到指定尺寸，返回 uint8 数组列表。"""
-    out: list[np.ndarray] = []
-    for p in paths:
-        try:
-            out.append(read_rgb_image(p, size))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("跳过无法读取的图 %s: %s", p, exc)
-    return out
+    """解码失败直接报错，避免图片与 ref_paths 的索引错位。"""
+    return [read_rgb_image(path, size) for path in paths]
 
 
 def summarize(verdicts) -> dict[str, Any]:
@@ -198,12 +192,17 @@ def eval_real_adverse(
     size: tuple[int, int],
     n: int,
     seed: int,
+    *,
+    cleaning_manifest: str | Path | None = None,
+    project_root: str | Path = ".",
 ) -> dict[str, Any]:
     """真实恶劣天气图：这些图「难但可用」，不应大量落进 BLIND。"""
     rng = np.random.default_rng(seed)
     result: dict[str, Any] = {}
     for cond in ("fog", "night", "rain", "snow"):
-        paths = list_adverse_images(acdc_root, [cond])
+        paths = list_adverse_images(
+            acdc_root, [cond], cleaning_manifest=cleaning_manifest, project_root=project_root
+        )
         if not paths:
             continue
         idx = rng.choice(len(paths), size=min(n, len(paths)), replace=False)
@@ -442,13 +441,20 @@ def main() -> int:
     )
     gate = VisibilityGate.from_config(cfg)
     if scorer.calibration is None:
-        logger.warning("无零校准统计，BLIND 判定将被降级 —— 建议重新训练")
+        logger.warning(
+            "缺少AE重建校准；信息量仍独立判档，极低时直接BLIND。"
+            "只有显式启用重建判据且require_calibration=true时，缺校准才会报评分故障。"
+        )
     else:
         logger.info("零校准: mean=%.6f std=%.6f (n=%d)",
                     scorer.calibration.mean, scorer.calibration.std, scorer.calibration.n)
 
     n = int(args.samples or rcfg.get("sample_per_condition", 200))
-    refs = load_images(list_ref_images(acdc_root), size)
+    cleaning_root = root / dcfg.get("project_root", ".")
+    ref_paths = list_ref_images(
+        acdc_root, cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root
+    )
+    refs = load_images(ref_paths, size)
     if not refs:
         logger.error("未找到正常天气参考图，请确认 ACDC 已解压")
         return 2
@@ -461,10 +467,12 @@ def main() -> int:
     }
 
     # 先做过拟合检查 —— 模型本身没训好的话，后面的召回率数字都没有意义
-    ref_paths = list_ref_images(acdc_root)
     report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)
-    report["real_adverse"] = eval_real_adverse(scorer, gate, acdc_root, size, n, 0)
+    report["real_adverse"] = eval_real_adverse(
+        scorer, gate, acdc_root, size, n, 0,
+        cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root,
+    )
     logger.info("合成退化实验（%d 张基准图 × %d 种退化 × %d 档强度）...",
                 min(n, len(refs)), 4, len(args.severities))
     report["synthetic"] = eval_synthetic(scorer, gate, refs, list(args.severities), n, 0)

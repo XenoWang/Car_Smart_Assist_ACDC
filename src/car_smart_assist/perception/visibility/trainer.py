@@ -6,11 +6,13 @@ import copy
 import hashlib
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -40,6 +42,8 @@ class TrainHistory:
     seconds: float = 0.0
     resumed_from: str | None = None
     start_epoch: int = 0
+    planned_epochs: int = 0
+    termination_reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -49,9 +53,17 @@ class TrainHistory:
             "stopped_early": self.stopped_early,
             "epochs_run": len(self.train_loss),
             "start_epoch": self.start_epoch,
+            "planned_epochs": self.planned_epochs,
+            "termination_reason": self.termination_reason,
             "resumed_from": self.resumed_from,
             "seconds": round(self.seconds, 1),
         }
+
+
+def _seed_worker(_worker_id: int) -> None:
+    seed = torch.initial_seed() % (2**32)
+    random.seed(seed)
+    np.random.seed(seed)
 
 
 def resolve_device(spec: str = "auto") -> torch.device:
@@ -161,6 +173,11 @@ class VisibilityTrainer:
         self.model_cfg = dict(cfg.get("model", {}))
         self.scoring_cfg = copy.deepcopy(cfg.get("scoring", {}))
         tcfg = cfg.get("train", {})
+        self.seed = int(tcfg.get("seed", 42))
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        self.loader_generator = torch.Generator().manual_seed(self.seed)
         self.ckpt_dir = self.root / tcfg.get(
             "checkpoint_dir", "artifacts/checkpoints/visibility"
         )
@@ -170,6 +187,7 @@ class VisibilityTrainer:
         self.scaler: torch.amp.GradScaler | None = None
         self._pending_scaler_state: dict | None = None
         self.split_signature: str | None = None
+        self._since_best = 0
         # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
 
@@ -229,7 +247,11 @@ class VisibilityTrainer:
 
         dcfg = self.cfg.get("data", {})
         acdc_root = self.root / dcfg.get("acdc_root", "data/raw/acdc")
-        paths = list_ref_images(acdc_root)
+        paths = list_ref_images(
+            acdc_root,
+            cleaning_manifest=dcfg.get("cleaning_manifest"),
+            project_root=self.root / dcfg.get("project_root", "."),
+        )
         if not paths:
             raise FileNotFoundError(
                 f"未在 {acdc_root} 下找到正常天气参考图（*_rgb_ref_anon.png）。"
@@ -269,6 +291,12 @@ class VisibilityTrainer:
                 for p in paths
             ],
             "input_size": size,
+            "grouping": "recording_family-v1" if groups is not None else "image",
+            "split_algorithm": (
+                "recording-family-greedy-nonempty-sse-v1"
+                if groups is not None else "image-permutation-v1"
+            ),
+            "groups": groups,
             "train": train_idx.tolist(),
             "val": val_idx.tolist(),
             "calib": calib_idx.tolist(),
@@ -338,6 +366,21 @@ class VisibilityTrainer:
                 "train": training_config(self.cfg.get("train", {})),
             },
             "split_signature": self.split_signature,
+            "seed": self.seed,
+            "training_complete": self.history.termination_reason is not None,
+            "termination_reason": self.history.termination_reason,
+            "planned_epochs": self.history.planned_epochs,
+            "early_stopping_state": {
+                "wait": self._since_best,
+                "stopped": self.history.stopped_early,
+            },
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
+                "loader": self.loader_generator.get_state(),
+            },
         }
 
     def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
@@ -368,6 +411,20 @@ class VisibilityTrainer:
         self.history.resumed_from = str(self.resume_path)
         epoch = int(ckpt.get("epoch", 0))
         self.history.start_epoch = epoch
+        self.history.seconds = float(ckpt.get("history", {}).get("seconds", 0.0))
+        self._since_best = int(ckpt.get("early_stopping_state", {}).get("wait", 0))
+        rng_state = ckpt.get("rng_state")
+        if rng_state is not None:
+            if ckpt.get("seed") != self.seed:
+                raise ValueError("检查点随机种子与当前配置不一致，请用 --fresh 新开实验")
+            random.setstate(rng_state["python"])
+            np.random.set_state(rng_state["numpy"])
+            torch.set_rng_state(rng_state["torch"])
+            if self.device.type == "cuda" and rng_state["cuda"]:
+                torch.cuda.set_rng_state_all(rng_state["cuda"])
+            self.loader_generator.set_state(rng_state["loader"])
+        else:
+            logger.warning("旧检查点未保存完整随机/采样状态，无法保证中断恢复的随机轨迹一致")
 
         cal = ckpt.get("calibration")
         if cal:
@@ -393,14 +450,17 @@ class VisibilityTrainer:
         train_loader = DataLoader(
             train_ds, batch_size=bs, shuffle=True, num_workers=nw,
             pin_memory=self.device.type == "cuda", drop_last=False,
+            generator=self.loader_generator, worker_init_fn=_seed_worker,
         )
         val_loader = DataLoader(
             val_ds, batch_size=bs, shuffle=False, num_workers=nw,
             pin_memory=self.device.type == "cuda",
+            generator=torch.Generator().manual_seed(self.seed + 1), worker_init_fn=_seed_worker,
         )
         calib_loader = DataLoader(
             calib_ds, batch_size=bs, shuffle=False, num_workers=nw,
             pin_memory=self.device.type == "cuda",
+            generator=torch.Generator().manual_seed(self.seed + 2), worker_init_fn=_seed_worker,
         )
 
         if str(tcfg["optimizer"]).lower() != "adamw":
@@ -430,6 +490,9 @@ class VisibilityTrainer:
                 epochs = start_epoch + extra
             elif tcfg.get("resume_extra_epochs"):
                 epochs = start_epoch + int(tcfg["resume_extra_epochs"])
+        self.history.planned_epochs = epochs
+        self.history.termination_reason = None
+        self.history.stopped_early = False
 
         use_amp = bool(tcfg["amp"]) and self.device.type == "cuda"
         dtype = str(tcfg["dtype"])
@@ -473,7 +536,8 @@ class VisibilityTrainer:
             )
 
         t0 = time.time()
-        since_best = 0
+        elapsed_before = self.history.seconds
+        since_best = self._since_best
         for epoch in range(start_epoch + 1, epochs + 1):
             self.model.train()
             run = torch.zeros((), dtype=torch.float64, device=self.device)
@@ -514,6 +578,14 @@ class VisibilityTrainer:
                 since_best = 0
             else:
                 since_best += 1
+            self._since_best = since_best
+            self.history.stopped_early = bool(es["enabled"] and since_best >= patience)
+            self.history.termination_reason = (
+                "early_stopping" if self.history.stopped_early else (
+                    "budget_completed" if epoch == epochs else None
+                )
+            )
+            self.history.seconds = elapsed_before + time.time() - t0
 
             # 每轮都写：last.pt 用于续训和崩溃恢复，best.pt 只在误差创新低时更新。
             # 写 last.pt 时如果还没有 best，就先用当前轮顶上，保证 best.pt 一直可用。
@@ -528,12 +600,11 @@ class VisibilityTrainer:
                     self.history.best_val_loss, self.history.best_epoch,
                     "  *" if improved else "",
                 )
-            if since_best >= patience:
-                self.history.stopped_early = True
+            if self.history.stopped_early:
                 logger.info("  验证损失连续 %d 轮未改善，提前停止于 epoch %d", patience, epoch)
                 break
 
-        self.history.seconds = time.time() - t0
+        self.history.seconds = elapsed_before + time.time() - t0
 
         # 回滚到验证集选出的最优权重，再用独立校准集算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
@@ -551,6 +622,9 @@ class VisibilityTrainer:
         best_payload["best_val_loss"] = self.history.best_val_loss
         best_payload["best_epoch"] = self.history.best_epoch
         best_payload["current_val_loss"] = self.history.best_val_loss
+        best_payload["training_complete"] = True
+        best_payload["termination_reason"] = self.history.termination_reason
+        best_payload["planned_epochs"] = self.history.planned_epochs
         _atomic_save(best_payload, best_path)
         logger.info("检查点已保存: %s（last: %s）", best_path, last_path)
         return self.history

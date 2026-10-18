@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import subprocess
 import sys
@@ -180,18 +181,169 @@ def test_invalid_or_low_confidence_requests_takeover(config, confidence, field):
     json.dumps(result.to_dict(), allow_nan=False)
 
 
-def test_effective_confidence_applied_exactly_once(config):
+def test_degraded_uses_raw_confidence_for_target_head_and_legacy_weather(config):
     p = scene(
-        target(confidence=0.875),
-        road_condition_confidence=0.875,
+        target(60, confidence=0.7),
+        road_condition="clear",
+        road_condition_confidence=0.7,
         visibility_level="degraded",
-        visibility_confidence_multiplier=0.8,
+        visibility_confidence_multiplier=0.6,
         handover_level=0,
-        handover_confidence=0.875,
+        handover_confidence=0.7,
     )
     assert not evaluate_handover(p, config).should_takeover
-    p.visibility_confidence_multiplier = 0.6
-    assert evaluate_handover(p, config).unable_to_judge
+    assert p.visibility_confidence_multiplier == 0.6
+
+    p.objects[0].confidence = 0.699
+    result = evaluate_handover(p, config)
+    assert result.should_takeover and result.unable_to_judge
+    assert "target_confidence_low" in result.risk.triggered
+
+    p.objects[0].confidence = 1.0
+    p.handover_confidence = 0.699
+    result = evaluate_handover(p, config)
+    assert result.should_takeover and result.unable_to_judge
+
+    p.handover_confidence = 1.0
+    p.road_condition = "rain"
+    p.road_condition_confidence = 0.7
+    assert assess_risk(p, config).risk_level is RiskLevel.NOTICE
+    p.road_condition_confidence = 0.699
+    assert assess_risk(p, config).risk_level is RiskLevel.NOTICE  # DEGRADED itself is NOTICE.
+    assert "天气分类置信度不足" in " ".join(assess_risk(p, config).diagnostics)
+
+
+def test_modern_weather_attributes_override_legacy_and_use_low_probability(config):
+    p = scene(
+        target(60),
+        road_condition="clear",
+        road_condition_confidence=1.0,
+        weather_attributes=("rain",),
+        weather_probabilities={"rain": 0.05},
+    )
+    risk = assess_risk(p, config)
+    assert risk.risk_level is RiskLevel.NOTICE
+    assert "weather_recognized" in risk.triggered
+    assert not risk.diagnostics
+
+    # Attribute-only callers remain supported, and modern empty predictions do not
+    # fall back to a conflicting legacy rain label.
+    p.weather_probabilities = {}
+    assert assess_risk(p, config).risk_level is RiskLevel.NOTICE
+    p.weather_attributes = ()
+    p.weather_probabilities = {"rain": 0.95}
+    p.road_condition = "rain"
+    p.road_condition_confidence = 1.0
+    risk = assess_risk(p, config)
+    assert risk.risk_level is RiskLevel.NONE
+    assert "weather_recognized" not in risk.triggered
+    assert risk.diagnostics
+
+
+def test_weather_attribute_subsets_choose_highest_level_and_max_multiplier(config):
+    levels = {"clear": "none", "fog": "notice", "rain": "critical", "snow": "warning", "night": "notice"}
+    multipliers = {"clear": 1.0, "fog": 1.3, "rain": 1.1, "snow": 1.8, "night": 1.2}
+    custom = load_policy_config(
+        {"weather_risk_levels": levels, "weather_risk_multiplier": multipliers}
+    )
+    rank = {RiskLevel.NONE: 0, RiskLevel.NOTICE: 1, RiskLevel.WARNING: 2, RiskLevel.CRITICAL: 3}
+    attributes = ("fog", "rain", "snow", "night")
+    subsets = [
+        subset
+        for size in range(1, len(attributes) + 1)
+        for subset in itertools.combinations(attributes, size)
+    ]
+    for subset in subsets:
+        p = scene(weather_attributes=subset, weather_probabilities={name: 0.01 for name in subset})
+        risk = assess_risk(p, custom)
+        expected = max((RiskLevel(levels[name]) for name in subset), key=rank.__getitem__)
+        assert risk.risk_level is expected
+        assert risk.triggered.count("weather_recognized") == len(subset)
+
+    # The highest weather risk (rain) and largest distance multiplier (snow)
+    # intentionally come from different attributes.
+    p = scene(target(20), weather_attributes=("rain", "snow"))
+    risk = assess_risk(p, custom)
+    assert risk.risk_level is RiskLevel.CRITICAL
+    target_reason = next(reason for reason in risk.reasons if reason.startswith("目标[0]"))
+    assert "天气倍率 1.8" in target_reason
+
+
+@pytest.mark.parametrize(
+    ("attributes", "probabilities"),
+    [
+        ("rain", {}),
+        (None, {"rain": 0.9}),
+        (("rain", "unknown"), {"rain": 0.9}),
+        (("rain", 1), {"rain": 0.9}),
+        (("rain",), None),
+        (("rain",), {"rain": float("nan")}),
+        (("rain",), {"rain": float("inf")}),
+        (("rain",), {"rain": float("-inf")}),
+        (("rain",), {"rain": None}),
+        (("rain",), {"rain": "0.9"}),
+        (("rain",), {"rain": -0.1}),
+        (("rain",), {"rain": 1.1}),
+        (("rain",), {"unknown": 0.9}),
+        (("rain",), {"rain": 0.9, "unknown": 0.1}),
+        (("rain",), {None: 0.9}),
+        (("rain",), {"rain": True}),
+    ],
+)
+def test_invalid_modern_weather_is_diagnostic_without_legacy_fallback(
+    config, attributes, probabilities
+):
+    p = scene(
+        target(60),
+        visibility_level="degraded",
+        road_condition="rain",
+        road_condition_confidence=1.0,
+        weather_attributes=attributes,
+        weather_probabilities=probabilities,
+    )
+    result = evaluate_handover(p, config)
+    assert not result.should_takeover
+    assert result.risk.risk_level is RiskLevel.NOTICE  # Only the visibility evidence remains.
+    assert "weather_recognized" not in result.risk.triggered
+    assert "weather_visibility_auxiliary_handover" not in result.risk.triggered
+    assert result.risk.diagnostics
+
+
+def test_modern_weather_order_duplicates_and_auxiliary_rule_are_consistent(config):
+    first = scene(weather_attributes=("rain", "fog", "rain"))
+    second = scene(weather_attributes=("fog", "rain"))
+    assert assess_risk(first, config).risk_level is assess_risk(second, config).risk_level
+    assert assess_risk(first, config).triggered.count("weather_recognized") == 2
+
+    for weather in ("fog", "rain", "snow"):
+        result = evaluate_handover(
+            scene(weather_attributes=(weather,), visibility_level="degraded"), config
+        )
+        assert result.should_takeover
+        assert "weather_visibility_auxiliary_handover" in result.risk.triggered
+    night_only = evaluate_handover(
+        scene(weather_attributes=("night",), visibility_level="degraded"), config
+    )
+    assert not night_only.should_takeover
+
+
+def test_legacy_weather_confidence_uses_original_threshold(config):
+    accepted = scene(target(60), road_condition="rain", road_condition_confidence=0.7)
+    rejected = scene(target(60), road_condition="rain", road_condition_confidence=0.699)
+    assert assess_risk(accepted, config).risk_level is RiskLevel.NOTICE
+    assert assess_risk(rejected, config).risk_level is RiskLevel.NONE
+    assert assess_risk(rejected, config).diagnostics
+
+
+def test_weather_policy_does_not_mutate_input(config):
+    p = scene(
+        target(60),
+        weather_attributes=("rain", "fog"),
+        weather_probabilities={"rain": 0.2, "fog": 0.3},
+    )
+    original = copy.deepcopy(p)
+    evaluate_handover(p, config)
+    assert p == original
 
 
 @pytest.mark.parametrize("distance", [None, -1, float("nan"), float("inf"), True, "10", 10**400])
@@ -382,7 +534,9 @@ def test_gate_result_overrides_perception_without_mutation():
     p = scene(target())
     verdict = VisibilityVerdict(level=VisibilityLevel.DEGRADED, reason="test", information=0.4)
     a = AdvisoryGenerator().generate(visibility=verdict, perception=p)
-    assert a.should_takeover and a.policy_details["unable_to_judge"]
+    assert not a.should_takeover
+    assert not a.policy_details["unable_to_judge"]
+    assert a.risk_level is RiskLevel.NOTICE
     assert p.visibility_level == "visible" and p.visibility_confidence_multiplier == 1
 
 

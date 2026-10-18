@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from math import isfinite, isnan
 from typing import Any
 
 from car_smart_assist.config.visibility import GATE_DEFAULTS
@@ -90,7 +91,7 @@ class VisibilityVerdict:
     def confidence_multiplier(self) -> float:
         """给下游感知结果的置信度乘子。
 
-        DEGRADED 时下调下游置信度，让决策层更倾向提示与接管；
+        DEGRADED 的折减值保留供诊断和兼容调用，规则另以原始置信度判断可靠性；
         BLIND 时没有下游结果，返回 0。
         """
         return {
@@ -103,8 +104,8 @@ class VisibilityVerdict:
             "level": self.level.value,
             "reason": self.reason,
             "triggered": self.triggered,
-            "information": self.information,
-            "recon_z": self.recon_z,
+            "information": self.information if isfinite(self.information) else None,
+            "recon_z": self.recon_z if isfinite(self.recon_z) else None,
             "allows_perception": self.allows_perception,
             "confidence_multiplier": self.confidence_multiplier,
         }
@@ -115,7 +116,7 @@ class VisibilityGate:
 
     Args:
         thresholds: 判定阈值
-        require_calibration: 为 True 时，缺少零校准统计就不给出 BLIND；信息量很低时按 DEGRADED 返回。
+        require_calibration: 启用重建判据时是否要求校准统计；不影响信息量独立判 BLIND。
     """
 
     def __init__(
@@ -144,57 +145,59 @@ class VisibilityGate:
         """对单帧打分做判定。"""
         t = self.thresholds
         info = score.information
-        z = score.recon_z
-        has_cal = z == z  # NaN 检查：没有校准时 z 是 NaN
-
-        triggered: list[str] = []
+        if not isfinite(info):
+            raise ValueError("能见度信息量必须为有限值")
 
         # --- BLIND 规则 1：信息量塌陷。这条和场景是否新奇无关 ---
         if info < t.info_blind:
-            triggered.append("info_low")
+            return self._make(
+                VisibilityLevel.BLIND,
+                f"信息量 {info:.3f} < {t.info_blind}",
+                ["info_low"],
+                score,
+            )
+
+        z = score.recon_z
+        has_recon = False
+        if t.use_recon_z:
+            if isnan(z):
+                if self.require_calibration:
+                    raise ValueError("已启用重建判据，但缺少校准后的重建 z 分数")
+            elif not isfinite(z):
+                raise ValueError("启用重建判据时，重建 z 分数不能为无穷大")
+            else:
+                has_recon = True
 
         # --- BLIND 规则 2：极度异常 **且** 信息量已经偏低（两个条件都要满足）---
         # 同时检查 info，避免把信息量较高的新场景误判为看不见。
         #
         # 默认不启用（t.use_recon_z=False）。实测重建误差和退化反相关，
         # 当前实测中这条规则未触发；详见 GateThresholds.use_recon_z 的说明。
-        if t.use_recon_z and has_cal and z > t.z_blind and info < t.info_degraded:
-            triggered.append("recon_extreme_low_info")
-
-        if triggered:
-            if not has_cal and self.require_calibration:
-                # 只有信息量信号可用时，不足以判 BLIND —— 降级为 DEGRADED 并说明原因
-                return self._make(
-                    VisibilityLevel.DEGRADED,
-                    "信息量极低，但缺少零校准统计，保守降级为 DEGRADED；"
-                    "请用 scripts/train_visibility.py 训练以获得完整判定能力",
-                    ["info_low", "no_calibration"],
-                    score,
-                )
+        if has_recon and z > t.z_blind and info < t.info_degraded:
             return self._make(
                 VisibilityLevel.BLIND,
-                f"信息量 {info:.3f} < {t.info_blind}"
-                if "info_low" in triggered
-                else f"重建 z 分数 {z:.1f} > {t.z_blind} 且信息量 {info:.3f} 偏低",
-                triggered,
+                f"重建 z 分数 {z:.1f} > {t.z_blind} 且信息量 {info:.3f} 偏低",
+                ["recon_extreme_low_info"],
                 score,
             )
 
         # --- DEGRADED ---
+        triggered: list[str] = []
         if info < t.info_degraded:
             triggered.append("info_reduced")
-        if t.use_recon_z and has_cal and z > t.z_degraded:
+        if has_recon and z > t.z_degraded:
             triggered.append("recon_anomalous")
         if triggered:
             return self._make(
                 VisibilityLevel.DEGRADED,
                 f"能见度下降：信息量 {info:.3f}，重建 z 分数 "
-                f"{z:.1f}" if has_cal else f"能见度下降：信息量 {info:.3f}",
+                f"{z:.1f}" if has_recon else f"能见度下降：信息量 {info:.3f}",
                 triggered,
                 score,
             )
 
-        return self._make(VisibilityLevel.VISIBLE, "信息量与重建误差均在正常范围", [], score)
+        reason = "信息量与重建误差均在正常范围" if has_recon else "信息量在正常范围"
+        return self._make(VisibilityLevel.VISIBLE, reason, [], score)
 
     def _make(
         self,

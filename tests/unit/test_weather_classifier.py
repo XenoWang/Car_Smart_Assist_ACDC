@@ -247,7 +247,7 @@ def test_weather_warning_is_separate_from_handover_decision():
     assert result.weather_warning == "夜间有雾，视线可能受影响，请减速"
     assert result.perception.weather_attributes == ("fog", "night")
     assert result.advisory.should_takeover is False
-    assert result.advisory.risk_level is RiskLevel.NONE
+    assert result.advisory.risk_level is RiskLevel.NOTICE
 
 
 def test_pipeline_uses_weather_only_as_auxiliary_with_degraded_visibility():

@@ -1,0 +1,90 @@
+visibility:
+  data:
+    project_root: .
+    acdc_root: data/raw/acdc
+    cleaning_manifest: data/processed/manifests/acdc.json
+    train_ratio: 0.80
+    val_ratio: 0.05
+    calib_ratio: 0.05
+    test_ratio: 0.10
+    split_mode: fixed
+    split_seed: 42
+    split_by_sequence: true
+    input_size: [144, 256]
+    cache_path: artifacts/cache/retrain_300_20261017/visibility/ref_images_144x256.npy
+    num_workers: 4
+  model:
+    in_channels: 3
+    base_channels: 16
+    latent_dim: 256
+    input_size: [144, 256]
+    pre_latent_channels: 32
+    encoder_type: multiscale
+    kernel_sizes: [3, 5, 7]
+    use_bottleneck: true
+    dilations: [1, 1, 1]
+  train:
+    epochs: 300
+    batch_size: 32
+    lr: 1.0e-3
+    weight_decay: 0.0
+    optimizer: adamw
+    amp: true
+    dtype: bfloat16
+    augment: true
+    augmentation:
+      contrast_range: [0.9, 1.1]
+      brightness_range: [-0.03, 0.03]
+    denoise_sigma: 0.06
+    grad_clip_norm: 1.0
+    seed: 42
+    early_stopping:
+      enabled: true
+      patience: 8
+      min_delta: 1.0e-5
+    checkpoint_dir: artifacts/checkpoints/retrain_300_20261017/visibility
+  scoring:
+    features:
+      edge_gradient_threshold: 0.04
+      hf_cutoff_ratio: 0.50
+    feature_scales:
+      contrast: 0.25
+      entropy: 8.0
+      edge_density: 0.15
+      hf_ratio: 0.05
+    aggregation:
+      weights:
+        contrast: 0.40
+        entropy: 0.25
+        edge_density: 0.25
+        hf_ratio: 0.10
+      power: -1.0
+      feature_floor: 0.10
+    reconstruction_error:
+      block_grid: [3, 3]
+  thresholds:
+    info_blind: 0.34
+    info_degraded: 0.50
+    z_degraded: 3.0
+    z_blind: 8.0
+    use_recon_z: false
+  require_calibration: true
+  degraded_confidence_multiplier: 0.6
+  degradation:
+    fog:
+      transmission_range: [0.05, 0.30]
+      atmospheric_light: 1.0
+    darkness:
+      gamma_range: [3.0, 6.0]
+      scale_range: [0.02, 0.10]
+    occlusion:
+      coverage_range: [0.75, 0.98]
+    blur:
+      kernel_range: [15, 41]
+    expected_recall: 0.90
+  report:
+    output_dir: artifacts/reports/retrain_300_20261017/visibility
+    sample_per_condition: 200
+    export_gallery: true
+    gallery_size: 32
+  device: auto

@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from car_smart_assist.advisory.policy.risk import RiskAssessment, assess_risk, valid_confidence
+from car_smart_assist.advisory.policy.risk import (
+    RiskAssessment,
+    assess_risk,
+    confirmed_weather,
+    valid_confidence,
+)
 from car_smart_assist.advisory.schema import PerceptionResult, RiskLevel
 from car_smart_assist.config.policy import PolicyConfig
 
@@ -48,12 +53,10 @@ def evaluate_handover(
             reasons.append("接管边界等级无效")
         elif (
             not valid_confidence(perception.handover_confidence)
-            or not valid_confidence(perception.visibility_confidence_multiplier)
-            or perception.effective_confidence(perception.handover_confidence)
-            < config.min_confidence_for_clear
+            or perception.handover_confidence < config.min_confidence_for_clear
         ):
             unable_to_judge = True
-            reasons.append("接管边界识别的有效置信度不足")
+            reasons.append("接管边界识别的原始置信度不足")
         else:
             head_action = config.handover_level_to_action[level]
             if head_action != "no_action":
@@ -65,27 +68,22 @@ def evaluate_handover(
         and isinstance(perception, PerceptionResult)
         and perception.visibility_level == "degraded"
     ):
-        attributes = perception.weather_attributes
-        if isinstance(attributes, (tuple, list)) and all(
-            isinstance(attribute, str) for attribute in attributes
-        ):
-            severe_weather = tuple(
-                condition
-                for condition in config.weather_handover_conditions
-                if condition in attributes
+        attributes, _ = confirmed_weather(perception, config)
+        severe_weather = tuple(
+            condition
+            for condition in config.weather_handover_conditions
+            if condition in attributes
+        )
+        if severe_weather:
+            weather_auxiliary_takeover = True
+            reason = (
+                "天气识别到 "
+                + "/".join(severe_weather)
+                + "，且能见度已下降；天气作为辅助信号请求接管"
             )
-            if severe_weather:
-                weather_auxiliary_takeover = True
-                reason = (
-                    "天气识别到 "
-                    + "/".join(severe_weather)
-                    + "，且能见度已下降；天气作为辅助信号请求接管"
-                )
-                reasons.append(reason)
-                risk.reasons.append(reason)
-                risk.triggered.append("weather_visibility_auxiliary_handover")
-        else:
-            risk.diagnostics.append("天气属性格式无效，未用于接管辅助判断")
+            reasons.append(reason)
+            risk.reasons.append(reason)
+            risk.triggered.append("weather_visibility_auxiliary_handover")
 
     if risk.risk_level is RiskLevel.CRITICAL:
         reasons.append("图片识别结果触发 critical 风险规则")
