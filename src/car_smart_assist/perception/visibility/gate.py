@@ -58,8 +58,27 @@ class GateThresholds:
     # 逐组 recon_z 分布见 scripts/evaluate_visibility.py 的输出。
     use_recon_z: bool = GATE_DEFAULTS["thresholds"]["use_recon_z"]
 
+    def __post_init__(self) -> None:
+        for name in ("info_blind", "info_degraded", "z_degraded", "z_blind"):
+            value = getattr(self, name)
+            if isinstance(value, bool):
+                raise ValueError(f"门控阈值{name}必须是有限数值")
+            try:
+                finite = isfinite(value)
+            except (TypeError, OverflowError):
+                finite = False
+            if not finite:
+                raise ValueError(f"门控阈值{name}必须是有限数值")
+        if not 0 <= self.info_blind <= self.info_degraded <= 1:
+            raise ValueError("门控阈值须满足0 <= info_blind <= info_degraded <= 1")
+        if self.z_degraded > self.z_blind:
+            raise ValueError("门控阈值须满足z_degraded <= z_blind")
+
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> GateThresholds:
+        for name in ("info_blind", "info_degraded", "z_degraded", "z_blind"):
+            if isinstance(cfg.get(name), bool):
+                raise ValueError(f"门控阈值{name}不能使用bool")
         return cls(
             info_blind=float(cfg.get("info_blind", cls.info_blind)),
             info_degraded=float(cfg.get("info_degraded", cls.info_degraded)),

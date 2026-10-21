@@ -24,13 +24,16 @@ def setup_run(root, *, epoch=-1, state_version=None):
         "model": "initial.pt",
         "checkpoint": "artifacts/runs/detection/demo/weights/best.pt",
         "train": {"epochs": 2, "seed": 42, "close_mosaic": 5, "resume_extra_epochs": None},
+        "inference": {"imgsz": 640, "confidence": 0.25, "iou": 0.5, "max_det": 100},
     }
     manifest = {"signature": "dataset", "seed": 42, "classes": [{"name": "car", "source_id": 26}]}
+    selection_contract = cli.yolo_model_selection_contract(cfg, manifest)
     metadata = {
         "dataset_signature": manifest["signature"],
         "seed": 42,
         "classes": manifest["classes"],
         "train_args": {"epochs": 2, "seed": 42, "close_mosaic": 2},
+        "model_selection_contract": selection_contract,
     }
     (run / "run_metadata.json").write_text(json.dumps(metadata))
     torch.save({"epoch": epoch, "optimizer": {} if epoch >= 0 else None}, weights / "last.pt")
@@ -41,6 +44,7 @@ def setup_run(root, *, epoch=-1, state_version=None):
                 {
                     "epochs_completed": 2,
                     "validation_metrics": {"fitness": 0.2},
+                    "model_selection_contract": selection_contract,
                 }
             )
         )
@@ -49,6 +53,7 @@ def setup_run(root, *, epoch=-1, state_version=None):
             {
                 "format_version": state_version,
                 "dataset_signature": manifest["signature"],
+                "model_selection_contract": selection_contract,
                 "checkpoint_sha256": hashlib.sha256((weights / "last.pt").read_bytes()).hexdigest(),
                 "epoch": epoch if epoch >= 0 else 1,
                 "best_fitness": 0.2,
@@ -63,6 +68,7 @@ def test_no_checkpoint_and_explicit_resume(tmp_path):
         "model": "initial.pt",
         "checkpoint": "missing.pt",
         "train": {"epochs": 2, "seed": 42, "close_mosaic": 5},
+        "inference": {"imgsz": 640, "confidence": 0.25, "iou": 0.5, "max_det": 100},
     }
     manifest = {"seed": 42}
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, tmp_path / "new", epochs=1)
@@ -72,12 +78,40 @@ def test_no_checkpoint_and_explicit_resume(tmp_path):
         cli.resolve_training_plan(tmp_path, cfg, manifest, tmp_path / "new", require_resume=True)
 
 
-def test_legacy_completed_model_automatically_reuses_best(tmp_path):
+def test_matching_completed_model_without_full_state_reuses_best_fitness(tmp_path):
     cfg, manifest, run = setup_run(tmp_path)
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
     assert plan["mode"] == "finetune"
     assert plan["checkpoint"] == run / "weights/best.pt"
     assert plan["best_fitness"] == 0.2
+    assert plan["epochs_before_run"] == 2
+
+
+def test_new_directory_finetunes_old_best_without_old_state_or_fitness(tmp_path, monkeypatch):
+    cfg, manifest, source_run = setup_run(tmp_path, state_version=3)
+    metadata_path = source_run / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("model_selection_contract")
+    metadata_path.write_text(json.dumps(metadata))
+    summary_path = source_run / "validation_summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary.pop("model_selection_contract")
+    summary_path.write_text(json.dumps(summary))
+    state_path = source_run / "weights/last_training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    state.pop("model_selection_contract")
+    torch.save(state, state_path)
+
+    def forbidden_load(*args, **kwargs):
+        pytest.fail("new-directory fine-tuning must not load the old resume state")
+
+    monkeypatch.setattr(torch, "load", forbidden_load)
+    new_run = tmp_path / "artifacts/runs/detection/new-name"
+    plan = cli.resolve_training_plan(tmp_path, cfg, manifest, new_run)
+    assert plan["mode"] == "finetune"
+    assert plan["checkpoint"] == source_run / "weights/best.pt"
+    assert plan["resume_state"] is None
+    assert plan["best_fitness"] is None
     assert plan["epochs_before_run"] == 2
 
 
@@ -95,7 +129,7 @@ def test_project_settings_configured_before_checkpoint_import(tmp_path, monkeypa
 
 
 def test_interrupted_run_defaults_to_full_resume(tmp_path):
-    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=1)
+    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=3)
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
     assert plan["mode"] == "resume"
     assert plan["train"]["epochs"] == 2
@@ -104,7 +138,7 @@ def test_interrupted_run_defaults_to_full_resume(tmp_path):
 
 @pytest.mark.parametrize("extra,override,expected", [(None, None, 4), (1, None, 3), (None, 1, 3)])
 def test_completed_full_state_adds_epochs(tmp_path, extra, override, expected):
-    cfg, manifest, run = setup_run(tmp_path, state_version=2)
+    cfg, manifest, run = setup_run(tmp_path, state_version=3)
     cfg["train"]["resume_extra_epochs"] = extra
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run, epochs=override)
     assert plan["mode"] == "resume"
@@ -113,6 +147,10 @@ def test_completed_full_state_adds_epochs(tmp_path, extra, override, expected):
 
 def test_fresh_ignores_existing_model_and_changed_dataset(tmp_path):
     cfg, manifest, run = setup_run(tmp_path)
+    metadata_path = run / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("model_selection_contract")
+    metadata_path.write_text(json.dumps(metadata))
     manifest["signature"] = "changed"
     with pytest.raises(ValueError, match="changed"):
         cli.resolve_training_plan(tmp_path, cfg, manifest, run)
@@ -122,8 +160,52 @@ def test_fresh_ignores_existing_model_and_changed_dataset(tmp_path):
     assert plan["epochs_before_run"] == 0
 
 
+@pytest.mark.parametrize("record_kind", ["metadata", "summary", "state"])
+def test_old_or_changed_selection_contract_is_rejected_before_checkpoint_load(
+    tmp_path, monkeypatch, record_kind
+):
+    cfg, manifest, run = setup_run(
+        tmp_path,
+        epoch=-1 if record_kind == "summary" else (0 if record_kind == "state" else -1),
+        state_version=3 if record_kind == "state" else None,
+    )
+    metadata_path = run / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    if record_kind == "metadata":
+        metadata.pop("model_selection_contract")
+        metadata_path.write_text(json.dumps(metadata))
+    elif record_kind == "summary":
+        summary_path = run / "validation_summary.json"
+        summary = json.loads(summary_path.read_text())
+        summary["model_selection_contract"] = {"imgsz": 641}
+        summary_path.write_text(json.dumps(summary))
+    else:
+        state_path = run / "weights/last_training_state.pt"
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        state["model_selection_contract"] = {"imgsz": 641}
+        torch.save(state, state_path)
+
+    if record_kind != "state":
+        def forbidden_load(*args, **kwargs):
+            pytest.fail("checkpoint deserialization must not occur before contract rejection")
+
+        monkeypatch.setattr(torch, "load", forbidden_load)
+    observed_files = (
+        run / "run_metadata.json",
+        run / "validation_summary.json",
+        run / "weights/last.pt",
+        run / "weights/best.pt",
+        run / "weights/last_training_state.pt",
+    )
+    before = {path: path.read_bytes() for path in observed_files if path.is_file()}
+    with pytest.raises(ValueError, match="contract|missing or changed"):
+        cli.resolve_training_plan(tmp_path, cfg, manifest, run)
+    assert {path: path.read_bytes() for path in before} == before
+    assert not (run / "history").exists()
+
+
 def test_archive_retains_original_files_and_separate_snapshots(tmp_path):
-    _, _, run = setup_run(tmp_path, state_version=2)
+    _, _, run = setup_run(tmp_path, state_version=3)
     original = (run / "weights/best.pt").read_bytes()
     cli.archive_checkpoints(run)
     cli.archive_checkpoints(run)

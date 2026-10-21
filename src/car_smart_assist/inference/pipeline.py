@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
 from PIL import Image
 
 if TYPE_CHECKING:
@@ -19,14 +20,17 @@ from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
 from car_smart_assist.config.visibility import MODEL_DEFAULTS
 from car_smart_assist.config.weather import load_weather_config
-from car_smart_assist.perception.visibility.dataset import read_rgb_image
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
     VisibilityLevel,
     VisibilityVerdict,
 )
 from car_smart_assist.perception.visibility.scorer import VisibilityScorer
-from car_smart_assist.perception.weather import WeatherPrediction, WeatherPredictor
+from car_smart_assist.perception.weather import (
+    WeatherPrediction,
+    WeatherPredictor,
+    select_device,
+)
 from car_smart_assist.perception.weather_pyramid import WeatherPyramidPredictor
 
 logger = logging.getLogger(__name__)
@@ -70,16 +74,31 @@ def _to_array(image: np.ndarray | Image.Image | str | Path) -> np.ndarray:
     """把各种输入统一成 (H, W, 3) uint8 数组。"""
     if isinstance(image, np.ndarray):
         a = image
-        if a.ndim == 2:
-            a = np.stack([a] * 3, axis=-1)
-        if a.shape[-1] == 4:
-            a = a[..., :3]
-        if a.dtype != np.uint8:
-            a = np.clip(a, 0, 255).astype(np.uint8)
-        return np.ascontiguousarray(a)
-    if isinstance(image, Image.Image):
-        return np.asarray(image.convert("RGB"), dtype=np.uint8)
-    return read_rgb_image(image)
+    elif isinstance(image, Image.Image):
+        if not np.isfinite(np.asarray(image)).all():
+            raise ValueError("图像包含 NaN 或 Inf")
+        a = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    elif isinstance(image, (str, Path)):
+        with Image.open(image) as decoded:
+            return _to_array(decoded)
+    else:
+        raise TypeError(f"不支持的图像输入类型: {type(image).__name__}")
+
+    if a.ndim not in (2, 3) or a.shape[0] == 0 or a.shape[1] == 0:
+        raise ValueError(f"图像必须有非空的高和宽，实际形状: {a.shape}")
+    if a.ndim == 3 and a.shape[2] not in (3, 4):
+        raise ValueError(f"图像通道数必须为 3 或 4，实际形状: {a.shape}")
+    if a.dtype.kind not in "buif":
+        raise TypeError(f"图像必须使用实数数值类型，实际类型: {a.dtype}")
+    if not np.isfinite(a).all():
+        raise ValueError("图像包含 NaN 或 Inf")
+    if a.ndim == 2:
+        a = np.stack([a] * 3, axis=-1)
+    if a.shape[2] == 4:
+        a = a[..., :3]
+    if a.dtype != np.uint8:
+        a = np.clip(a, 0, 255).astype(np.uint8)
+    return np.array(a, dtype=np.uint8, order="C", copy=True)
 
 
 class InferencePipeline:
@@ -107,11 +126,13 @@ class InferencePipeline:
         | WeatherPyramidPredictor
         | WeatherAttentionPredictor
         | None = None,
+        predictor_unavailable_reason: str | None = None,
     ) -> None:
         self.scorer = scorer
         self.gate = gate or VisibilityGate()
         self.generator = generator or AdvisoryGenerator()
         self.predictor = predictor
+        self.predictor_unavailable_reason = predictor_unavailable_reason
         self.weather_predictor = weather_predictor
         self.gate_input_size = tuple(gate_input_size)
         self.cfg = cfg or {}
@@ -140,11 +161,17 @@ class InferencePipeline:
         """按配置构建管线。
 
         Args:
+            device: 显式覆盖本次构建的所有模型设备；None 保留各模型配置。
             require_visibility: 为 True（默认）时，门控 checkpoint 不存在就报错。
                 改成 False 会得到一条**没有安全网**的管线 —— 只在调试时用，
                 因为「看不见却不出声」正是这套系统最不能接受的失败模式。
         """
         root = Path(project_root)
+        if device is not None:
+            selected_device = select_device(str(device).strip().lower())
+            if selected_device.type == "cuda" and selected_device.index is None:
+                selected_device = torch.device("cuda", torch.cuda.current_device())
+            device = "cpu" if selected_device.type == "cpu" else str(selected_device)
         tcfg = visibility_cfg.get("train", {})
         model_cfg = visibility_cfg.get("model", {})
         size = tuple(model_cfg.get("input_size", MODEL_DEFAULTS["input_size"]))
@@ -239,7 +266,9 @@ class InferencePipeline:
             if not weather_ckpt.is_absolute():
                 weather_ckpt = root / weather_ckpt
             if weather_ckpt.is_file():
-                weather_predictor = WeatherPredictor.from_checkpoint(weather_ckpt, weather_cfg)
+                weather_predictor = WeatherPredictor.from_checkpoint(
+                    weather_ckpt, weather_cfg, device
+                )
                 logger.info("天气小模型已接入: %s", weather_ckpt)
         elif weather_checkpoint is not None:
             raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
@@ -248,6 +277,7 @@ class InferencePipeline:
             root / "configs/model/yolo_detection.yaml",
             root / "configs/model/yolo_acdc_baseline.yaml",
         )
+        predictor_unavailable_reason = None
         for detection_config_path in detection_paths:
             if predictor is not None or not detection_config_path.is_file():
                 continue
@@ -255,11 +285,21 @@ class InferencePipeline:
             from car_smart_assist.perception.detection_yolo import YoloDetectionPredictor
 
             detection_cfg = load_yolo_config(detection_config_path)
+            if device is not None:
+                detection_cfg = {**detection_cfg, "device": device}
             if not detection_cfg.get("enabled_for_inference", True):
                 continue
             detection_checkpoint = root / detection_cfg["checkpoint"]
             if detection_checkpoint.is_file():
-                predictor = YoloDetectionPredictor.from_config(detection_cfg, root)
+                try:
+                    predictor = YoloDetectionPredictor.from_config(detection_cfg, root)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("YOLO 目标检测未能接入")
+                    predictor_unavailable_reason = (
+                        f"目标检测不可用: {type(exc).__name__}: {exc}"
+                    )
+                    # 当前检测路由校验失败不能静默换成另一个模型绕过校准。
+                    break
                 logger.info("YOLO 目标检测已接入: %s", detection_checkpoint)
 
         return cls(
@@ -267,6 +307,7 @@ class InferencePipeline:
             gate=VisibilityGate.from_config(visibility_cfg),
             generator=AdvisoryGenerator(advisory_cfg),
             predictor=predictor,
+            predictor_unavailable_reason=predictor_unavailable_reason,
             weather_predictor=weather_predictor,
             gate_input_size=size,
             cfg={"visibility": visibility_cfg, "advisory": advisory_cfg or {}},
@@ -310,33 +351,43 @@ class InferencePipeline:
         """批量推理。门控阶段真正批量执行；感知阶段按 predictor 的接口走。"""
         if len(images) == 0:
             return []
-        arrays = [_to_array(im) for im in images]
-        results = [PipelineResult() for _ in arrays]
+        results = [PipelineResult() for _ in images]
+        arrays: list[np.ndarray] = []
+        valid_results: list[PipelineResult] = []
+        for image, result in zip(images, results, strict=True):
+            try:
+                array = _to_array(image)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("图像输入不可用: %s: %s", type(exc).__name__, exc)
+                result.skipped["input"] = f"图像输入不可用: {type(exc).__name__}: {exc}"
+                continue
+            arrays.append(array)
+            valid_results.append(result)
 
         # --- ① 门控 ---
         t0 = time.perf_counter()
         try:
-            verdicts = self._run_gate(arrays)
+            verdicts = self._run_gate(arrays) if arrays else []
         except Exception as exc:  # noqa: BLE001
             # 门控失败不能当成「可见」；记下故障，在建议阶段请求接管。
             logger.exception("能见度门控失败")
             verdicts = []
-            for r in results:
+            for r in valid_results:
                 r.skipped["gate"] = f"门控运行失败: {type(exc).__name__}: {exc}"
         gate_ms = (time.perf_counter() - t0) * 1000.0
         if verdicts:
-            for r, v in zip(results, verdicts, strict=True):
+            for r, v in zip(valid_results, verdicts, strict=True):
                 r.visibility = v
                 r.timings_ms["gate"] = gate_ms / max(len(arrays), 1)
         if self.scorer is None:
-            for r in results:
+            for r in valid_results:
                 r.skipped["gate"] = "未接入能见度门控（scorer 为 None）"
         elif not verdicts:
-            for r in results:
+            for r in valid_results:
                 r.skipped.setdefault("gate", "门控未产出结果")
 
         # --- ② 感知（只对没被阻断的帧）---
-        for i, r in enumerate(results):
+        for array, r in zip(arrays, valid_results, strict=True):
             if self.scorer is not None and "gate" in r.skipped:
                 r.skipped["perception"] = "能见度门控失败，已跳过感知"
                 continue
@@ -348,7 +399,7 @@ class InferencePipeline:
             if self.weather_predictor is not None:
                 weather_started = time.perf_counter()
                 try:
-                    weather = self.weather_predictor.predict(arrays[i])
+                    weather = self.weather_predictor.predict(array)
                     if not isinstance(weather, WeatherPrediction):
                         raise TypeError("weather_predictor.predict() 必须返回 WeatherPrediction")
                     r.weather = weather
@@ -359,14 +410,17 @@ class InferencePipeline:
                 r.timings_ms["weather"] = (time.perf_counter() - weather_started) * 1000.0
 
             if self.predictor is None:
-                r.skipped["perception"] = "目标检测权重或感知 predictor 尚未接入"
+                r.skipped["perception"] = (
+                    self.predictor_unavailable_reason
+                    or "目标检测权重或感知 predictor 尚未接入"
+                )
                 continue
 
             t1 = time.perf_counter()
             try:
                 # 注意：传**原始分辨率**的图，不是门控用的降采样图。
                 # 检测框和单目测距都依赖原始像素尺度。
-                perception = self.predictor.predict(arrays[i])
+                perception = self.predictor.predict(array)
                 if not isinstance(perception, PerceptionResult):
                     raise TypeError(
                         "predictor.predict() 必须返回 PerceptionResult，"
@@ -393,7 +447,9 @@ class InferencePipeline:
         # --- ③ 建议 ---
         t2 = time.perf_counter()
         for r in results:
-            if r.blocked:
+            if "input" in r.skipped:
+                r.advisory = self.generator.from_unavailable(r.skipped["input"])
+            elif r.blocked:
                 r.advisory = self.generator.generate(visibility=r.visibility)
             elif "gate" in r.skipped:
                 r.advisory = self.generator.from_unavailable(r.skipped["gate"])

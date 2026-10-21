@@ -35,6 +35,7 @@ from car_smart_assist.perception.visibility.scorer import CalibrationStats
 from car_smart_assist.perception.visibility.trainer import (
     VisibilityTrainer,
     _atomic_save,
+    _model_state_sha256,
     resolve_resume_spec,
 )
 
@@ -147,6 +148,16 @@ class TestCheckpointResume:
             "train": {"checkpoint_dir": str(tmp_path / "ckpt")},
         }
 
+    def _save_valid_resume_fixture(
+        self, trainer, checkpoint_path, *, epoch, optimizer=None, scheduler=None, val_loss=0.5
+    ):
+        trainer.history.best_epoch = epoch
+        trainer.history.best_val_loss = val_loss
+        trainer._best_model_sha256 = _model_state_sha256(trainer.model.state_dict())
+        payload = trainer._make_payload(epoch, optimizer, scheduler, val_loss)
+        _atomic_save(payload, checkpoint_path.parent / "best.pt")
+        _atomic_save(payload, checkpoint_path)
+        return payload
     # --- resolve_resume_spec ---
 
     def test_resolve_none_when_empty(self, tmp_path):
@@ -195,7 +206,7 @@ class TestCheckpointResume:
     def test_fresh_training_ignores_existing_checkpoint(self, tmp_path):
         cfg = self._cfg(tmp_path)
         t1 = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
-        _atomic_save(t1._make_payload(7, None, None, 0.5), tmp_path / "ckpt" / "last.pt")
+        self._save_valid_resume_fixture(t1, tmp_path / "ckpt" / "last.pt", epoch=7)
 
         t2 = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
         assert t2.resume_path is None, "--fresh 不该捡起已有检查点"
@@ -203,7 +214,7 @@ class TestCheckpointResume:
     def test_auto_resume_picks_up_existing_checkpoint(self, tmp_path):
         cfg = self._cfg(tmp_path)
         t1 = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
-        _atomic_save(t1._make_payload(7, None, None, 0.5), tmp_path / "ckpt" / "last.pt")
+        self._save_valid_resume_fixture(t1, tmp_path / "ckpt" / "last.pt", epoch=7)
 
         t2 = VisibilityTrainer(cfg, project_root=tmp_path, resume="auto")
         assert t2.resume_path is not None
@@ -216,7 +227,7 @@ class TestCheckpointResume:
         """
         cfg_a = self._cfg(tmp_path, base_channels=4)
         t = VisibilityTrainer(cfg_a, project_root=tmp_path, resume="none")
-        _atomic_save(t._make_payload(3, None, None, 0.4), tmp_path / "ckpt" / "last.pt")
+        self._save_valid_resume_fixture(t, tmp_path / "ckpt" / "last.pt", epoch=3, val_loss=0.4)
 
         # 用户改了配置，但检查点是旧结构
         cfg_b = self._cfg(tmp_path, base_channels=16)
@@ -245,7 +256,10 @@ class TestCheckpointResume:
         t1.history.best_epoch = 3
         t1.calibration = CalibrationStats(mean=0.01, std=0.003, p95=0.02, p99=0.03, n=10)
         expected = {k: v.clone() for k, v in t1.model.state_dict().items()}
-        _atomic_save(t1._make_payload(3, opt1, sched1, 0.75), tmp_path / "ckpt" / "last.pt")
+        self._save_valid_resume_fixture(
+            t1, tmp_path / "ckpt" / "last.pt", epoch=3, optimizer=opt1,
+            scheduler=sched1, val_loss=0.75,
+        )
 
         # 新实例：结构随机初始化，随后应被检查点覆盖
         t2 = VisibilityTrainer(cfg, project_root=tmp_path, resume="auto")
@@ -269,8 +283,10 @@ class TestCheckpointResume:
         cfg = self._cfg(tmp_path)
         cfg["scoring"] = {"aggregation": {"power": -2.0}}
         t = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
+        t._best_model_sha256 = _model_state_sha256(t.model.state_dict())
         payload = t._make_payload(1, None, None, 0.1)
-        assert payload["format_version"] == 2
+        assert payload["format_version"] == 3
+        assert payload["best_model_sha256"] == _model_state_sha256(payload["model_state"])
         assert payload["model_cfg"]["latent_dim"] == 8
         assert payload["scoring_cfg"] == cfg["scoring"]
         assert "config_snapshot" in payload
@@ -282,6 +298,7 @@ class TestCheckpointResume:
         cfg["scoring"] = {"aggregation": {"power": -2.0}}
         trainer = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
         checkpoint = tmp_path / "scorer.pt"
+        trainer._best_model_sha256 = _model_state_sha256(trainer.model.state_dict())
         _atomic_save(trainer._make_payload(1, None, None, 0.1), checkpoint)
 
         active_cfg = {"aggregation": {"power": -0.5}}

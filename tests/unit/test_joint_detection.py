@@ -78,16 +78,53 @@ def test_old_output_rows_preserved_when_adding_class():
 
 
 def test_validation_uses_deployment_single_class_selection():
+    from car_smart_assist.perception import joint_yolo_backend as backend
     from car_smart_assist.perception.joint_yolo_backend import DeploymentValidator
 
     validator = DeploymentValidator.__new__(DeploymentValidator)
     validator.args = SimpleNamespace(
-        conf=0.25, iou=0.5, single_cls=False, agnostic_nms=False, max_det=10
+        conf=0.001, iou=0.5, single_cls=False, agnostic_nms=False, max_det=10,
+        task="detect",
     )
+    validator.names = {0: "car", 1: "truck", 2: "bus"}
     validator.end2end = False
     predictions = torch.tensor([[[5.0], [5.0], [4.0], [4.0], [0.8], [0.7], [0.1]]])
     result = validator.postprocess(predictions)
     assert result[0]["cls"].tolist() == [0.0]
+    assert issubclass(backend.JointValidator, DeploymentValidator)
+
+
+def test_training_ap_validation_passes_shared_sweep_contract(monkeypatch):
+    from car_smart_assist.perception import joint_yolo_backend as backend
+    from car_smart_assist.perception.joint_yolo_backend import DeploymentValidator
+
+    captured = {}
+
+    def fake_postprocess(predictions, **kwargs):
+        captured.update(kwargs)
+        return [torch.empty((0, 6))]
+
+    monkeypatch.setattr(backend, "postprocess_detection", fake_postprocess)
+    validator = DeploymentValidator.__new__(DeploymentValidator)
+    validator.args = SimpleNamespace(
+        conf=0.001, iou=0.5, single_cls=False, agnostic_nms=False, max_det=100,
+        task="detect",
+    )
+    validator.names = {0: "car", 1: "truck", 2: "bus"}
+    validator.end2end = False
+    validator.postprocess(torch.empty((1, 7, 1)))
+    assert captured == {
+        "nc": 3,
+        "names": validator.names,
+        "mode": "ap_sweep",
+        "confidence": 0.001,
+        "class_thresholds": None,
+        "iou": 0.5,
+        "agnostic": False,
+        "max_det": 100,
+        "end2end": False,
+        "task": "detect",
+    }
 
 
 def test_validation_ignores_unannotated_classes_and_void_regions(tmp_path):
@@ -117,3 +154,33 @@ def test_validation_ignores_unannotated_classes_and_void_regions(tmp_path):
     result = validator._prepare_pred(predictions, batch)
     assert result["cls"].tolist() == [8.0]
     assert result["conf"].tolist() == pytest.approx([0.9])
+
+
+def test_locked_operating_stats_are_exact_and_macro_excludes_missing_gt(monkeypatch):
+    from car_smart_assist.perception import joint_yolo_backend as backend
+
+    monkeypatch.setattr(backend.DetectionValidator, "get_stats", lambda self: "base-stats")
+    validator = backend.DeploymentValidator.__new__(backend.DeploymentValidator)
+    validator.names = {0: "car", 1: "truck"}
+    validator.postprocess_mode = "locked"
+    validator.metrics = SimpleNamespace(
+        stats={
+            "target_cls": [np.array([0, 0])],
+            "pred_cls": [np.array([0, 0, 1])],
+            "tp": [np.array([[True], [False], [False]])],
+        }
+    )
+
+    result = validator.get_stats()
+
+    assert result == "base-stats"
+    operating = validator.metrics.operating_iou50
+    assert operating["per_class"]["car"] == {
+        "class_id": 0, "tp": 1, "fp": 1, "fn": 1, "support": 2,
+        "precision": 0.5, "recall": 0.5, "f1": 0.5, "has_ground_truth": True,
+    }
+    assert operating["per_class"]["truck"]["tp"] == 0
+    assert operating["per_class"]["truck"]["fp"] == 1
+    assert operating["per_class"]["truck"]["fn"] == 0
+    assert operating["per_class"]["truck"]["has_ground_truth"] is False
+    assert operating["macro"] == {"precision": 0.5, "recall": 0.5, "f1": 0.5}

@@ -43,10 +43,12 @@ class StubScorer:
         self.information = information
         self.recon_z = recon_z
         self.seen_shapes: list[tuple[int, int]] = []
+        self.calls = 0
 
     def score_arrays(self, images, paths=None):
         from car_smart_assist.perception.visibility.scorer import InformationFeatures
 
+        self.calls += 1
         out = []
         for i, im in enumerate(images):
             self.seen_shapes.append(im.shape[:2])
@@ -121,6 +123,56 @@ def make_pipeline(information: float = 0.9, predictor=None, **kw) -> InferencePi
 def frame(h: int = 720, w: int = 1280) -> np.ndarray:
     rng = np.random.default_rng(0)
     return rng.integers(0, 256, (h, w, 3), dtype=np.uint8)
+
+
+def test_mixed_valid_and_unreadable_inputs_preserve_order_and_fail_closed(tmp_path):
+    scorer = StubScorer(information=0.95)
+    predictor = StubPredictor()
+    pipe = InferencePipeline(
+        scorer=scorer,
+        gate=VisibilityGate(GateThresholds(), require_calibration=False),
+        predictor=predictor,
+    )
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"not an image")
+    valid_a, valid_b = frame(), frame(360, 640)
+    originals = [valid_a.copy(), valid_b.copy()]
+
+    results = pipe.run_batch([valid_a, broken, valid_b])
+
+    assert len(results) == 3
+    assert results[0].perception is not None
+    assert results[1].perception is None
+    assert "input" in results[1].skipped
+    assert results[1].blocked is False
+    assert results[1].visibility is None
+    assert results[1].advisory.should_takeover is True
+    assert results[2].perception is not None
+    assert scorer.calls == 1
+    assert predictor.seen_shapes == [(720, 1280), (360, 640)]
+    np.testing.assert_array_equal(valid_a, originals[0])
+    np.testing.assert_array_equal(valid_b, originals[1])
+
+
+def test_all_unreadable_inputs_skip_scorer_and_predictor(tmp_path):
+    scorer = StubScorer()
+    predictor = StubPredictor()
+    pipe = InferencePipeline(
+        scorer=scorer,
+        gate=VisibilityGate(GateThresholds(), require_calibration=False),
+        predictor=predictor,
+    )
+    broken = tmp_path / "broken.png"
+    broken.write_bytes(b"not an image")
+
+    results = pipe.run_batch([broken, np.zeros((0, 10, 3), dtype=np.uint8)])
+
+    assert len(results) == 2
+    assert all("input" in result.skipped for result in results)
+    assert all(result.visibility is None and result.blocked is False for result in results)
+    assert all(result.perception is None and result.advisory.should_takeover for result in results)
+    assert scorer.calls == 0
+    assert predictor.seen_shapes == []
 
 
 

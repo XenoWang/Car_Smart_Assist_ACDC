@@ -81,14 +81,27 @@ def test_invalid_only_manifest_excludes_invalid_but_keeps_unlisted_suspect_and_r
     assert paths == [suspect]
 
 
-def test_missing_invalid_manifest_keeps_legacy_sample_enumeration(tmp_path):
+def test_missing_manifest_errors_even_when_sample_collection_is_empty(tmp_path):
+    missing = "data/processed/manifests/not-created.json"
+    acdc_root = tmp_path / "data/raw/acdc"
+    with pytest.raises(FileNotFoundError) as exc_info:
+        list_ref_images(
+            acdc_root,
+            cleaning_manifest=missing,
+            project_root=tmp_path,
+        )
+
+    message = str(exc_info.value)
+    assert str(tmp_path / missing) in message
+    assert str(tmp_path) in message
+    assert "先进行数据清洗" in message
+    assert r".\.venv\Scripts\python.exe -X utf8 scripts\clean_data.py --only acdc --corrupt-images-only" in message
+
+
+def test_none_manifest_preserves_legacy_sample_enumeration(tmp_path):
     acdc_root = tmp_path / "data/raw/acdc"
     paths = {_ref(tmp_path, "fog", "GOPR0001", 1), _ref(tmp_path, "snow", "GOPR0002", 2)}
-    found = list_ref_images(
-        acdc_root,
-        cleaning_manifest="data/processed/manifests/not-created.json",
-        project_root=tmp_path,
-    )
+    found = list_ref_images(acdc_root, cleaning_manifest=None, project_root=tmp_path)
     assert set(found) == paths
 
 

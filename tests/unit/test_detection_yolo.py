@@ -1,6 +1,5 @@
 """适配器的约定：RGB、原图坐标，以及明确的能力限制。"""
 
-import hashlib
 import json
 from types import SimpleNamespace
 
@@ -8,6 +7,7 @@ import numpy as np
 import pytest
 
 from car_smart_assist.perception.detection_yolo import YoloDetectionPredictor
+from car_smart_assist.perception.yolo_postprocess import calibration_identity, calibration_path
 
 
 class ArrayResult:
@@ -26,8 +26,35 @@ def config():
         "device": "cpu",
         "checkpoint": "best.pt",
         "calibration_file": "calibration.json",
+        "data": "data/data.yaml",
         "inference": {"imgsz": 640, "confidence": 0.25, "iou": 0.5, "max_det": 100},
     }
+
+
+def _write_valid_calibration(root, cfg):
+    checkpoint = root / cfg["checkpoint"]
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(b"weights")
+    data_dir = root / cfg["data"]
+    data_dir.parent.mkdir(parents=True, exist_ok=True)
+    manifest = {"classes": ["car", "truck"], "signature": "fixture-data"}
+    (data_dir.parent / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    identity = calibration_identity(root, cfg, {0: "car", 1: "truck"}, checkpoint, manifest)
+    payload = {
+        **identity,
+        "split": "calibration",
+        "passes": [identity["calibration_selection_mode"], identity["mode"]],
+        "confidence_threshold": 0.31,
+        "class_confidence_thresholds": {"car": 0.31, "truck": 0.31},
+        "class_threshold_sources": {"car": "fixture", "truck": "fixture"},
+    }
+    path = calibration_path(root, cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _model(predict):
+    return SimpleNamespace(names={0: "car", 1: "truck"}, predictor=object(), predict=predict)
 
 
 @pytest.mark.parametrize("empty", [False, True])
@@ -47,7 +74,11 @@ def test_rgb_boxes_and_unimplemented_obstacle_capability(tmp_path, empty):
             )
         ]
 
-    adapter = YoloDetectionPredictor(SimpleNamespace(predict=predict), config(), tmp_path)
+    cfg = config()
+    _write_valid_calibration(tmp_path, cfg)
+    model = _model(predict)
+    adapter = YoloDetectionPredictor(model, cfg, tmp_path)
+    assert model.predictor is None  # cached default predictor is cleared at adapter setup
     rgb = np.zeros((60, 90, 3), dtype=np.uint8)
     rgb[..., 0] = 255
     result = adapter.predict(rgb)
@@ -67,33 +98,51 @@ def test_rgb_boxes_and_unimplemented_obstacle_capability(tmp_path, empty):
 
 
 def test_calibration_bound_to_checkpoint(tmp_path):
-    (tmp_path / "best.pt").write_bytes(b"weights")
-    calibration = tmp_path / "calibration.json"
-    calibration.write_text(
-        json.dumps(
-            {
-                "checkpoint_sha256": hashlib.sha256(b"weights").hexdigest(),
-                "confidence_threshold": 0.31,
-                "nms_iou": 0.5,
-                "imgsz": 640,
-                "max_det": 100,
-            }
-        )
-    )
-    adapter = YoloDetectionPredictor(None, config(), tmp_path)
+    cfg = config()
+    _write_valid_calibration(tmp_path, cfg)
+    adapter = YoloDetectionPredictor(_model(lambda **kwargs: []), cfg, tmp_path)
     assert adapter.confidence == 0.31
     changed_cfg = config()
     changed_cfg["inference"]["iou"] = 0.7
-    with pytest.raises(ValueError, match="settings changed"):
-        YoloDetectionPredictor(None, changed_cfg, tmp_path)
+    with pytest.raises(ValueError, match="identity/settings changed"):
+        YoloDetectionPredictor(_model(lambda **kwargs: []), changed_cfg, tmp_path)
     (tmp_path / "best.pt").write_bytes(b"changed")
-    with pytest.raises(ValueError, match="different weights"):
-        YoloDetectionPredictor(None, config(), tmp_path)
+    with pytest.raises(ValueError, match="identity/settings changed"):
+        YoloDetectionPredictor(_model(lambda **kwargs: []), config(), tmp_path)
 
 
 def test_reject_non_rgb_uint8(tmp_path):
-    adapter = YoloDetectionPredictor(None, config(), tmp_path)
+    cfg = config()
+    _write_valid_calibration(tmp_path, cfg)
+    adapter = YoloDetectionPredictor(_model(lambda **kwargs: []), cfg, tmp_path)
     with pytest.raises(ValueError, match="RGB uint8"):
         adapter.predict(np.zeros((20, 30), dtype=np.uint8))
     with pytest.raises(ValueError, match="RGB uint8"):
         adapter.predict(np.zeros((20, 30, 3), dtype=np.float32))
+
+
+def test_installed_predictor_postprocess_calls_shared_helper(monkeypatch):
+    import car_smart_assist.perception.yolo_postprocess as postprocess_module
+
+    from car_smart_assist.perception.yolo_postprocess import detection_predictor_class
+
+    calls = []
+    monkeypatch.setattr(
+        postprocess_module,
+        "postprocess_detection",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or [],
+    )
+    predictor_type = detection_predictor_class(0.3, {"car": 0.3})
+    predictor = predictor_type.__new__(predictor_type)
+    predictor.model = SimpleNamespace(names={0: "car"}, end2end=False)
+    predictor.args = SimpleNamespace(
+        iou=0.5, max_det=100, agnostic_nms=False, task="detect"
+    )
+    monkeypatch.setattr(predictor_type, "construct_results", lambda self, *args: args[0])
+
+    result = predictor.postprocess(object(), object(), [])
+
+    assert result == []
+    assert len(calls) == 1
+    assert calls[0][1]["mode"] == "locked"
+    assert calls[0][1]["class_thresholds"] == {"car": 0.3}

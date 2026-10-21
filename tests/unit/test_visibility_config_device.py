@@ -73,7 +73,8 @@ def test_configured_augmentation_changes_pixels(tmp_path):
         VisibilityImageDataset([], augmentation_cfg={"contrast_range": [2, 1]})
 
 
-def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("cleaning_manifest", [None, "cleaning.json"])
+def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch, cleaning_manifest):
     root = tmp_path / "images"
     root.mkdir()
     paths = [root / f"{i}.png" for i in range(20)]
@@ -89,14 +90,14 @@ def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch):
     cfg = {
         "device": "cpu",
         "model": {"base_channels": 2, "latent_dim": 4, "input_size": [16, 16]},
-        "data": {"acdc_root": "images", "split_by_sequence": False},
+        "data": {"acdc_root": "images", "split_by_sequence": False, "cleaning_manifest": cleaning_manifest},
         "train": {"augment": False, "augmentation": {"contrast_range": [1, 1]}},
     }
     trainer = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
     train, val, calib, _ = trainer._build_datasets()
     assert train.augment is val.augment is calib.augment is False
     assert train.contrast_range == (1.0, 1.0)
-    assert calls == [(tmp_path / "images", None, tmp_path)]
+    assert calls == [(tmp_path / "images", cleaning_manifest, tmp_path)]
 
 
 @pytest.mark.gpu
@@ -108,8 +109,9 @@ def test_actual_gpu_training_and_resume(tmp_path, monkeypatch, dtype):
         "model": {"base_channels": 2, "latent_dim": 4, "input_size": [16, 16]},
         "data": {"num_workers": 0},
         "train": {
-            "epochs": 1, "batch_size": 2, "dtype": dtype,
-            "checkpoint_dir": str(tmp_path), "early_stopping": {"enabled": False},
+            "epochs": 3, "batch_size": 2, "dtype": dtype,
+            "checkpoint_dir": str(tmp_path),
+            "early_stopping": {"enabled": True, "patience": 1, "min_delta": 1e6},
         },
     }
     samples = torch.linspace(0, 1, 4 * 3 * 16 * 16).reshape(4, 3, 16, 16)
@@ -123,7 +125,20 @@ def test_actual_gpu_training_and_resume(tmp_path, monkeypatch, dtype):
     if dtype == "float16":
         checkpoint = torch.load(tmp_path / "last.pt", map_location="cpu", weights_only=False)
         assert checkpoint["scaler_state"]
+        assert checkpoint["optimizer_state"]["param_groups"][0]["lr"] > 0
         resumed = VisibilityTrainer(cfg, resume="auto")
         resumed.fit()
         assert resumed.scaler.is_enabled()
         assert resumed._pending_scaler_state == checkpoint["scaler_state"]
+
+
+def test_pipeline_rejects_unsupported_device_before_build_and_preserves_config(tmp_path):
+    from car_smart_assist.inference.pipeline import InferencePipeline
+
+    cfg = {"device": "auto", "data": {}, "model": {}, "train": {}}
+    original = {key: value.copy() if isinstance(value, dict) else value for key, value in cfg.items()}
+    with pytest.raises(ValueError, match="只支持 CPU 或 CUDA"):
+        InferencePipeline.from_config(
+            cfg, project_root=tmp_path, device="mps", require_visibility=False
+        )
+    assert cfg == original

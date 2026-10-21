@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import hashlib
+import json
+from copy import copy
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from car_smart_assist.config.detection import yolo_selection_validator_args
+
+
+def require_model_selection_contract(record, contract):
+    previous = record.get("model_selection_contract")
+    if previous is None or json.dumps(previous, sort_keys=True) != json.dumps(contract, sort_keys=True):
+        raise ValueError(
+            "Existing run model-selection contract is missing or changed; "
+            "use a new run directory (--name) to fine-tune from the old best weights"
+        )
 
 
 def _plain_numbers(value):
@@ -19,12 +32,15 @@ def _plain_numbers(value):
     return value
 
 
-def load_training_state(path: Path, checkpoint: Path, dataset_signature: str) -> dict:
+def load_training_state(
+    path: Path, checkpoint: Path, dataset_signature: str, selection_contract: dict
+) -> dict:
     if not path.is_file():
         raise ValueError(
             "Full-precision resume state is missing; start a new run from trained weights"
         )
     state = torch.load(path, map_location="cpu", weights_only=True)
+    require_model_selection_contract(state, selection_contract)
     if (
         state["dataset_signature"] != dataset_signature
         or state["checkpoint_sha256"] != hashlib.sha256(checkpoint.read_bytes()).hexdigest()
@@ -34,12 +50,17 @@ def load_training_state(path: Path, checkpoint: Path, dataset_signature: str) ->
 
 
 def attach_training_state_callbacks(
-    model, dataset_signature: str, resume_state: dict | None, best_fitness: float | None = None
+    model, dataset_signature: str, resume_state: dict | None, best_fitness: float | None = None,
+    *, selection_contract: dict,
 ) -> None:
+    if resume_state is not None:
+        require_model_selection_contract(resume_state, selection_contract)
+
     def save_state(trainer):
         state = {
-            "format_version": 2,
+            "format_version": 3,
             "dataset_signature": dataset_signature,
+            "model_selection_contract": selection_contract,
             "checkpoint_sha256": hashlib.sha256(trainer.last.read_bytes()).hexdigest(),
             "epoch": trainer.epoch,
             "best_fitness": trainer.best_fitness,
@@ -92,11 +113,40 @@ def attach_training_state_callbacks(
     model.add_callback("on_train_end", finalize_state)
 
 
-def detection_trainer_for_resume(resume_state: dict | None):
+def detection_trainer_for_resume(resume_state: dict | None, selection_contract: dict):
     """等项目本地的 Ultralytics 设置初始化完成后再延迟导入。"""
+    from ultralytics.data import build_yolo_dataset
     from ultralytics.models.yolo.detect import DetectionTrainer
+    from ultralytics.utils.checks import check_imgsz
+    from ultralytics.utils.torch_utils import de_parallel
 
     class ProjectDetectionTrainer(DetectionTrainer):
+        def validation_args(self):
+            args = copy(self.args)
+            for name, value in yolo_selection_validator_args(selection_contract).items():
+                setattr(args, name, value)
+            args.imgsz = check_imgsz(args.imgsz, max_dim=1)
+            return args
+
+        def build_dataset(self, img_path, mode="train", batch=None):
+            if mode != "val":
+                return super().build_dataset(img_path, mode, batch)
+            stride = max(int(de_parallel(self.model).stride.max() if self.model else 0), 32)
+            return build_yolo_dataset(
+                self.validation_args(), img_path, batch, self.data, mode=mode, rect=True,
+                stride=stride,
+            )
+
+        def get_validator(self):
+            # Joint backend在模块级引用本factory，延迟到此处导入避免循环。
+            from car_smart_assist.perception.joint_yolo_backend import DeploymentValidator
+
+            self.loss_names = "box_loss", "cls_loss", "dfl_loss"
+            return DeploymentValidator(
+                self.test_loader, save_dir=self.save_dir, args=self.validation_args(),
+                _callbacks=self.callbacks,
+            )
+
         def check_resume(self, overrides):
             super().check_resume(overrides)
             if self.resume:

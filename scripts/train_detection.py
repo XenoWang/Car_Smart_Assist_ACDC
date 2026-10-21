@@ -13,7 +13,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from car_smart_assist.config.detection import load_yolo_config, resolve_yolo_device  # noqa: E402
+from car_smart_assist.config.detection import (  # noqa: E402
+    load_yolo_config,
+    resolve_yolo_device,
+    yolo_model_selection_contract,
+)
 from car_smart_assist.data.detection import validate_detection_export  # noqa: E402
 from car_smart_assist.perception.detection_yolo import (  # noqa: E402
     configure_yolo_environment,
@@ -23,6 +27,7 @@ from car_smart_assist.perception.yolo_training import (  # noqa: E402
     attach_training_state_callbacks,
     detection_trainer_for_resume,
     load_training_state,
+    require_model_selection_contract,
 )
 
 
@@ -46,16 +51,27 @@ def resolve_training_plan(
         "best_fitness": None,
         "epochs_before_run": 0,
         "completed": False,
+        "model_selection_contract": yolo_model_selection_contract(cfg, manifest),
     }
     if fresh:
         return plan
-    candidates = (run / "weights/last.pt", run / "weights/best.pt", root / cfg["checkpoint"])
+    selection_contract = plan["model_selection_contract"]
+    local_checkpoints = (run / "weights/last.pt", run / "weights/best.pt")
+    if any(path.is_file() for path in local_checkpoints):
+        metadata_path = run / "run_metadata.json"
+        if not metadata_path.is_file():
+            require_model_selection_contract({}, selection_contract)
+        require_model_selection_contract(
+            json.loads(metadata_path.read_text(encoding="utf-8")), selection_contract
+        )
+    candidates = (*local_checkpoints, root / cfg["checkpoint"])
     checkpoint = next((path for path in candidates if path.is_file()), None)
     if checkpoint is None:
         if require_resume:
             raise FileNotFoundError("No existing detection checkpoint to resume")
         return plan
     source_run = checkpoint.parent.parent
+    same_run = source_run.resolve() == run.resolve()
     previous = json.loads((source_run / "run_metadata.json").read_text(encoding="utf-8"))
     if (
         previous["dataset_signature"] != manifest["signature"]
@@ -65,21 +81,25 @@ def resolve_training_plan(
         raise ValueError("Existing model dataset/seed/classes changed; use --fresh")
     summary_path = source_run / "validation_summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.is_file() else {}
-    # 反序列化 YOLO checkpoint 会导入 Ultralytics，所以要在这次读取之前就设好它的本地
-    # 配置，而不是只在构建 predictor 之前设。
-    configure_yolo_environment(root)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    completed = int(payload.get("epoch", -1)) < 0
-    state_path = checkpoint.parent / "last_training_state.pt"
+    if same_run and summary_path.is_file():
+        require_model_selection_contract(summary, selection_contract)
     state = None
-    same_run = source_run.resolve() == run.resolve()
-    if same_run and checkpoint.name == "last.pt":
-        if not completed:
-            state = load_training_state(state_path, checkpoint, manifest["signature"])
-        elif state_path.is_file():
-            candidate = torch.load(state_path, map_location="cpu", weights_only=True)
-            if candidate.get("format_version", 1) >= 2:
-                state = load_training_state(state_path, checkpoint, manifest["signature"])
+    completed = False
+    if same_run:
+        state_path = checkpoint.parent / "last_training_state.pt"
+        if checkpoint.name == "last.pt" and state_path.is_file():
+            state = load_training_state(
+                state_path, checkpoint, manifest["signature"], selection_contract
+            )
+        # 旧metadata在以上检查中拒绝；仅合法同目录恢复需要读取checkpoint的epoch。
+        # 反序列化会导入Ultralytics，须先设好项目本地配置。
+        configure_yolo_environment(root)
+        payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+        completed = int(payload.get("epoch", -1)) < 0
+        if checkpoint.name == "last.pt" and not completed and state is None:
+            state = load_training_state(
+                state_path, checkpoint, manifest["signature"], selection_contract
+            )
     plan["checkpoint"] = checkpoint
     plan["completed"] = completed
     if state is not None:
@@ -99,8 +119,7 @@ def resolve_training_plan(
             epochs_before_run=previous.get("epochs_before_run", 0),
         )
     else:
-        # 旧版已完成的 checkpoint 只含权重；续训从现有 best 权重开始，
-        # 优化器重新初始化，此路径不加载 COCO 预训练权重。
+        # 新目录只微调best权重；同目录无FP32状态时仅允许合同匹配的历史分数。
         best = checkpoint.parent / "best.pt"
         plan["checkpoint"] = best if best.is_file() else checkpoint
         train["epochs"] = extra or train["epochs"]
@@ -187,13 +206,15 @@ def main() -> int:
             "source_checkpoint": str(plan["checkpoint"]),
             "epochs_before_run": plan["epochs_before_run"],
             "joint_foreground_exclusive": cfg.get("joint_foreground_exclusive", True),
+            "model_selection_contract": plan["model_selection_contract"],
         }
         run.mkdir(parents=True, exist_ok=True)
         model = load_yolo_model(root, plan["checkpoint"])
         if args.fresh or plan["mode"] == "finetune" or plan["completed"]:
             archive_checkpoints(run)
         attach_training_state_callbacks(
-            model, manifest["signature"], plan["resume_state"], plan["best_fitness"]
+            model, manifest["signature"], plan["resume_state"], plan["best_fitness"],
+            selection_contract=plan["model_selection_contract"],
         )
 
         def save_metadata(_trainer):
@@ -207,12 +228,19 @@ def main() -> int:
         print(
             f"YOLO training mode: {plan['mode']}; source: {plan['checkpoint']}; target epochs: {train['epochs']}"
         )
-        trainer_class = detection_trainer_for_resume(plan["resume_state"])
+        print(
+            "YOLO model-selection contract (validation only): "
+            + json.dumps(plan["model_selection_contract"], ensure_ascii=False, sort_keys=True)
+        )
+        trainer_class = detection_trainer_for_resume(
+            plan["resume_state"], plan["model_selection_contract"]
+        )
         if manifest.get("joint_supervision"):
             from car_smart_assist.perception.joint_yolo_backend import joint_trainer
 
             trainer_class = joint_trainer(
-                plan["resume_state"], cfg.get("joint_foreground_exclusive", True)
+                plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
+                selection_contract=plan["model_selection_contract"],
             )
         results = model.train(
             data=str(data),

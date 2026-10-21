@@ -33,7 +33,14 @@ def _exclude_invalid(
     if cleaning_manifest is None:
         return list(paths)
     root = Path(project_root)
-    invalid = load_invalid_entries(root / cleaning_manifest, root)
+    manifest_path = root / cleaning_manifest
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"清洗清单不存在：{manifest_path}。请先进行数据清洗。\n"
+            f"在项目根目录（{root}）运行：\n"
+            r".\.venv\Scripts\python.exe -X utf8 scripts\clean_data.py --only acdc --corrupt-images-only"
+        )
+    invalid = load_invalid_entries(manifest_path, root)
     return [path for path in paths if str(path.resolve()) not in invalid]
 
 

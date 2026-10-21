@@ -60,6 +60,19 @@ class TrainHistory:
         }
 
 
+def _model_state_sha256(state: dict[str, torch.Tensor]) -> str:
+    """只绑定权重，校准与历史记录的更新不会改变其身份。"""
+    digest = hashlib.sha256()
+    for name, value in sorted(state.items()):
+        tensor = value.detach().cpu().contiguous()
+        header = json.dumps([name, str(tensor.dtype), list(tensor.shape)],
+                            ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        digest.update(len(header).to_bytes(8, "big"))
+        digest.update(header)
+        digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
 def _seed_worker(_worker_id: int) -> None:
     seed = torch.initial_seed() % (2**32)
     random.seed(seed)
@@ -186,8 +199,11 @@ class VisibilityTrainer:
         self.calibration: CalibrationStats | None = None
         self.scaler: torch.amp.GradScaler | None = None
         self._pending_scaler_state: dict | None = None
+        self._resume_train_cfg: dict[str, Any] | None = None
+        self._resume_training_complete = False
         self.split_signature: str | None = None
         self._since_best = 0
+        self._best_model_sha256: str | None = None
         # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
 
@@ -201,6 +217,12 @@ class VisibilityTrainer:
                     f"检查点 {self.resume_path} 使用旧的 train/calib/test 划分策略，"
                     "其 best 权重曾由校准集选出，不能用于独立校准流程。"
                     "请使用 --fresh 从头训练；旧 best.pt 仍可用于当前推理。"
+                )
+            if int(head.get("format_version", 1)) < 3 or not head.get("best_model_sha256"):
+                raise ValueError(
+                    "旧AE检查点没有可核验的历史best身份，不能完整续训。"
+                    "请保留原件；可用 --fresh 新开实验，旧权重仍可推理。"
+                    "如需沿旧权重微调，请另行指定微调方案。"
                 )
             ckpt_model_cfg = head.get("model_cfg")
             if ckpt_model_cfg and ckpt_model_cfg != self.model_cfg:
@@ -345,7 +367,8 @@ class VisibilityTrainer:
         val_loss: float | None,
     ) -> dict[str, Any]:
         return {
-            "format_version": 2,
+            "format_version": 3,
+            "best_model_sha256": self._best_model_sha256,
             "model_state": self.model.state_dict(),
             "model_cfg": self.model_cfg,
             "scoring_cfg": self.scoring_cfg,
@@ -383,6 +406,28 @@ class VisibilityTrainer:
             },
         }
 
+    def _load_verified_best(self, reference: dict[str, Any]) -> dict[str, Any]:
+        expected = reference.get("best_model_sha256")
+        if (not isinstance(expected, str) or len(expected) != 64
+                or any(char not in "0123456789abcdef" for char in expected)):
+            raise ValueError("AE历史best身份缺失或无效，不能完整续训；请保留原件并另行指定微调方案或 --fresh")
+        path = self.ckpt_dir / "best.pt"
+        if not path.is_file():
+            raise ValueError(
+                f"历史best缺失：{path}。请使用保有匹配best的原训练目录；"
+                "不会把last或恢复后的第一轮当成历史best。"
+            )
+        best = torch.load(path, map_location="cpu", weights_only=False)
+        for key in ("split_signature", "seed", "model_cfg", "best_epoch", "best_val_loss"):
+            if key not in reference or key not in best or best[key] != reference[key]:
+                raise ValueError(f"历史best与恢复记录的{key}不匹配：{path}，拒绝完整续训")
+        if (best.get("best_model_sha256") != expected
+                or best.get("epoch") != reference["best_epoch"]
+                or best.get("current_val_loss") != reference["best_val_loss"]
+                or _model_state_sha256(best["model_state"]) != expected):
+            raise ValueError(f"历史best权重身份或指标不匹配：{path}，拒绝完整续训")
+        return best
+
     def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
@@ -395,6 +440,8 @@ class VisibilityTrainer:
                 "请确认数据和 split 配置未变，或使用 --fresh 重新训练。"
             )
 
+        self._load_verified_best(ckpt)
+        self._best_model_sha256 = ckpt["best_model_sha256"]
         self.model.load_state_dict(ckpt["model_state"])
         self._pending_scaler_state = ckpt.get("scaler_state")
         if ckpt.get("optimizer_state") is not None:
@@ -411,6 +458,9 @@ class VisibilityTrainer:
         self.history.resumed_from = str(self.resume_path)
         epoch = int(ckpt.get("epoch", 0))
         self.history.start_epoch = epoch
+        self.history.planned_epochs = int(ckpt.get("planned_epochs", 0))
+        self._resume_train_cfg = ckpt.get("config_snapshot", {}).get("train")
+        self._resume_training_complete = bool(ckpt.get("training_complete", False))
         self.history.seconds = float(ckpt.get("history", {}).get("seconds", 0.0))
         self._since_best = int(ckpt.get("early_stopping_state", {}).get("wait", 0))
         rng_state = ckpt.get("rng_state")
@@ -478,7 +528,18 @@ class VisibilityTrainer:
         start_epoch = 0
         if self.resume_path is not None:
             start_epoch = self._restore(opt, sched)
-            if start_epoch >= epochs:
+            same_budget = self._resume_train_cfg is not None and all(
+                self._resume_train_cfg.get(key) == tcfg.get(key)
+                for key in ("epochs", "resume_extra_epochs")
+            )
+            if (
+                same_budget
+                and not self._resume_training_complete
+                and self.history.planned_epochs > start_epoch
+            ):
+                # 追加段中断后继续原终点，不能每次恢复都再加一份 extra。
+                epochs = self.history.planned_epochs
+            elif start_epoch >= epochs:
                 # 续训时 epochs 表示「再训多少轮」，不是「总共多少轮」，
                 # 否则从第 38 轮续训、epochs=40 就只剩 2 轮，等于什么都没做。
                 extra = tcfg.get("resume_extra_epochs")
@@ -490,6 +551,26 @@ class VisibilityTrainer:
                 epochs = start_epoch + extra
             elif tcfg.get("resume_extra_epochs"):
                 epochs = start_epoch + int(tcfg["resume_extra_epochs"])
+
+            requested_remaining = epochs - start_epoch
+            if requested_remaining > 0:
+                restored_lrs = [float(group["lr"]) for group in opt.param_groups]
+                if any(not np.isfinite(lr) or lr <= 0 for lr in restored_lrs):
+                    raise ValueError(
+                        "恢复的学习率已为0或无效，不能继续追加训练。"
+                        "请另行指定微调方案；不会自动恢复初始学习率。"
+                    )
+                if requested_remaining != sched.T_max - sched.last_epoch:
+                    # scheduler.step 在每轮保存前执行；last_epoch 是当前段已走步数。
+                    for group, lr in zip(opt.param_groups, restored_lrs, strict=True):
+                        group["initial_lr"] = lr
+                    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        opt, T_max=requested_remaining, eta_min=0.0
+                    )
+                    logger.info(
+                        "续训预算调整：第 %d -> %d 轮，从恢复学习率 %s 连续余弦衰减至0",
+                        start_epoch, epochs, restored_lrs,
+                    )
         self.history.planned_epochs = epochs
         self.history.termination_reason = None
         self.history.stopped_early = False
@@ -575,6 +656,7 @@ class VisibilityTrainer:
             if improved:
                 self.history.best_val_loss = val_loss
                 self.history.best_epoch = epoch
+                self._best_model_sha256 = _model_state_sha256(self.model.state_dict())
                 since_best = 0
             else:
                 since_best += 1
@@ -587,11 +669,13 @@ class VisibilityTrainer:
             )
             self.history.seconds = elapsed_before + time.time() - t0
 
-            # 每轮都写：last.pt 用于续训和崩溃恢复，best.pt 只在误差创新低时更新。
-            # 写 last.pt 时如果还没有 best，就先用当前轮顶上，保证 best.pt 一直可用。
-            _atomic_save(self._make_payload(epoch, opt, sched, val_loss), last_path)
-            if improved or not best_path.exists():
-                _atomic_save(self._make_payload(epoch, opt, sched, val_loss), best_path)
+            if self._best_model_sha256 is None:
+                raise ValueError("尚无可核验的有限验证集best，拒绝保存伪最优检查点")
+            # 先保存best，再保存引用其模型身份的last；不以当前轮补造旧best。
+            payload = self._make_payload(epoch, opt, sched, val_loss)
+            if improved:
+                _atomic_save(payload, best_path)
+            _atomic_save(payload, last_path)
 
             if epoch % 5 == 0 or epoch == start_epoch + 1:
                 logger.info(
@@ -608,7 +692,12 @@ class VisibilityTrainer:
 
         # 回滚到验证集选出的最优权重，再用独立校准集算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
-        best_payload = torch.load(best_path, map_location="cpu", weights_only=False)
+        best_payload = self._load_verified_best({
+            "best_model_sha256": self._best_model_sha256,
+            "split_signature": self.split_signature, "seed": self.seed,
+            "model_cfg": self.model_cfg, "best_epoch": self.history.best_epoch,
+            "best_val_loss": self.history.best_val_loss,
+        })
         self.model.load_state_dict(best_payload["model_state"])
         logger.info("已回滚到 epoch %d 的最优权重", best_payload.get("epoch", -1))
         self.model.to(self.device).eval()

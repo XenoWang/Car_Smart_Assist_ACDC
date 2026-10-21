@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from copy import copy
 from pathlib import Path
 
 import numpy as np
@@ -17,13 +16,14 @@ from car_smart_assist.perception.joint_yolo import (
     preserve_classification_outputs,
 )
 from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
+from car_smart_assist.config.detection import YOLO_AP_MODE
+from car_smart_assist.perception.yolo_postprocess import postprocess_detection
 
 # 导入 Ultralytics 时会初始化 settings，这份初始化要留在项目里。
 if not os.environ.get("YOLO_CONFIG_DIR"):
     configure_yolo_environment(Path(__file__).resolve().parents[3])
 from ultralytics.data.dataset import YOLODataset  # noqa: E402
 from ultralytics.models.yolo.detect.val import DetectionValidator  # noqa: E402
-from ultralytics.utils import ops  # noqa: E402
 from ultralytics.utils.metrics import DetMetrics  # noqa: E402
 
 
@@ -128,23 +128,71 @@ class JointMetrics(DetMetrics):
 
 
 class DeploymentValidator(DetectionValidator):
+    postprocess_mode = YOLO_AP_MODE
+    locked_confidence = None
+    class_thresholds = None
+
     def postprocess(self, predictions):
-        # YOLO.predict 每个 anchor 只取一个类别。验证必须用同一个
-        # 类别选择方式，而不是再找回分数更低的第二个类别。
-        outputs = ops.non_max_suppression(
+        outputs = postprocess_detection(
             predictions,
-            self.args.conf,
-            self.args.iou,
-            nc=0,
-            multi_label=False,
+            nc=len(self.names),
+            names=self.names,
+            mode=self.postprocess_mode,
+            confidence=(
+                self.locked_confidence if self.locked_confidence is not None else self.args.conf
+            ),
+            class_thresholds=self.class_thresholds,
+            iou=self.args.iou,
             agnostic=self.args.single_cls or self.args.agnostic_nms,
             max_det=self.args.max_det,
             end2end=self.end2end,
+            task=self.args.task,
         )
         return [
             {"bboxes": value[:, :4], "conf": value[:, 4], "cls": value[:, 5], "extra": value[:, 6:]}
             for value in outputs
         ]
+
+    def get_stats(self):
+        # Base get_stats会清空原始统计，必须在此之前保留ROI/source过滤后的精确计数。
+        stats = self.metrics.stats
+        targets = np.concatenate(stats["target_cls"]) if stats["target_cls"] else np.zeros(0)
+        labels = np.concatenate(stats["pred_cls"]) if stats["pred_cls"] else np.zeros(0)
+        correct = (
+            np.concatenate(stats["tp"], axis=0)[:, 0]
+            if stats["tp"] else np.zeros(0, dtype=bool)
+        )
+        per_class = {}
+        for label, name in self.names.items():
+            tp = int(np.count_nonzero(correct & (labels == label)))
+            predicted = int(np.count_nonzero(labels == label))
+            support = int(np.count_nonzero(targets == label))
+            fp, fn = predicted - tp, support - tp
+            precision = tp / predicted if predicted else 0.0
+            recall = tp / support if support else 0.0
+            per_class[name] = {
+                "class_id": int(label),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "support": support,
+                "precision": precision,
+                "recall": recall,
+                "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0,
+                "has_ground_truth": bool(support),
+            }
+        supported = [row for row in per_class.values() if row["has_ground_truth"]]
+        self.metrics.operating_iou50 = {
+            "mode": self.postprocess_mode,
+            "per_class": per_class,
+            "macro_scope": "classes_with_ground_truth_only",
+            "missing_ground_truth": "Listed with exact counts and zero recall; excluded from macro",
+            "macro": {
+                key: float(np.mean([row[key] for row in supported])) if supported else 0.0
+                for key in ("precision", "recall", "f1")
+            },
+        }
+        return super().get_stats()
 
 
 class JointValidator(DeploymentValidator):
@@ -195,8 +243,8 @@ class JointValidator(DeploymentValidator):
         return {key: value[keep] for key, value in result.items()}
 
 
-def joint_trainer(resume_state, foreground_exclusive=True):
-    base = detection_trainer_for_resume(resume_state)
+def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract):
+    base = detection_trainer_for_resume(resume_state, selection_contract)
 
     class Trainer(base):
         def build_dataset(self, img_path, mode="train", batch=None):
@@ -219,12 +267,13 @@ def joint_trainer(resume_state, foreground_exclusive=True):
                 ):
                     if getattr(self.args, name, 0):
                         raise ValueError(f"Joint ROI supervision requires {name}=0")
+            args = self.validation_args() if mode == "val" else self.args
             return JointDataset(
                 img_path=img_path,
-                imgsz=self.args.imgsz,
-                batch_size=batch or self.args.batch,
+                imgsz=args.imgsz,
+                batch_size=batch or args.batch,
                 augment=mode == "train",
-                hyp=self.args,
+                hyp=args,
                 rect=mode != "train",
                 stride=32,
                 pad=0.0 if mode == "train" else 0.5,
@@ -252,7 +301,7 @@ def joint_trainer(resume_state, foreground_exclusive=True):
             return JointValidator(
                 self.test_loader,
                 save_dir=self.save_dir,
-                args=copy(self.args),
+                args=self.validation_args(),
                 _callbacks=self.callbacks,
             )
 

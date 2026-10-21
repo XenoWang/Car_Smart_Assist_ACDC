@@ -13,11 +13,10 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from car_smart_assist.inference.pipeline import InferencePipeline  # noqa: E402
+from car_smart_assist.inference.pipeline import InferencePipeline, _to_array  # noqa: E402
 from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     list_adverse_images,
     list_ref_images,
-    read_rgb_image,
 )
 
 
@@ -36,19 +35,23 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def build_samples(root: Path, cfg: dict) -> list[tuple[str, np.ndarray]]:
+def build_samples(root: Path, cfg: dict) -> list[tuple[str, np.ndarray | Path]]:
     """每个天气子集抽一张 + 一张正常天气参考图。"""
-    acdc = root / cfg.get("data", {}).get("acdc_root", "data/raw/acdc")
-    samples: list[tuple[str, np.ndarray]] = []
+    dcfg = cfg.get("data", {})
+    acdc = root / dcfg.get("acdc_root", "data/raw/acdc")
+    manifest = dcfg.get("cleaning_manifest")
+    samples: list[tuple[str, np.ndarray | Path]] = []
 
-    refs = list_ref_images(acdc)
+    refs = list_ref_images(acdc, cleaning_manifest=manifest, project_root=root)
     if refs:
-        samples.append(("正常天气参考图", read_rgb_image(refs[0])))
+        samples.append(("正常天气参考图", refs[0]))
 
     for cond in ("fog", "night", "rain", "snow"):
-        paths = list_adverse_images(acdc, [cond])
+        paths = list_adverse_images(
+            acdc, [cond], cleaning_manifest=manifest, project_root=root
+        )
         if paths:
-            samples.append((f"真实 {cond}", read_rgb_image(paths[0])))
+            samples.append((f"真实 {cond}", paths[0]))
     return samples
 
 
@@ -70,16 +73,26 @@ def main() -> int:
     )
 
     if args.image:
-        samples = [(Path(p).name, read_rgb_image(p)) for p in args.image]
+        samples = [(Path(p).name, Path(p)) for p in args.image]
     else:
         samples = build_samples(root, cfg)
 
     if args.synthetic:
         from car_smart_assist.perception.visibility import degrade
 
-        base = samples[0][1] if samples else np.full((1080, 1920, 3), 128, dtype=np.uint8)
-        for kind in ("fog", "darkness", "occlusion", "blur"):
-            samples.append((f"合成 {kind} @1.0", degrade(base, kind, 1.0, seed=0)[0]))
+        base = None
+        for name, image in samples:
+            try:
+                base = _to_array(image)
+            except Exception as exc:  # noqa: BLE001
+                logging.warning("合成对照底图不可用（%s）: %s: %s", name, type(exc).__name__, exc)
+                continue
+            break
+        if base is None:
+            logging.warning("没有可解码的样本，已跳过合成退化对照")
+        else:
+            for kind in ("fog", "darkness", "occlusion", "blur"):
+                samples.append((f"合成 {kind} @1.0", degrade(base, kind, 1.0, seed=0)[0]))
 
     # 全黑帧：不属于任何数据集，但它是「看不见」最直接的形式，值得做对照
     samples.append(("全黑帧（对照）", np.zeros((1080, 1920, 3), dtype=np.uint8)))
@@ -105,6 +118,8 @@ def main() -> int:
             f"{name:<22}{lvl:<10}{info:>8}"
             f"{('是' if a.should_takeover else '否'):>6}{a.risk_level.value:>10}  {a.text}"
         )
+        if "input" in r.skipped:
+            print(f"  {r.skipped['input']}")
         if r.weather_warning:
             print(f"  天气提醒：{r.weather_warning}")
 

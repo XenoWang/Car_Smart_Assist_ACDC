@@ -10,6 +10,58 @@ import torch
 import yaml
 
 
+# 固定的标准 detect 后处理合同；不是新增的调参入口。
+YOLO_POSTPROCESS_VERSION = "best_class_threshold_v1"
+YOLO_CALIBRATION_SCHEMA_VERSION = 2
+YOLO_LOCKED_MODE = "locked"
+YOLO_PROPOSAL_MODE = "proposal_sweep"
+YOLO_AP_MODE = "ap_sweep"
+YOLO_SWEEP_CONFIDENCE = 0.001
+YOLO_MAX_NMS = 30000
+YOLO_MAX_WH = 7680
+YOLO_AGNOSTIC_NMS = False
+
+
+def yolo_model_selection_contract(cfg, manifest):
+    """选best的AP口径；部署操作点阈值不参与扫分。"""
+    inference = cfg["inference"]
+    joint = bool(manifest.get("joint_supervision"))
+    return {
+        "schema_version": 1,
+        "postprocess_version": YOLO_POSTPROCESS_VERSION,
+        "ap_mode": YOLO_AP_MODE,
+        "sweep_confidence": YOLO_SWEEP_CONFIDENCE,
+        "imgsz": inference["imgsz"],
+        "nms_iou": inference["iou"],
+        "max_det": inference["max_det"],
+        "max_nms": YOLO_MAX_NMS,
+        "max_wh": YOLO_MAX_WH,
+        "agnostic_nms": YOLO_AGNOSTIC_NMS,
+        "class_selection": "original_best_class_only",
+        "threshold_comparison": ">=",
+        "task": "detect",
+        "fitness": "0.1*mAP50+0.9*mAP50_95",
+        "joint_selection": {
+            "known_class_count": manifest["known_class_count"],
+            "source_weights": dict(manifest["source_weights"]),
+            "valid_roi_ids": list(manifest["valid_roi_ids"]),
+            "foreground_exclusive": cfg.get("joint_foreground_exclusive", True),
+        } if joint else None,
+    }
+
+
+def yolo_selection_validator_args(contract):
+    return {
+        "imgsz": contract["imgsz"],
+        "iou": contract["nms_iou"],
+        "max_det": contract["max_det"],
+        "conf": contract["sweep_confidence"],
+        "agnostic_nms": contract["agnostic_nms"],
+        "single_cls": False,
+        "task": contract["task"],
+    }
+
+
 def load_yolo_config(path: Path) -> dict[str, Any]:
     cfg = yaml.safe_load(path.read_text(encoding="utf-8"))["yolo_detection"]
     train = cfg["train"]

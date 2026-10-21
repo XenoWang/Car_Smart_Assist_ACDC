@@ -172,7 +172,9 @@ class WeatherPredictor:
         self.device = device
 
     @classmethod
-    def from_checkpoint(cls, path: str | Path, cfg: WeatherConfig) -> WeatherPredictor:
+    def from_checkpoint(
+        cls, path: str | Path, cfg: WeatherConfig, device: str | None = None
+    ) -> WeatherPredictor:
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if checkpoint.get("format_version") != 2:
             raise ValueError("天气检查点格式不兼容")
@@ -188,7 +190,7 @@ class WeatherPredictor:
                 raise ValueError(f"天气检查点的 {key} 与当前配置不一致")
         model = WeatherClassifier(cfg)
         model.load_state_dict(checkpoint["model_state"])
-        return cls(model, cfg, select_device(cfg.device))
+        return cls(model, cfg, select_device(cfg.device if device is None else device))
 
     @torch.inference_mode()
     def predict(self, image: np.ndarray | Image.Image) -> WeatherPrediction:

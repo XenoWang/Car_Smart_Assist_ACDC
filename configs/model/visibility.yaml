@@ -3,6 +3,7 @@ base: ../default.yaml
 visibility:
   data:
     acdc_root: data/raw/acdc
+    cleaning_manifest: data/processed/manifests/acdc.json
 
     train_ratio: 0.80
     val_ratio: 0.05          # 最佳权重选择 + 早停
