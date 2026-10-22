@@ -113,19 +113,24 @@ class WeatherAttention(nn.Module):
         return (self.dropout(hidden) * self.class_weights).sum(-1) + self.class_bias
 
 
-def optimize_attention_inference(model: WeatherAttention) -> WeatherAttention:
-    """在独立推理副本中合并卷积和 BN；保留训练模型及检查点结构。"""
-    optimized = copy.deepcopy(model).eval()
-    for module in optimized.backbone.modules():
+def _optimize_attention_inference_inplace(model: WeatherAttention) -> WeatherAttention:
+    """在独占的推理模型中合并卷积和 BN。"""
+    model.eval()
+    for module in model.backbone.modules():
         if isinstance(module, nn.Sequential):
             children = list(module.named_children())
             for (conv_name, conv), (bn_name, bn) in zip(children[:-1], children[1:], strict=True):
                 if isinstance(conv, nn.Conv2d) and isinstance(bn, nn.BatchNorm2d):
                     module._modules[conv_name] = torch.nn.utils.fusion.fuse_conv_bn_eval(conv, bn)
                     module._modules[bn_name] = nn.Identity()
-    if optimized.cfg.train["channels_last"]:
-        optimized.to(memory_format=torch.channels_last)
-    return optimized
+    if model.cfg.train["channels_last"]:
+        model.to(memory_format=torch.channels_last)
+    return model
+
+
+def optimize_attention_inference(model: WeatherAttention) -> WeatherAttention:
+    """在独立推理副本中合并卷积和 BN；保留训练模型及检查点结构。"""
+    return _optimize_attention_inference_inplace(copy.deepcopy(model))
 
 
 class WeatherAttentionPredictor:
@@ -149,11 +154,12 @@ class WeatherAttentionPredictor:
         ):
             raise ValueError("天气属性阈值无效")
         selected = select_device(device or cfg.device)
-        model = WeatherAttention(cfg).to(selected)
+        # 旧copy路径也隔离配置；只复制元数据，不复制整份设备参数。
+        model = WeatherAttention(copy.deepcopy(cfg)).to(selected)
         model.load_state_dict(payload["model_state"])
         if cfg.train["channels_last"]:
             model.to(memory_format=torch.channels_last)
-        return cls(optimize_attention_inference(model), cfg, thresholds, selected)
+        return cls(_optimize_attention_inference_inplace(model), cfg, thresholds, selected)
 
     def predict(self, image: np.ndarray | Image.Image):
         pixels = prepare_pyramid_image(image, self.cfg.image_size)

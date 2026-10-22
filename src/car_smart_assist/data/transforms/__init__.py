@@ -1,1 +1,1 @@
-"""变换子包，提供 build_transform 工厂（train / val 两套）。"""
+"""变换子包占位；build_transform工厂尚未实现。"""

@@ -6,22 +6,25 @@ import hashlib
 import io
 import json
 import logging
+import os
 import random
 import re
 from collections import defaultdict
 from contextlib import ExitStack
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zipfile import ZipFile
 
 import numpy as np
 import torch
+import yaml
 from PIL import Image
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from car_smart_assist.config.weather import WeatherConfig
+from car_smart_assist.config.weather import WeatherConfig, load_weather_config
 from car_smart_assist.data.detection import recording_group
 from car_smart_assist.data.preprocessing import load_invalid_entries
 from car_smart_assist.perception.visibility.dataset import read_rgb_image
@@ -299,6 +302,93 @@ def _save_checkpoint(payload: dict[str, Any], path: Path) -> None:
     temporary.replace(path)
 
 
+def require_independent_weather_output(project_root: Path, destination: Path) -> None:
+    """训练输出与当前默认部署目录分离；路由损坏时拒绝猜测。"""
+    root = Path(project_root).resolve()
+    route_path = root / "configs/model/weather_default.yaml"
+    if route_path.exists():
+        try:
+            route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
+            if (
+                not isinstance(route, dict)
+                or set(route) != {"config", "checkpoint"}
+                or any(not isinstance(value, str) or not value for value in route.values())
+            ):
+                raise ValueError("需要 config 和 checkpoint 两条路径")
+            checkpoint = root / route["checkpoint"]
+        except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError(f"默认天气路由无效，停止训练以保护部署产物：{exc}") from exc
+    else:
+        fallback = root / "configs/model/weather_classifier.yaml"
+        if not fallback.is_file():
+            return
+        checkpoint = root / load_weather_config(fallback).checkpoint
+    destination = Path(destination)
+    if not destination.is_absolute():
+        destination = root / destination
+    if destination.resolve() == checkpoint.resolve().parent:
+        raise ValueError(
+            f"训练输出目录包含受保护的默认天气权重：{checkpoint.resolve()}。"
+            "请将训练配置的 checkpoint_root/checkpoint 指向独立实验目录；"
+            "普通恢复和 --fresh 均不能写入部署目录，训练完成后须另行明确发布。"
+        )
+
+
+def _archive_weather_checkpoints(paths: tuple[Path, ...]) -> None:
+    existing = {path: path.read_bytes() for path in dict.fromkeys(paths) if path.exists()}
+    if not existing:
+        return
+    folder = paths[0].parent / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    folder.mkdir(parents=True)
+    for path, content in existing.items():
+        backup = folder / path.name
+        with backup.open("xb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if backup.read_bytes() != content:
+            raise OSError(f"旧 CNN 检查点归档回读不一致，保留原件并停止：{backup}")
+    if any(path.read_bytes() != content for path, content in existing.items()):
+        raise OSError("归档期间旧 CNN 检查点发生变化，保留原件并停止")
+    for path in existing:
+        path.unlink()
+
+
+def _load_verified_weather_best(path: Path, reference: dict[str, Any]) -> dict[str, Any]:
+    expected = reference.get("best_sha256")
+    advice = (
+        "请保留原件并使用有匹配 best/last 的原目录；或使用 --fresh 归档后重开，"
+        "或选择独立输出并另行明确仅权重初始化方案（当前入口不会自动回退）。"
+    )
+    if (
+        not isinstance(expected, str)
+        or len(expected) != 64
+        or any(char not in "0123456789abcdef" for char in expected)
+    ):
+        raise ValueError(f"旧 CNN 历史缺少可核验的 best 身份，拒绝完整恢复。{advice}")
+    if not path.is_file():
+        raise ValueError(f"旧 CNN 历史 best 缺失：{path}，拒绝完整恢复。{advice}")
+    content = path.read_bytes()
+    if hashlib.sha256(content).hexdigest() != expected:
+        raise ValueError(f"旧 CNN best/last 摘要不配对：{path}，拒绝完整恢复。{advice}")
+    best = torch.load(io.BytesIO(content), map_location="cpu", weights_only=True)
+    for best_key, reference_key in (
+        ("format_version", "format_version"),
+        ("model_config", "model_config"),
+        ("dataset_signatures", "dataset_signatures"),
+        ("epoch", "best_epoch"),
+        ("val_loss", "best_val_loss"),
+        ("val_metrics", "best_val_metrics"),
+    ):
+        if (
+            best_key not in best
+            or reference_key not in reference
+            or best[best_key] != reference[reference_key]
+        ):
+            raise ValueError(f"旧 CNN best/last 的 {best_key} 不配对，拒绝完整恢复。{advice}")
+    return best
+
+
 def attribute_metrics(
     targets: np.ndarray,
     probabilities: np.ndarray,
@@ -369,7 +459,17 @@ def train_weather(
     resume: bool = True,
 ) -> WeatherTrainResult:
     """用按场景分组的 ACDC 和 Pixel 数据训练天气与光照属性。"""
-    root = Path(project_root)
+    root = Path(project_root).resolve()
+    best_path = root / cfg.checkpoint
+    last_path = best_path.with_name("last.pt")
+    require_independent_weather_output(root, best_path.parent)
+    if best_path == last_path:
+        raise ValueError("旧 CNN 的 checkpoint 不能命名为 last.pt；best 与 last 必须分开")
+    if resume and best_path.exists() and not last_path.exists():
+        raise ValueError(
+            "旧 CNN 只有 best、缺少配对 last，不能完整恢复；请保留原件，"
+            "使用 --fresh 归档后重开或选择独立输出并明确仅权重初始化方案。"
+        )
     train_cfg = cfg.train
     try:
         batch_size = int(train_cfg["batch_size"])
@@ -468,12 +568,14 @@ def train_weather(
         pos_weight=torch.as_tensor(pos_weight, dtype=torch.float32, device=device)
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    best_path = root / cfg.checkpoint
-    last_path = best_path.with_name("last.pt")
     signatures = {"train": train_set.signature, "val": val_set.signature}
     model_cfg = checkpoint_model_config(cfg)
     start_epoch, best_epoch, best_loss, wait = 0, 0, float("inf"), 0
     best_metrics: dict[str, Any] = {}
+    best_reference: dict[str, Any] = {}
+    best_sha256 = None
+    if not resume:
+        _archive_weather_checkpoints((best_path, last_path))
     if resume and last_path.exists():
         previous = torch.load(last_path, map_location="cpu", weights_only=True)
         previous_model_cfg = dict(previous.get("model_config", {}))
@@ -482,6 +584,9 @@ def train_weather(
             raise ValueError("天气属性模型检查点不兼容；请使用 --fresh")
         if previous.get("dataset_signatures") != signatures:
             raise ValueError("天气训练数据变化，不能沿用旧优化器状态；请使用 --fresh")
+        _load_verified_weather_best(best_path, previous)
+        best_reference = previous
+        best_sha256 = previous["best_sha256"]
         model.load_state_dict(previous["model_state"])
         optimizer.load_state_dict(previous["optimizer_state"])
         start_epoch = int(previous["epoch"])
@@ -490,8 +595,6 @@ def train_weather(
         wait = int(previous["wait"])
         best_metrics = previous["best_val_metrics"]
         generator.set_state(previous["shuffle_state"])
-    if best_epoch > 0 and not best_path.is_file():
-        raise ValueError("last 检查点引用的 best 权重不存在；请使用 --fresh")
 
     for epoch in range(start_epoch + 1, epochs + 1):
         model.train()
@@ -540,34 +643,35 @@ def train_weather(
                     "epoch": epoch,
                     "val_loss": val_loss,
                     "val_metrics": metrics,
+                    "dataset_signatures": signatures,
                 },
                 best_path,
             )
+            best_sha256 = hashlib.sha256(best_path.read_bytes()).hexdigest()
         else:
             wait += 1
-        _save_checkpoint(
-            {
-                "format_version": 2,
-                "model_config": model_cfg,
-                "model_state": {
-                    key: value.detach().cpu() for key, value in model.state_dict().items()
-                },
-                "optimizer_state": optimizer.state_dict(),
-                "epoch": epoch,
-                "best_epoch": best_epoch,
-                "best_val_loss": best_loss,
-                "best_val_metrics": best_metrics,
-                "wait": wait,
-                "shuffle_state": generator.get_state(),
-                "dataset_signatures": signatures,
+        best_reference = {
+            "format_version": 2,
+            "model_config": model_cfg,
+            "model_state": {
+                key: value.detach().cpu() for key, value in model.state_dict().items()
             },
-            last_path,
-        )
+            "optimizer_state": optimizer.state_dict(),
+            "epoch": epoch,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_loss,
+            "best_val_metrics": best_metrics,
+            "wait": wait,
+            "shuffle_state": generator.get_state(),
+            "dataset_signatures": signatures,
+            "best_sha256": best_sha256,
+        }
+        _save_checkpoint(best_reference, last_path)
         if wait >= patience:
             break
     if best_epoch == 0:
         raise ValueError("未找到可用的天气属性模型 best 检查点")
-    best_checkpoint = torch.load(best_path, map_location="cpu", weights_only=True)
+    best_checkpoint = _load_verified_weather_best(best_path, best_reference)
     model.load_state_dict(best_checkpoint["model_state"])
     model.eval()
     final_targets: list[np.ndarray] = []

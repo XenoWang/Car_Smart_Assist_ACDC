@@ -70,9 +70,14 @@ def compute_information_features(
     实现在 numpy 上而不是 torch：这些特征要逐帧单独解释，
     用 numpy 方便直接对着数值排查，也不需要 GPU。
     """
-    a = img.astype(np.float32)
-    if a.max() > 1.0:
-        a /= 255.0
+    if img.dtype == np.uint8:
+        a = img.astype(np.float32) / 255.0
+    elif np.issubdtype(img.dtype, np.floating):
+        if not np.isfinite(img).all() or img.min() < 0.0 or img.max() > 1.0:
+            raise ValueError("浮点图像必须是有限的 float[0,1] 数据")
+        a = img.astype(np.float32)
+    else:
+        raise ValueError("信息量特征仅接受 uint8 或 float[0,1] 图像")
     gray = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
     # --- 对比度：灰度标准差 ---
@@ -88,7 +93,7 @@ def compute_information_features(
     # 用 np.gradient（中心差分），不用 Sobel：Sobel 的 3×3 核自带平滑，
     # 会把高频噪声一起抹掉，而这里要的正是「还剩多少高频结构」。
     # 阈值来自 scoring_cfg；默认 0.04 是 [0,1] 灰度量纲下的值（≈ 10/255，和 preprocessing.py 的
-    # 0-255 量纲阈值 10.0 等价 —— 两边量纲不同，物理含义一致）。
+    # 0-255量纲阈值10.0近似对应；0.04×255=10.2，并非精确相等）。
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy)
     feature_cfg = (scoring_cfg or {}).get("features", {})
@@ -167,11 +172,27 @@ class VisibilityScore:
 _FEATURE_SCALES: dict[str, float] = dict(SCORING_DEFAULTS["feature_scales"])
 
 
+def _validated_feature_scales(scales: dict[str, float] | None) -> dict[str, float]:
+    scales = _FEATURE_SCALES if scales is None else scales
+    if not isinstance(scales, dict):
+        raise ValueError("scoring.feature_scales 必须是特征到正数尺度的映射")
+    validated = {}
+    for name in _FEATURE_SCALES:
+        try:
+            value = float(scales[name])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"scoring.feature_scales.{name} 必须是有限正数") from exc
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError(f"scoring.feature_scales.{name} 必须是有限正数")
+        validated[name] = value
+    return validated
+
+
 def normalize_features(
     f: InformationFeatures, scales: dict[str, float] | None = None
 ) -> dict[str, float]:
     """把各特征除以参考尺度，再截断到 [0,1]。"""
-    scales = scales or _FEATURE_SCALES
+    scales = _validated_feature_scales(scales)
     return {
         "contrast": min(1.0, f.contrast / scales["contrast"]),
         "entropy": min(1.0, f.entropy / scales["entropy"]),
@@ -194,8 +215,46 @@ _INFO_WEIGHTS: dict[str, float] = dict(SCORING_DEFAULTS["aggregation"]["weights"
 _INFO_P: float = SCORING_DEFAULTS["aggregation"]["power"]
 # 单维下限。防止某一维接近 0 时在 p<0 的幂运算中完全主导总分，
 # 否则一个饱和的噪声维度就会把分数钉死，反而制造误报。
-# 取 0.10 的含义：任何一维最多只能把总分压到约 1/(0.1·w) 的量级。
+# 取 0.10 的含义：每个归一化维度至少按0.10参与聚合，限制极小值的支配作用。
 _INFO_EPS: float = SCORING_DEFAULTS["aggregation"]["feature_floor"]
+
+
+def _aggregation_parameters(
+    cfg: dict[str, Any],
+    weights: dict[str, float] | None = None,
+    p: float | None = None,
+    eps: float | None = None,
+) -> tuple[dict[str, float], float, float]:
+    aggregate_cfg = cfg.get("aggregation", {})
+    if not isinstance(aggregate_cfg, dict):
+        raise ValueError("scoring.aggregation 必须是映射")
+    raw_weights = aggregate_cfg.get("weights", _INFO_WEIGHTS) if weights is None else weights
+    if not isinstance(raw_weights, dict) or not raw_weights:
+        raise ValueError("scoring.aggregation.weights 必须是非空特征权重映射")
+    validated = {}
+    for name, raw_weight in raw_weights.items():
+        if name not in _INFO_WEIGHTS:
+            raise ValueError(f"未知信息量聚合特征：{name}")
+        try:
+            weight = float(raw_weight)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"scoring.aggregation.weights.{name} 必须是有限非负数") from exc
+        if not np.isfinite(weight) or weight < 0.0:
+            raise ValueError(f"scoring.aggregation.weights.{name} 必须是有限非负数")
+        validated[name] = weight
+    total = sum(validated.values())
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("scoring.aggregation.weights 的总和必须是有限正数")
+    try:
+        power = float(aggregate_cfg.get("power", _INFO_P) if p is None else p)
+        floor = float(aggregate_cfg.get("feature_floor", _INFO_EPS) if eps is None else eps)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scoring.aggregation 的 power 和 feature_floor 必须是有限数值") from exc
+    if not np.isfinite(power) or power == 0.0:
+        raise ValueError("scoring.aggregation.power 必须是有限非零数")
+    if not np.isfinite(floor) or not 0.0 < floor <= 1.0:
+        raise ValueError("scoring.aggregation.feature_floor 必须在 (0,1] 内")
+    return validated, power, floor
 
 
 def information_score(
@@ -243,16 +302,15 @@ def information_score(
     默认权重见 _INFO_WEIGHTS（contrast/entropy/edge_density 主导，hf_ratio 只做辅助）。
     """
     cfg = scoring_cfg or {}
-    aggregate_cfg = cfg.get("aggregation", {})
     n = normalize_features(f, cfg.get("feature_scales"))
-    w = weights or aggregate_cfg.get("weights") or _INFO_WEIGHTS
-    p = float(aggregate_cfg.get("power", _INFO_P) if p is None else p)
-    eps = float(aggregate_cfg.get("feature_floor", _INFO_EPS) if eps is None else eps)
+    w, p, eps = _aggregation_parameters(cfg, weights, p, eps)
     w_sum = sum(w.values())
     acc = 0.0
     for k, weight in w.items():
+        if weight == 0.0:
+            continue
         acc += weight * (max(n[k], eps) ** p)
-    return float((acc / max(w_sum, eps)) ** (1.0 / p))
+    return float((acc / w_sum) ** (1.0 / p))
 
 
 
@@ -297,7 +355,7 @@ class VisibilityScorer:
             仍会计算原始误差和信息量；gate 按缺少校准统计的规则处理。
         device: 推理设备
         input_size: 需与模型一致
-        scoring_cfg: 特征尺度、聚合权重及分块误差参数；随训练检查点固定
+        scoring_cfg: 特征尺度、聚合权重及分块误差参数；加载时未显式覆盖才使用检查点快照
     """
 
     def __init__(
@@ -308,11 +366,13 @@ class VisibilityScorer:
         input_size: tuple[int, int] = MODEL_DEFAULTS["input_size"],
         scoring_cfg: dict[str, Any] | None = None,
     ) -> None:
+        self.scoring_cfg = scoring_cfg if scoring_cfg is not None else {}
+        _validated_feature_scales(self.scoring_cfg.get("feature_scales"))
+        _aggregation_parameters(self.scoring_cfg)
         self.model = model.to(device).eval()
         self.calibration = calibration
         self.device = torch.device(device)
         self.input_size = tuple(input_size)
-        self.scoring_cfg = scoring_cfg or {}
 
     # --- 构建 ---
 
@@ -356,6 +416,15 @@ class VisibilityScorer:
         # np.stack 会生成可写的 uint8 连续数组，随后在一次 dtype/内存格式
         # 转换中直接得到 NCHW float32，不用逐图分配张量再 torch.cat。
         batch = np.stack(images, axis=0)
+        if self.device.type == "cuda" and batch.dtype == np.uint8:
+            # 先传输 uint8，避免在 CPU 分配整个 float32 batch。
+            x = torch.from_numpy(batch).to(self.device)
+            x = x.permute(0, 3, 1, 2).to(
+                dtype=torch.float32, memory_format=torch.contiguous_format
+            )
+            # 张量除数保持与旧CPU归一化一致的舍入，标量路径可能相差1 ULP。
+            divisor = torch.tensor(255.0, dtype=x.dtype, device=x.device)
+            return x.div_(divisor)
         x = torch.from_numpy(batch).permute(0, 3, 1, 2).to(
             dtype=torch.float32, memory_format=torch.contiguous_format
         )

@@ -49,19 +49,19 @@ check-env:  ## 自检：确认 torch 用的是 CUDA 版而不是 CPU 版
 # 数据
 # -----------------------------------------------------------------------------
 .PHONY: data-download
-data-download:  ## 下载 ACDC 原始数据到 data/raw/
+data-download:  ## 预留：ACDC下载入口尚未实现
 	$(PYTHON) scripts/download_acdc.py --config $(CONFIG_DIR)/data/acdc.yaml
 
 .PHONY: data-prepare
-data-prepare:  ## 预处理 ACDC，产出 data/processed/ 与索引清单
+data-prepare:  ## 预留：通用ACDC预处理入口尚未实现；检测准备使用专用脚本
 	$(PYTHON) scripts/prepare_acdc.py --config $(CONFIG_DIR)/data/acdc.yaml
 
 .PHONY: data-distance
-data-distance:  ## 构造前车/来车距离标签（ACDC 原生缺失，见 docs/label_spec.md）
+data-distance:  ## 预留：距离标签构造尚未实现，见 docs/label_spec.md
 	$(PYTHON) scripts/build_distance_labels.py --config $(CONFIG_DIR)/data/distance_supplement.yaml
 
 .PHONY: data-instruction
-data-instruction:  ## 构造 Stage 2 指令微调数据集
+data-instruction:  ## 预留：Stage 2指令数据构造尚未实现
 	$(PYTHON) scripts/build_instruction_dataset.py --config $(CONFIG_DIR)/data/acdc.yaml
 
 .PHONY: data-analyze
@@ -72,30 +72,30 @@ data-analyze:  ## 数据分布统计与抽样可视化 -> artifacts/reports/
 # 训练
 # -----------------------------------------------------------------------------
 .PHONY: train-perception
-train-perception:  ## Stage 1：训练多任务感知模型
+train-perception:  ## 预留：Stage 1多任务训练尚未实现
 	$(PYTHON) scripts/train_perception.py --config $(CONFIG_DIR)/train/perception.yaml
 
 .PHONY: train-advisory
-train-advisory:  ## Stage 2：训练司机提示生成（QLoRA）
+train-advisory:  ## 预留：Stage 2提示生成训练尚未实现
 	$(PYTHON) scripts/train_advisory.py --config $(CONFIG_DIR)/train/advisory_sft.yaml
 
 .PHONY: dry-run
-dry-run:  ## 只跑几个 step，验证训练通路是否打通
+dry-run:  ## 预留：通用训练dry-run尚未实现，不能用于验证通路
 	$(PYTHON) scripts/train_perception.py --config $(CONFIG_DIR)/train/perception.yaml --dry-run
 
 # -----------------------------------------------------------------------------
 # 评测与推理
 # -----------------------------------------------------------------------------
 .PHONY: eval
-eval:  ## 两个 Stage 的完整评测
+eval:  ## 预留：通用两阶段评测尚未实现
 	$(PYTHON) scripts/evaluate.py --config $(CONFIG_DIR)/inference/default.yaml --stage all
 
 .PHONY: infer
-infer:  ## 单图端到端推理 demo：图像 -> 司机提示
+infer:  ## 预留：统一CLI尚未实现；可用入口见scripts/run_pipeline.py
 	$(PYTHON) -m car_smart_assist.cli.main infer --config $(CONFIG_DIR)/inference/default.yaml
 
 .PHONY: export
-export:  ## 导出 Stage 1 为 ONNX（可选）
+export:  ## 预留：Stage 1 ONNX导出尚未实现
 	$(PYTHON) scripts/export_onnx.py --config $(CONFIG_DIR)/inference/default.yaml
 
 # -----------------------------------------------------------------------------

@@ -33,7 +33,7 @@ class MultiScaleBlock(nn.Module):
                        │
                      GELU
 
-    padding 取 k//2 保证各分支输出空间尺寸一致，否则无法在通道维拼接。
+    奇数卷积核使用d*(k-1)//2 padding，在相同步长下对齐各分支空间尺寸。
     步长只在分支卷积上施加，三个分支同步下采样，拼接时尺寸天然对齐。
 
     Args:
@@ -46,10 +46,10 @@ class MultiScaleBlock(nn.Module):
             置 None 等价于全 1。
         stride: 下采样步长
         use_bottleneck: 是否先用 1×1 降维。关闭则各分支保持完整通道，
-            参数量约 8 倍，仅在消融实验里用。
+            参数量增加，具体倍率取决于输入、输出通道及分支数；仅在消融实验里用。
 
     Note:
-        padding 取 d*(k-1)//2。这个取值让**任意 (k, d) 组合的输出尺寸都相同**：
+        padding 取 d*(k-1)//2。这个取值让**支持的奇数卷积核与空洞率组合输出尺寸对齐**：
             out = floor((in + d(k-1) - d(k-1) - 1)/s) + 1 = ceil(in/s)
         与 k、d 无关，因此三条分支的尺寸天然对齐，可以直接在通道维拼接。
         若改用常见的 k//2（不考虑空洞），dilation>1 时各分支尺寸会各不相同，
@@ -206,12 +206,12 @@ class ConvAutoencoder(nn.Module):
         # 早期版本只依赖「最后插值回去」，但崩的位置在插值之前，兜不住。
         #
         # 用自适应平均池化把空间尺寸钉死在 feat_hw：
-        #   · 输入尺寸 == 配置尺寸时是恒等操作，不改变任何既有行为、无额外开销
-        #   · 尺寸不同时退化为平滑下采样，模型仍能工作而不是崩掉
+        #   · 编码器输出已等于feat_hw时不改变空间尺寸；plain编码器处理非16倍配置尺寸时仍可能调整网格
+        #   · 尺寸不同时自适应调整网格，确保展平维度符合配置；不保证重建质量不变
         self.pool_to_grid = nn.AdaptiveAvgPool2d(self.feat_hw)
 
         # 展平前的 1×1 投影：把通道压下来，直接决定两个全连接层的规模。
-        # 不做这一步时它们占整个模型约 90% 的参数，是过拟合的主因。
+        # 历史配置中不做投影时两层曾占约90%的参数；参数规模本身不能确定过拟合原因。
         if pre_latent_channels and pre_latent_channels < chans[3]:
             self.pre_latent: nn.Module = nn.Sequential(
                 nn.Conv2d(chans[3], pre_latent_channels, 1, bias=False),
@@ -272,7 +272,7 @@ class ReconstructionError:
         mean      —— 主分数，整体偏差
         p90_block —— 分块误差的 90 分位，对局部退化敏感
         max_block —— 最坏的一块，用于「大部分糊住但有小片清晰」的情形
-        std_block —— 块间方差，反映退化是否均匀（雾是均匀的，遮挡不是）
+        std_block —— 块间标准差，反映退化是否均匀（雾是均匀的，遮挡不是）
     """
 
     mean: float

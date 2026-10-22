@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import sys
@@ -36,7 +37,7 @@ from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# 评估用规模。七组用同一批图，解码一次就行。
+# 评估规模；数据配置相同的预设共享参考图与划分。
 N_PER_SPLIT = 60          # train / val / calib / test 各抽多少张
 N_SYNTH = 60              # 合成退化实验的基准图数量
 SEVERITIES = (0.5, 0.75, 1.0)
@@ -46,6 +47,85 @@ MAX_SEV = SEVERITIES[-1]
 
 def load_refs(paths, size) -> list[np.ndarray]:
     return [read_rgb_image(path, size) for path in paths]
+
+
+def _signature(value: Any) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                         allow_nan=False).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _file_identity(path: Path) -> dict[str, str]:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": path.resolve().as_posix(), "sha256": digest.hexdigest()}
+
+
+def _prepare_inputs(cfg: dict[str, Any], root: Path) -> dict[str, Any]:
+    dcfg = cfg.get("data", {})
+    if dcfg.get("split_mode", "fixed") == "random":
+        raise ValueError("消融不能独立重建训练和评估随机分区；请设置 data.split_mode=fixed")
+    acdc_root = root / dcfg.get("acdc_root", "data/raw/acdc")
+    cleaning_root = root / dcfg.get("project_root", ".")
+    manifest = dcfg.get("cleaning_manifest")
+    paths = list_ref_images(
+        acdc_root, cleaning_manifest=manifest, project_root=cleaning_root
+    )
+    if not paths:
+        raise ValueError("未找到正常天气参考图")
+    groups = [sequence_of(p) for p in paths] if dcfg.get("split_by_sequence", True) else None
+    splits = split_ref_indices(
+        len(paths),
+        train_ratio=float(dcfg.get("train_ratio", 0.80)),
+        val_ratio=float(dcfg.get("val_ratio", 0.05)),
+        calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
+        test_ratio=float(dcfg.get("test_ratio", 0.10)),
+        seed=int(dcfg.get("split_seed", 42)),
+        mode=str(dcfg.get("split_mode", "fixed")),
+        groups=groups,
+    )
+    data_identity = {
+        "acdc_root": acdc_root.resolve().as_posix(),
+        "reference_count": len(paths),
+        "ordered_reference_sha256": _signature([_file_identity(p) for p in paths]),
+        "cleaning_manifest": _file_identity(cleaning_root / manifest) if manifest else None,
+    }
+    size = tuple(cfg.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
+    protocol = {
+        "version": "visibility-ablation-val-v2",
+        "implementation_sha256": _signature([
+            _file_identity(root / name) for name in (
+                "scripts/run_visibility_ablations.py",
+                "src/car_smart_assist/config/visibility.py",
+                "src/car_smart_assist/perception/visibility/scorer.py",
+                "src/car_smart_assist/perception/visibility/gate.py",
+                "src/car_smart_assist/perception/visibility/dataset.py",
+                "src/car_smart_assist/perception/visibility/degradation.py",
+                "src/car_smart_assist/perception/visibility/autoencoder.py",
+                "src/car_smart_assist/perception/visibility/trainer.py",
+            )
+        ]),
+        "input_size": list(size),
+        "decode": "RGB-uint8-Pillow-BILINEAR",
+        "grouping": "recording_family-v1" if groups is not None else "image",
+        "groups_sha256": _signature(groups),
+        "split_indices": {
+            name: indices.tolist()
+            for name, indices in zip(("train", "val", "calib", "test"), splits, strict=True)
+        },
+        "sample_per_split": N_PER_SPLIT,
+        "sample_seed": 0,
+        "sample_order": ["train", "val", "calib"],
+        "synthetic_base": "sampled-validation",
+        "synthetic_seed": "enumerated-base-index",
+        "synthetic_kinds": list(KINDS),
+        "severities": list(SEVERITIES),
+        "metric": "BLIND-rate-at-maximum-severity",
+    }
+    return {"paths": paths, "size": size, "splits": splits,
+            "data_identity": data_identity, "protocol": protocol}
 
 
 
@@ -149,88 +229,82 @@ def main() -> int:
             logger.error("--only 指定的 tag 都不存在")
             return 2
 
+    if any(apply_config_overrides(base, p.get("set", {})).get("data", {}).get("split_mode", "fixed") == "random"
+           for p in presets):
+        logger.error("消融不能独立重建训练和评估随机分区；请设置 data.split_mode=fixed")
+        return 2
+
     out_dir = root / "artifacts/reports/visibility/ablations"
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.json"
     results: dict[str, Any] = {}
     if results_path.exists() and not args.force:
         results = json.loads(results_path.read_text(encoding="utf-8"))
-        if any("val_fpr" not in row or "synth" not in row for row in results.values()):
-            logger.warning("已有消融结果使用旧评估协议，丢弃并按验证集协议重跑")
-            results = {}
-        logger.info("已载入 %d 组历史结果（用 --force 可全部重跑）", len(results))
+        if not isinstance(results, dict):
+            logger.error("已有消融结果身份不明；请保留原结果，使用 --force 明确重跑")
+            return 2
+        logger.info("已载入 %d 组历史结果，复用前逐组核对实验身份", len(results))
 
-    # --- 有效性闸门（踩过一次坑，花了 56 分钟 GPU 时间）---
-    #
-    # use_recon_z=False 时，门控判定**只依赖确定性信息量特征**，
-    # 而信息量特征由 compute_information_features(图像) 直接算出，不经过模型。
-    # 所以「换编码器结构」对召回率、误报率的影响**在数学上恒为零** ——
-    # 不管怎么消融，所有组的结果都逐位相同。
-    #
-    # 这不是「架构不重要」，是「门控根本没用到架构」。
-    # 真要拿消融比较架构，得让被比较的指标依赖模型：
-    #   · 重新启用 use_recon_z（并先证明 recon_z 有判别力），或
-    #   · 比较重建质量本身（过拟合比、逐类重建误差）
-    # 在这之前跑消融，只会得到七行一样的表格。
-    #
-    # 闸门放在解码参考图**之前**：这里花两分钟，失败越早发现越好。
-    gate_cfg = base.get("thresholds", {})
-    if not bool(gate_cfg.get("use_recon_z", False)) and not args.force_meaningless:
-        logger.error(
-            "消融实验当前**无效**：thresholds.use_recon_z=false，"
-            "门控判定只依赖确定性信息量特征，与模型结构无关，"
-            "所有预设的结果必然逐位相同。\n"
-            "  真正依赖模型的指标只有重建误差（overfit_ratio 等）。\n"
-            "  若仍要跑（例如只想比较重建质量），加 --force-meaningless。"
-        )
-        return 3
-
-    # --- 参考图和划分只准备一次，七组共用 ---
-    dcfg = base.get("data", {})
-    size = tuple(base.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
-    ref_paths = list_ref_images(root / dcfg.get("acdc_root", "data/raw/acdc"))
-    if not ref_paths:
-        logger.error("未找到正常天气参考图")
-        return 2
-    logger.info("解码参考图 %d 张（七组共用，只做一次）...", len(ref_paths))
-    refs = load_refs(ref_paths, size)
-
-    groups = [sequence_of(p) for p in ref_paths] if dcfg.get("split_by_sequence", True) else None
-    tr_idx, val_idx, ca_idx, te_idx = split_ref_indices(
-        len(ref_paths),
-        train_ratio=float(dcfg.get("train_ratio", 0.80)),
-        val_ratio=float(dcfg.get("val_ratio", 0.05)),
-        calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
-        test_ratio=float(dcfg.get("test_ratio", 0.10)),
-        seed=int(dcfg.get("split_seed", 42)),
-        mode=str(dcfg.get("split_mode", "fixed")),
-        groups=groups,
-    )
-    logger.info(
-        "统一划分（所有预设共用）：训练 %d / 验证 %d / 校准 %d / 测试 %d",
-        len(tr_idx), len(val_idx), len(ca_idx), len(te_idx),
-    )
-
-    device = resolve_device(str(base.get("device", "auto")))
-
-    for i, preset in enumerate(presets, 1):
-        tag = preset["tag"]
-        if tag in results and not args.force:
-            logger.info("[%d/%d] 跳过 %s（已有结果）", i, len(presets), tag)
-            continue
-
-        logger.info("=" * 66)
-        logger.info("[%d/%d] %s  覆盖: %s", i, len(presets), tag, preset.get("set", {}))
-        logger.info("=" * 66)
-
+    runs = []
+    for preset in presets:
         cfg = apply_config_overrides(base, preset.get("set", {}))
-        # 每组用独立目录：共用的话第二次会接着第一次的权重继续训，
-        # 那测的是「继续训练」而不是「换结构重训」，结论完全不对
         cfg.setdefault("train", {})["checkpoint_dir"] = (
-            f"artifacts/checkpoints/visibility_ablations/{tag}"
+            f"artifacts/checkpoints/visibility_ablations/{preset['tag']}"
         )
         if args.epochs is not None:
             cfg["train"]["epochs"] = args.epochs
+        runs.append((preset, cfg))
+
+    # 关闭重建判据时，同一输入与评分配置下的判档不经过 AE。
+    # 参数量、重建质量和训练耗时仍可用于模型比较；不自动开启重建判据。
+    disabled = [p["tag"] for p, cfg in runs
+                if not bool(cfg.get("thresholds", {}).get("use_recon_z", False))]
+    if disabled and not args.force_meaningless:
+        logger.error(
+            "预设 %s 关闭重建判据；同一输入和信息量配置下的判档与AE结构无关。"
+            "如需比较参数量、重建质量或耗时，请显式加 --force-meaningless。", disabled,
+        )
+        return 3
+
+    # 在启动任何训练前核验所有所选缓存，避免训练一半才发现另一行身份冲突。
+    inputs_by_config: dict[str, dict[str, Any]] = {}
+    prepared = []
+    for preset, cfg in runs:
+        data_key = _signature({"data": cfg.get("data", {}),
+                               "input_size": cfg.get("model", {}).get(
+                                   "input_size", MODEL_DEFAULTS["input_size"])})
+        if data_key not in inputs_by_config:
+            inputs_by_config[data_key] = _prepare_inputs(cfg, root)
+        inputs = inputs_by_config[data_key]
+        identity = {"version": 1, "config": cfg, "data": inputs["data_identity"],
+                    "evaluation_protocol": inputs["protocol"]}
+        signature = _signature(identity)
+        tag = preset["tag"]
+        previous = results.get(tag)
+        if tag in results and (
+            not isinstance(previous, dict)
+            or previous.get("experiment_signature") != signature
+            or previous.get("experiment_identity") != identity
+            or "val_fpr" not in previous or "synth" not in previous
+        ):
+            logger.error(
+                "%s 的历史结果缺少可核验身份，或数据/配置/评估协议已变；"
+                "拒绝复用和混表。请保留原结果，使用 --force 明确重跑。", tag,
+            )
+            return 2
+        prepared.append((preset, cfg, inputs, identity, signature))
+
+    for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
+        tag = preset["tag"]
+        if tag in results:
+            logger.info("[%d/%d] 跳过 %s（实验身份一致）", i, len(presets), tag)
+            continue
+        logger.info("[%d/%d] %s  覆盖: %s", i, len(presets), tag, preset.get("set", {}))
+        if "refs" not in inputs:
+            logger.info("解码参考图 %d 张，尺寸 %s", len(inputs["paths"]), inputs["size"])
+            inputs["refs"] = load_refs(inputs["paths"], inputs["size"])
+        refs = inputs["refs"]
+        tr_idx, val_idx, ca_idx, _ = inputs["splits"]
 
         t0 = time.time()
         trainer = VisibilityTrainer(cfg, project_root=root, resume="none")
@@ -240,10 +314,12 @@ def main() -> int:
         ckpt = root / cfg["train"]["checkpoint_dir"] / "best.pt"
         scorer = VisibilityScorer.from_checkpoint(
             ckpt,
-            device=device,
+            device=resolve_device(str(cfg.get("device", "auto"))),
             cfg=cfg.get("model", {}),
             scoring_cfg=cfg.get("scoring", {}),
         )
+        if scorer.input_size != inputs["size"]:
+            raise ValueError("有效检查点尺寸与已记录的消融评估尺寸不一致，拒绝发布结果")
         gate = VisibilityGate.from_config(cfg)
 
         rng = np.random.default_rng(0)
@@ -254,6 +330,13 @@ def main() -> int:
         metrics["epochs_run"] = len(history.train_loss)
         metrics["best_epoch"] = history.best_epoch
         metrics["overrides"] = preset.get("set", {})
+        metrics["experiment_identity"] = identity
+        metrics["experiment_signature"] = signature
+        metrics["comparison_signature"] = _signature({
+            "data": identity["data"], "evaluation_protocol": identity["evaluation_protocol"],
+        })
+        metrics["thresholds"] = vars(gate.thresholds)
+        metrics["scoring"] = scorer.scoring_cfg
         results[tag] = metrics
 
         results_path.write_text(
@@ -265,7 +348,8 @@ def main() -> int:
             metrics["val_fpr"] * 100, metrics["mean_recall"] * 100, train_s,
         )
 
-    return write_report(results, out_dir)
+    # 未选择或未核验的历史行不进入本轮对比报告。
+    return write_report({p["tag"]: results[p["tag"]] for p in presets}, out_dir)
 
 
 def write_report(results: dict[str, Any], out_dir: Path) -> int:
@@ -279,7 +363,7 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
     L: list[str] = [
         "# 能见度门控消融实验",
         "",
-        "所有预设使用**完全相同的划分**（按序列整组、固定种子）与**相同的评估口径**。",
+        "每组记录实际配置、过滤后参考图内容签名及分区/抽样协议；只有相同对比签名的组可直接比较。",
         "",
         "## 总表",
         "",
@@ -294,9 +378,23 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
             f"{m['val_fpr']:.1%} | {m['mean_recall']:.1%} | {rec} | {m['train_seconds']:.0f} |"
         )
 
-    L += ["", "## 各组配置", "", "| 预设 | 覆盖项 |", "|------|--------|"]
+    L += ["", "## 各组配置", "", "| 预设 | 覆盖项 | use_recon_z | 实验签名 | 对比签名 |",
+          "|------|--------|-------------|----------|----------|"]
     for tag in order:
-        L.append(f"| {tag} | `{results[tag].get('overrides') or '（基线）'}` |")
+        row = results[tag]
+        recon_enabled = bool(row.get("thresholds", {}).get("use_recon_z", False))
+        L.append(f"| {tag} | `{row.get('overrides') or '（基线）'}` | {recon_enabled} | "
+                 f"`{row.get('experiment_signature', '未记录')}` | "
+                 f"`{row.get('comparison_signature', '未记录')}` |")
+    for tag in order:
+        row = results[tag]
+        identity = row.get("experiment_identity", {})
+        L += ["", f"### {tag} 实际配置与协议", "",
+              f"- 配置：`{identity.get('config', {})}`",
+              f"- 数据身份：`{identity.get('data', {})}`",
+              f"- 评估协议：`{identity.get('evaluation_protocol', {})}`",
+              f"- 有效门控：`{row.get('thresholds', {})}`",
+              f"- 有效评分配置：`{row.get('scoring', {})}`", ""]
 
     base = results.get("baseline")
     if base:
@@ -306,6 +404,10 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
             if tag == "baseline":
                 continue
             m = results[tag]
+            if (not m.get("comparison_signature")
+                    or m["comparison_signature"] != base.get("comparison_signature")):
+                L.append(f"| {tag} | 数据或协议不同，不作直接比较 | — | — |")
+                continue
             L.append(
                 f"| {tag} | {(m['mean_recall'] - base['mean_recall']) * 100:+.1f}pp | "
                 f"{m['params_m'] - base['params_m']:+.2f}M | "
@@ -321,45 +423,25 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
             L.append(f"| {k} | {row} |")
         L.append("")
 
-    # 检测「所有组指标完全相同」这种退化情况 —— 它基本都意味着
-    # 被比较的指标与模型无关，而不是「架构真的不影响」。
     recalls = {round(results[t]["mean_recall"], 6) for t in order}
     fps = {round(results[t]["val_fpr"], 6) for t in order}
     degenerate = len(recalls) == 1 and len(fps) == 1 and len(order) > 1
-
     if degenerate:
         L += [
-            "## ⚠️ 本次消融无效（结果逐位相同）",
-            "",
-            f"全部 {len(order)} 组的平均召回与验证误报**完全相同**"
-            f"（召回 {list(recalls)[0]:.1%}，误报 {list(fps)[0]:.1%}）。",
-            "",
-            "这不是「架构不影响性能」，而是**门控判定与模型结构无关**：",
-            "`thresholds.use_recon_z=false` 时，判定只依赖",
-            "`compute_information_features(图像)` 算出的确定性特征，",
-            "该函数不经过模型 —— 所以换任何编码器，判定结果在数学上必然一致。",
-            "",
-            "真要通过消融比较架构，必须先让被比较的指标依赖模型：",
-            "重新启用 `use_recon_z`（并先证明它对当前模型有判别力），",
-            "或改为比较重建质量本身（本表里的 `overfit_ratio` 是唯一有模型依赖性的列）。",
-            "",
-            "---",
-            "",
+            "## 判档指标相同", "",
+            f"全部 {len(order)} 组的平均召回与验证误报在保留6位小数后相同。",
+            "该现象本身不能证明指标与模型无关；需核对各组实际 use_recon_z、输入和评分配置。", "",
         ]
-
     L += [
-        "## 读表须知",
-        "",
-        "- **过拟合比** = validation 重建误差 / train 重建误差。接近 1.0 表示泛化良好；",
-        "  显著大于 1 说明模型记住了训练序列。因为已按序列整组划分，",
-        "  这个数字现在反映的是真实的跨场景泛化，不再受相邻帧泄漏污染。",
-        "  **这是全表唯一依赖模型的指标**，架构差异只应在这里体现。",
-        "- 验证误报和合成退化召回用于消融比较；test 集不在此脚本中读取，留给最终评估。",
-        "- **平均召回** 是四种退化在最大强度下判为 BLIND 的比例均值。",
-        "  注意它衡量的是「确定看不见时会不会报警」，不是日常可用性。",
-        "- ⚠️ 召回与误报**不依赖模型**（见上）。只有过拟合比那一列能区分架构，",
-        "  且它受抽样规模影响，N 较小时差异可能落在噪声内，不要过度解读。",
-        "",
+        "## 读表须知", "",
+        "- 过拟合比 = 验证重建误差 / 训练重建误差，只是本次抽样下的重建差距诊断，",
+        "  不能单凭接近1或整组划分断言真实场景泛化或不存在泄漏。",
+        "- 参数量、重建误差与训练耗时都与模型有关。use_recon_z=false 时，",
+        "  相同输入与信息量评分配置下的门控判档不依赖AE权重；启用时还读取重建z分数。",
+        "- 验证判BLIND比例和合成退化召回用于消融比较；本脚本不评估test子集。",
+        "- 平均召回是所记录合成退化在最大强度下判为BLIND的比例均值，",
+        "  没有真实逐帧可见性真值，也不构成真实召回的上界。",
+        "- 抽样规模、分区、评分与阈值均影响指标；请结合各组配置和实验签名读表。", "",
     ]
 
     (out_dir / "ablations.md").write_text("\n".join(L), encoding="utf-8")

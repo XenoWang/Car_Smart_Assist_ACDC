@@ -1,4 +1,4 @@
-"""合成退化：生成「肯定看不见」的样本，用于验证能见度门控。"""
+"""合成退化：生成受控强度的样本以检查门控响应，不提供真实可用性真值。"""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def add_fog(img: np.ndarray, severity: float, rng: np.random.Generator,
     """雾模拟：I = J * t + A * (1 - t)。
 
     这是大气散射模型的标准形式，也是暗通道去雾的基础。
-    severity 越大透射率 t 越小，图像越接近纯大气光 —— severity=1 时完全是白板。
+    severity 越大透射率 t 越小，图像越接近纯大气光 —— severity=1时透射率为0.03，仍保留3%的原图分量。
     """
     # t 从 1.0（无雾）线性降到约 0.03（几乎全白）
     t = float(np.clip(1.0 - 0.97 * severity, 0.03, 1.0))

@@ -125,7 +125,9 @@ def main() -> int:
 
     print("-" * 92)
     t = results[-1].timings_ms
-    print(f"耗时: 门控 {t.get('gate', 0):.1f}ms / 帧（首次含模型预热，后续约 10ms）")
+    gate_ms = t.get("gate")
+    if gate_ms is not None:
+        print(f"末帧门控内部诊断: {gate_ms:.1f}ms（批内均摊，非端到端性能量测）")
     skipped = results[0].skipped
     if skipped:
         print("\n本次运行中被跳过的阶段（如实反映实现进度，不是异常）:")

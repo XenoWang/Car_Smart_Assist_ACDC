@@ -218,7 +218,8 @@ def test_visibility_early_stopping_tracks_terminal_epoch_and_restores_best(
     assert last["termination_reason"] == "early_stopping"
     assert last["early_stopping_state"] == {"wait": 2, "stopped": True}
     assert best["epoch"] == history.best_epoch
-    assert best["termination_reason"] == "early_stopping"
+    assert best["termination_reason"] is None  # best恢复点尚未触发后续早停
+    assert best["final_summary"]["termination_reason"] == "early_stopping"
     assert all(
         torch.equal(trainer.model.state_dict()[name], best["model_state"][name])
         for name in best["model_state"]
@@ -510,3 +511,18 @@ def test_no_improvement_resume_restores_original_best_state_and_metrics(tmp_path
         not torch.equal(final_last["model_state"][name], state)
         for name, state in original_state.items()
     )
+def test_best_checkpoint_keeps_best_resume_history_and_separate_final_summary(
+    tmp_path, monkeypatch
+):
+    trainer = _trainer_with_controlled_validation(
+        tmp_path, monkeypatch, [1.0, 1.0, 1.0, 1.0], epochs=4
+    )
+    trainer.cfg["train"]["early_stopping"]["patience"] = 1
+    history = trainer.fit()
+    best = torch.load(tmp_path / "checkpoints/best.pt", map_location="cpu", weights_only=False)
+    assert best["epoch"] == history.best_epoch == best["best_epoch"]
+    assert len(best["train_loss"]) == len(best["val_loss"]) == best["epoch"]
+    assert best["final_summary"]["training_complete"] is True
+    assert len(best["final_summary"]["train_loss"]) == len(history.train_loss)
+    assert len(best["final_summary"]["val_loss"]) == len(history.val_loss)
+    assert best["final_summary"]["termination_reason"] == history.termination_reason

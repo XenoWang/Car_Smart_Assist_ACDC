@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import zipfile
+import zlib
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 
 import numpy as np
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +117,7 @@ class CleaningReport:
     checked: dict[str, int] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
     _status: dict[str, SampleStatus] = field(default_factory=dict, repr=False)
+    _samples: set[str] = field(default_factory=set, repr=False)
 
     # --- 记录 ---
 
@@ -147,6 +149,13 @@ class CleaningReport:
 
     # --- 查询 ---
 
+    def register_samples(self, paths: Iterable[str | Path]) -> None:
+        """登记图片样本；目录、JSON及其他问题条目不进入样本分母。"""
+        for path in paths:
+            key = str(path)
+            self._samples.add(key)
+            self._status.setdefault(key, SampleStatus.VALID)
+
     def status_of(self, path: str | Path) -> SampleStatus:
         return self._status.get(str(path), SampleStatus.VALID)
 
@@ -171,10 +180,10 @@ class CleaningReport:
                 "total_issues": len(self.issues),
                 "by_severity": self.counts_by_severity(),
                 "by_check": self.counts_by_check(),
+                "sample_total": len(self._samples),
                 "samples": {
-                    "valid": sum(1 for s in self._status.values() if s is SampleStatus.VALID),
-                    "suspect": sum(1 for s in self._status.values() if s is SampleStatus.SUSPECT),
-                    "invalid": sum(1 for s in self._status.values() if s is SampleStatus.INVALID),
+                    status.value: sum(self.status_of(path) is status for path in self._samples)
+                    for status in SampleStatus
                 },
             },
             "checked": self.checked,
@@ -244,6 +253,14 @@ class CleaningReport:
 
 
 
+def _confirmed_corruption(exc: Exception) -> bool:
+    """解码器格式错误可确认损坏；系统读取或资源故障需保留待复核。"""
+    if isinstance(exc, (UnidentifiedImageError, SyntaxError, EOFError, zipfile.BadZipFile, zlib.error)):
+        return True
+    # Pillow解码失败通常是无errno的OSError，系统IO失败不是损坏证据。
+    return type(exc) is OSError and exc.errno is None
+
+
 def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
     """探测单张图像能否读取，并算统计特征。
 
@@ -257,6 +274,7 @@ def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
     path, force_load, want_stats, downsample = task
     r: dict[str, Any] = {
         "path": path, "ok": False, "error": None,
+        "corrupt": False, "stats_error": None,
         "width": None, "height": None, "mode": None,
         "brightness_mean": None, "brightness_std": None,
         "entropy": None, "edge_density": None, "colorfulness": None,
@@ -267,15 +285,20 @@ def _probe_image(task: tuple[str, bool, bool, int]) -> dict[str, Any]:
             im.verify()
         # verify() 之后必须重开，否则文件句柄状态不可用
         with Image.open(path) as im:
-            if force_load:
+            if force_load or want_stats:
                 im.load()
             r["width"], r["height"] = im.size
             r["mode"] = im.mode
+            r["ok"] = True
             if want_stats:
-                r.update(_image_stats(im, downsample))
-        r["ok"] = True
+                try:
+                    r.update(_image_stats(im, downsample))
+                except Exception as exc:  # noqa: BLE001 — 统计失败不改变解码结论
+                    r["stats_error"] = f"{type(exc).__name__}: {exc}"
     except Exception as exc:  # noqa: BLE001 —— 子进程里必须吞掉一切异常
+        r["ok"] = False
         r["error"] = f"{type(exc).__name__}: {exc}"
+        r["corrupt"] = _confirmed_corruption(exc)
     return r
 
 
@@ -287,8 +310,8 @@ def probe_image_integrity(path: str | Path) -> dict[str, Any]:
 def _image_stats(im: Image.Image, downsample: int) -> dict[str, float]:
     """计算用于退化与离群检测的图像统计量。
 
-    全部在灰度降采样图上算，兼顾速度与稳定性。
-    返回值范围固定，方便跨数据集比较。
+    亮度、熵和边缘使用灰度降采样图；色彩丰富度使用RGB降采样图。
+    各项统计使用各自的量纲，不表示物理天气强度。
     """
     small = im.convert("L")
     if downsample > 1:
@@ -305,7 +328,8 @@ def _image_stats(im: Image.Image, downsample: int) -> dict[str, float]:
     entropy = float(-(p * np.log2(p)).sum())
 
     # 边缘密度：退化或模糊图接近 0
-    gy, gx = np.gradient(a)
+    gy = np.gradient(a, axis=0) if a.shape[0] > 1 else np.zeros_like(a)
+    gx = np.gradient(a, axis=1) if a.shape[1] > 1 else np.zeros_like(a)
     mag = np.hypot(gx, gy)
     edge_density = float((mag > 10.0).mean())
 
@@ -344,11 +368,15 @@ def _run_probes(
     num_workers: int,
     corruption_only: bool = False,
 ) -> list[dict[str, Any]]:
-    """并行探测一批图像，把完整性/尺寸/退化问题直接记入 report。
+    """并行探测一批图像，将探测失败记入report；尺寸和内容判断由调用方另行处理。
+
+    无论是否启用内容检查，未完成读取都不能确认文件损坏。
+    corruption_only 参数保留供现有调用方使用，不放宽损坏判定标准。
 
     Returns:
         全部探测结果（含正常的），供后续统计与离群检测复用，避免重复 IO。
     """
+    report.register_samples(paths)
     tasks = [(str(p), force_load, want_stats, downsample) for p in paths]
     results: list[dict[str, Any]] = []
 
@@ -364,14 +392,12 @@ def _run_probes(
 
     for r in results:
         if not r["ok"]:
-            error_type = str(r["error"]).split(":", 1)[0]
-            if corruption_only and error_type in {
-                "PermissionError", "FileNotFoundError", "IsADirectoryError",
-                "MemoryError", "DecompressionBombError",
-            }:
+            if not r["corrupt"]:
                 report.warn(check, r["path"], f"读取未完成，不能确认文件损坏，保留待复核: {r['error']}")
             else:
                 report.error(check, r["path"], f"无法解码: {r['error']}")
+        elif r["stats_error"]:
+            report.warn(check, r["path"], f"图片已解码，统计未完成，保留待复核: {r['stats_error']}")
     return results
 
 
@@ -435,6 +461,7 @@ def check_zip_image_integrity(
                         continue
                     member_path = f"{archive_path.resolve().relative_to(base)}::{info.filename}"
                     checked_paths.append(member_path)
+                    report.register_samples([member_path])
                     checked += 1
                     try:
                         image_bytes = archive.read(info)
@@ -443,14 +470,19 @@ def check_zip_image_integrity(
                         with Image.open(io.BytesIO(image_bytes)) as image:
                             image.load()
                     except Exception as exc:  # noqa: BLE001 — 一个损坏成员不能中断整包扫描
-                        invalid += 1
-                        report.error(
-                            check,
-                            member_path,
-                            f"无法完整解码: {type(exc).__name__}: {exc}",
-                        )
+                        if _confirmed_corruption(exc):
+                            invalid += 1
+                            report.error(
+                                check, member_path,
+                                f"无法完整解码: {type(exc).__name__}: {exc}",
+                            )
+                        else:
+                            report.warn(
+                                check, member_path,
+                                f"读取未完成，不能确认文件损坏，保留待复核: {type(exc).__name__}: {exc}",
+                            )
         except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
-            report.error(check, archive_path, f"无法读取图像归档: {type(exc).__name__}: {exc}")
+            report.warn(check, archive_path, f"无法完成归档检查，成员未确认损坏: {type(exc).__name__}: {exc}")
 
     report.mark_checked(f"{check.rsplit('/', 1)[0]}.images_probed", checked)
     report.stats[f"{check.rsplit('/', 1)[0]}_total_images"] = checked
@@ -589,6 +621,8 @@ def check_acdc(
     if not all_images:
         report.mark_skipped("acdc", f"未找到图像: {root / 'rgb_anon'}")
         return
+
+    report.register_samples(all_images)
 
     # --- 1. 图像完整性 ---
     if checks.get("image_integrity", True) or checks.get("image_statistics", True):
@@ -849,6 +883,7 @@ def check_kitti(
             report.mark_skipped(f"kitti/{split}", f"目录下无 png: {img_dir}")
             continue
 
+        report.register_samples(images)
         if checks.get("image_integrity", True) or checks.get("image_statistics", True):
             integ = cfg.get("integrity", {})
             stat_cfg = cfg.get("image_statistics", {})
@@ -938,14 +973,14 @@ def check_kitti(
 
 
 def _file_digest(path: Path, nbytes: int) -> str:
-    """取文件前 nbytes 字节的 sha1。
-
-    只用前 256KB 而非全文哈希：全量哈希 16GB 要几分钟，收益也不大，
-    前 256KB 足以区分不同照片（图像头部包含尺寸、调色板与起始像素数据）。
-    """
-    h = hashlib.sha1()
+    """取前nbytes字节摘要筛候选；nbytes<=0时分块核验全文。"""
+    h = hashlib.sha256()
     with open(path, "rb") as f:
-        h.update(f.read(nbytes))
+        if nbytes > 0:
+            h.update(f.read(nbytes))
+        else:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
     return h.hexdigest()
 
 
@@ -981,14 +1016,23 @@ def check_duplicates(
                 seen[_file_digest(p, nbytes)].append(str(p))
             except Exception as exc:  # noqa: BLE001
                 report.error(f"{label}/duplicates_exact", p, f"读取失败: {exc}")
-        dups = {k: v for k, v in seen.items() if len(v) > 1}
+        full: dict[str, list[str]] = defaultdict(list)
+        for candidates in seen.values():
+            if len(candidates) < 2:
+                continue
+            for name in candidates:
+                try:
+                    full[_file_digest(Path(name), 0)].append(name)
+                except Exception as exc:  # noqa: BLE001
+                    report.warn(f"{label}/duplicates_exact", name, f"全文读取未完成，重复身份未确认: {exc}")
+        dups = {k: v for k, v in full.items() if len(v) > 1}
         report.mark_checked(f"{label}.exact_hashed", len(paths))
         report.stats[f"{label}_exact_duplicate_groups"] = len(dups)
         for k, v in dups.items():
             for extra in v[1:]:
                 report.warn(
                     f"{label}/duplicates_exact", extra,
-                    f"与 {v[0]} 内容重复（前 {nbytes // 1024}KB 哈希相同）",
+                    f"与 {v[0]} 内容重复（完整文件 SHA256 相同）",
                 )
     else:
         report.mark_skipped(f"{label}/duplicates_exact", "配置中已关闭")
@@ -1089,6 +1133,7 @@ def _write_manifest(
     """写出有效样本清单 —— 这是清洗的实际产物，数据集类据此过滤。"""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    report.register_samples(all_paths)
     valid = [str(p) for p in all_paths if report.status_of(p) is SampleStatus.VALID]
     suspect = [str(p) for p in all_paths if report.status_of(p) is SampleStatus.SUSPECT]
     invalid = [str(p) for p in all_paths if report.status_of(p) is SampleStatus.INVALID]
@@ -1155,7 +1200,7 @@ def clean(
                     force_load=True,
                     want_stats=False,
                     downsample=1,
-                    num_workers=workers,
+                    num_workers=workers, corruption_only=True,
                 )
                 report.mark_checked("acdc.images_probed", len(results))
                 report.stats["acdc_total_images"] = len(acdc_images)
@@ -1192,6 +1237,7 @@ def clean(
                 results = _run_probes(
                     kitti_images, report, check="kitti/image_integrity",
                     force_load=True, want_stats=False, downsample=1, num_workers=workers,
+                    corruption_only=True,
                 )
                 report.mark_checked("kitti.images_probed", len(results))
             _write_manifest(report, kitti_images, root / out_cfg.get(

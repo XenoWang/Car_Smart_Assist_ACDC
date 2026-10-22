@@ -1,3 +1,4 @@
+# 通用多任务／Stage 2框架的预留配置；对应通用入口尚未实现，当前三模型使用专用入口与配置。
 base: ../default.yaml
 data: ../data/acdc.yaml
 model: ../model/advisory_llm.yaml
@@ -9,13 +10,13 @@ train:
     max_image_pixels: 501760   # 约 896x560
     max_length: 1024           # 指令 + 回复的总 token 上限
 
-  epochs: 8                    # QLoRA 微调轮次不宜多，3-8 轮即可，多了会过拟合风格
+  epochs: 8                    # 预留训练预算；合适轮数与过拟合情况须由验证集判断
   batch_size: 1
   gradient_accumulation_steps: 16   # 等效批量 16
   length_grouped_batching: true
 
   lora:
-    r: 16                      # 秩。16 是常用起点；提示生成是相对简单的任务，再大收益有限
+    r: 16                      # 预留LoRA秩，尚未在本项目训练或比较收益
     lora_alpha: 32             # 一般取 2*r
     lora_dropout: 0.05
     bias: none
@@ -29,7 +30,7 @@ train:
   optimizer:
     name: adamw_8bit           # 8-bit 优化器，省显存
     lr: 2.0e-4                 # LoRA 的学习率比全参微调高 1-2 个数量级
-    weight_decay: 0.0          # LoRA 参数少，加 wd 收益甚微
+    weight_decay: 0.0          # 预留权重衰减值，收益尚未在本项目验证
     betas: [0.9, 0.999]
 
   scheduler:

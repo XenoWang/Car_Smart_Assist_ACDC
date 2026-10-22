@@ -363,3 +363,72 @@ def test_blind_gate_skips_weather_model():
     assert result.weather_warning is None
     assert result.advisory.should_takeover is True
     assert result.advisory.source == "visibility_gate"
+def test_attention_training_output_guard_rejects_default_checkpoint_directory(tmp_path):
+    import yaml
+    from car_smart_assist.perception.weather_training import require_independent_weather_output
+
+    config = tmp_path / "configs/model/weather_classifier.yaml"
+    config.parent.mkdir(parents=True)
+    values = yaml.safe_load((Path(__file__).resolve().parents[2]
+                             / "configs/model/weather_classifier.yaml").read_text(encoding="utf-8"))
+    values["weather_classifier"]["checkpoint"] = "artifacts/checkpoints/weather/default/best.pt"
+    config.write_text(yaml.safe_dump(values), encoding="utf-8")
+    protected = (tmp_path / values["weather_classifier"]["checkpoint"]).parent
+    protected.mkdir(parents=True)
+    best, last = protected / "best.pt", protected / "last.pt"
+    best.write_bytes(b"default best")
+    last.write_bytes(b"default last")
+    before = (best.read_bytes(), last.read_bytes())
+    with pytest.raises(ValueError, match="保护"):
+        require_independent_weather_output(tmp_path, protected)
+    assert (best.read_bytes(), last.read_bytes()) == before
+
+
+def test_weather_fresh_archive_preserves_best_and_last_bytes(tmp_path):
+    from car_smart_assist.perception.weather_training import _archive_weather_checkpoints
+
+    best, last = tmp_path / "best.pt", tmp_path / "last.pt"
+    best.write_bytes(b"old-best")
+    last.write_bytes(b"old-last")
+    _archive_weather_checkpoints((best, last))
+    assert not best.exists() and not last.exists()
+    snapshots = list((tmp_path / "history").glob("*/best.pt"))
+    assert len(snapshots) == 1
+    archive = snapshots[0].parent
+    assert snapshots[0].read_bytes() == b"old-best"
+    assert (archive / "last.pt").read_bytes() == b"old-last"
+
+
+def test_weather_fresh_archive_failure_keeps_original_checkpoints(tmp_path, monkeypatch):
+    from car_smart_assist.perception import weather_training
+
+    best, last = tmp_path / "best.pt", tmp_path / "last.pt"
+    best.write_bytes(b"old-best")
+    last.write_bytes(b"old-last")
+    monkeypatch.setattr(
+        weather_training.os, "fsync",
+        lambda _fd: (_ for _ in ()).throw(OSError("disk")),
+    )
+    with pytest.raises(OSError, match="disk"):
+        weather_training._archive_weather_checkpoints((best, last))
+    assert best.read_bytes() == b"old-best"
+    assert last.read_bytes() == b"old-last"
+
+
+def test_weather_last_rejects_missing_or_replaced_best_identity(tmp_path):
+    import hashlib
+    from car_smart_assist.perception.weather_training import _load_verified_weather_best
+
+    best = tmp_path / "best.pt"
+    best.write_bytes(b"best payload")
+    reference = {
+        "best_sha256": hashlib.sha256(best.read_bytes()).hexdigest(),
+        "format_version": 2, "model_config": {"width": 4},
+        "dataset_signatures": {"train": "a", "val": "b"},
+        "best_epoch": 2, "best_val_loss": 0.25, "best_val_metrics": {"f1": 0.7},
+    }
+    with pytest.raises(ValueError, match="完整恢复"):
+        _load_verified_weather_best(tmp_path / "missing.pt", reference)
+    best.write_bytes(b"unrelated best payload")
+    with pytest.raises(ValueError, match="摘要不配对"):
+        _load_verified_weather_best(best, reference)

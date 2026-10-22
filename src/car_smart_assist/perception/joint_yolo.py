@@ -1,4 +1,4 @@
-"""BCE 按数据来源选择监督范围；未标注的类别和 ROI 不作为负样本。"""
+"""BCE按来源与ROI限制背景监督；启用前景互斥时，已分配正样本位置同时监督其他类别为负。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ class MaskedClassificationLoss(nn.Module):
         if getattr(self, "foreground_exclusive", False):
             # 在已标注的目标上，这九类互斥：
             # 常规交通类别与已标注的杂类货物。
-            # 缺少背景标注时仍然不产生类别负样本。
+            # 未标注背景位置仍由来源／ROI限制监督；正样本位置可监督其他类别为负。
             positives = positives.any(dim=-1, keepdim=True)
         allowed = self.valid | positives
         return (
@@ -63,7 +63,7 @@ class JointDetectionLoss:
 
 
 def preserve_classification_outputs(source, target, known_classes):
-    """加第九类时要保留原来八类的输出权重行，不能重新初始化。"""
+    """源模型恰含known_classes类且通道兼容时复制其分类输出行；其他初始化来源返回0。"""
     if source is None or source.model[-1].nc != known_classes:
         return 0
     copied = 0

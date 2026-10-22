@@ -18,7 +18,7 @@ class VisibilityLevel(str, Enum):
     """能见度三档。"""
 
     VISIBLE = "visible"      # 可用，正常走感知链路
-    DEGRADED = "degraded"    # 能见度下降，可用但需降低置信度、倾向提示
+    DEGRADED = "degraded"    # 能见度下降，允许感知；规则仍用原始置信度，能见度另作风险证据
     BLIND = "blind"          # 看不清，跳过感知，直接请求接管
 
 

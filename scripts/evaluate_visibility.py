@@ -15,7 +15,6 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from car_smart_assist.config.visibility import MODEL_DEFAULTS  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
     VisibilityScorer,
@@ -91,18 +90,21 @@ def eval_fit_quality(
         train  模型在这些数据上拟合过 —— 指标最好，但不代表泛化
         val    参与早停与权重选择
         calib  只用来算零校准统计
-        test   **不参与任何决定** —— 这里报出的数字才是可引用的
+        test   本次仅用于报告；是否用于过往决策需核对实验记录
 
     ⚠️ 测重建误差必须直接用**原始图像**，不能拿训练日志里的 train_loss 对比。
     训练损失算在开了增强的数据上，验证/测试损失没有增强；
     所以这里分别在原始图像上抽样，统一重算重建误差。
 
-    划分函数与 trainer 完全一致，保证切分相同。
+    采用与 trainer 相同的划分入口；历史数据身份及实际分区仍需核对。
     """
     from car_smart_assist.perception.visibility.dataset import (
         sequence_of,
         split_ref_indices,
     )
+
+    if dcfg.get("split_mode", "fixed") == "random":
+        raise ValueError("评估不能重建训练时的随机分区；请使用 data.split_mode=fixed 的匹配检查点")
 
     # 划分参数必须和 trainer 完全一致，否则各集合会错位
     groups = (
@@ -196,7 +198,7 @@ def eval_real_adverse(
     cleaning_manifest: str | Path | None = None,
     project_root: str | Path = ".",
 ) -> dict[str, Any]:
-    """真实恶劣天气图：这些图「难但可用」，不应大量落进 BLIND。"""
+    """汇总真实恶劣天气图的判档分布，不将目录标签当成可用性真值。"""
     rng = np.random.default_rng(seed)
     result: dict[str, Any] = {}
     for cond in ("fog", "night", "rain", "snow"):
@@ -268,7 +270,7 @@ def eval_synthetic(
                 np.nanmedian(zs) if np.isfinite(zs).any() else float("nan"),
             )
 
-        # 单调性：information 随 severity 单调下降（等价于能见度单调变差）
+        # 单调性：检查information是否随合成severity单调不增；不等同于真实能见度真值
         infos = [c["information_mean"] for c in curve]
         monotonic = all(
             infos[i] >= infos[i + 1] - 1e-6 for i in range(len(infos) - 1)
@@ -293,7 +295,19 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    L: list[str] = ["# 能见度门控评估报告", ""]
+    thresholds = report.get("thresholds", {})
+    recon_enabled = bool(thresholds.get("use_recon_z", False))
+    L: list[str] = [
+        "# 能见度门控评估报告", "",
+        f"- 配置来源：`{report.get('config_path', '未记录')}`",
+        f"- 检查点：`{report.get('checkpoint', '未记录')}`",
+        f"- 有效输入尺寸 (H, W)：`{report.get('input_size', '未记录')}`",
+        f"- 实际门控参数：`{thresholds}`",
+        f"- 重建判据 use_recon_z：`{recon_enabled}`",
+        f"- 数据配置：`{report.get('config', {}).get('data', {})}`",
+        f"- 信息量评分配置：`{report.get('scoring', {})}`",
+        f"- 评估协议：`{report.get('evaluation_protocol', {})}`", "",
+    ]
 
     f = report["fit_quality"]
     sz = f["split_sizes"]
@@ -305,10 +319,10 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         f"| 训练集 | {sz['train']} | {f['train_recon_mean']:.6f} | 模型拟合过，指标最乐观 |",
         f"| 验证集 | {sz['val']} | {f['val_recon_mean']:.6f} | 用于选择权重与早停 |",
         f"| 校准集 | {sz['calib']} | {f['calib_recon_mean']:.6f} | 只用于最终零校准 |",
-        f"| **测试集** | {sz['test']} | **{f['test_recon_mean']:.6f}** | **不参与任何决定，可引用** |",
+        f"| **测试集** | {sz['test']} | **{f['test_recon_mean']:.6f}** | 本次仅报告，历史使用需核对 |",
         "",
         f"- 验证/训练误差比：**{f['val_train_ratio']:.3f}**（验证集用于选择权重）",
-        f"- 测试/训练误差比：**{f['test_train_ratio']:.3f}**（只作最终泛化诊断，不用于选权重）",
+        f"- 测试/训练误差比：**{f['test_train_ratio']:.3f}**（本次仅作重建诊断，不用于选权重）",
         f"- 结论：**{f['verdict']}**",
         f"- 信息量分数中位数：训练 {f['train_information_median']:.3f} / "
         f"验证 {f['val_information_median']:.3f} / 校准 {f['calib_information_median']:.3f} / "
@@ -317,8 +331,8 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         "",
         f"### 测试集误报率：**{f['test_false_positive_rate']:.2%}**",
         "",
-        "> 这是整个报告里**唯一没有被任何决策污染过**的数字 ——",
-        "> 测试集从不参与训练、早停、阈值标定，所以它是可引用的泛化估计。",
+        "> 本脚本按记录的数据配置重建四分划分；测试子集在本次评估中仅用于报告。",
+        "> 是否曾用于其他人工决策，以及检查点训练时是否采用相同数据，需结合实验记录核对。",
         "",
         "> ⚠️ 这里直接测**原始图像**，不能拿训练日志里的 train_loss 对比：",
         "> 训练损失在开了增强的数据上算，验证损失没有增强，两边口径不一致会**缩小**差距。",
@@ -334,7 +348,7 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         f"- **被判 BLIND 的比例：{c['false_positive_rate']:.2%}**（越低越好，理想为 0）",
         f"- 被判 DEGRADED 的比例：{c['degraded_rate']:.2%}",
         "",
-        "> 这些是清晰的正常天气图，门控不该拦下任何一张。",
+        "> 这里将参考图作为正常对照统计；没有逐帧可用性真值，不能据此断定每次阻断都错误。",
         "",
     ]
 
@@ -353,12 +367,11 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         )
     L += [
         "",
-        "> ⚠️ ACDC 里**没有**「看不清」的帧 —— 否则它不成其为数据集。",
-        "> 它的最暗帧是「很暗但可用」。因此这里的 BLIND 比例应当很低；",
-        "> 如果偏高，说明阈值定得太激进，会把整个夜路子集废掉。",
+        "> ACDC 条件标签不提供逐帧 BLIND 真值；此处只报告判档分布，",
+        "> 不能单凭阻断比例判断误报或可用性，需结合逐帧复核。",
         "",
-        "> **recon_z 一列请留意方向**：若退化越重它反而越低（甚至为负），",
-        "> 说明重建误差与退化反相关，该信号不具备判别力，已在 gate 中停用。",
+        "> recon_z 的方向与判别力需要独立验证；",
+        f"> 本次配置的重建判据为 use_recon_z={recon_enabled}。",
         "",
     ]
 
@@ -388,12 +401,13 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         "",
         "- 合成退化与真实恶劣天气并不等价：真实的雾浓度非均匀、",
         "  真实夜间的传感器噪声模型也不同于 gamma 拉伸。",
-        "  因此第 4 节的召回率是**上界意义上的估计**，不能替代真实场景验证。",
+        "  第 4 节只统计本次合成协议下的 BLIND 比例，不能视为真实召回的上界或替代真实验证。",
         "- 本报告只能回答「在人为构造的极端退化下门控是否报警」，",
         "  无法回答「在真实部署的雨雾夜里是否恰好报警」。",
         "  后者需要真实带标注数据，超出本项目的数据条件。",
-        "- 判定目前**只依赖确定性信息量特征**，重建误差未参与决策（原因见第 3 节）。",
-        "  这意味着自编码器在当前任务上尚未贡献判别力，其价值有待重新评估。",
+        ("- 本次启用重建判据，门控同时读取信息量与重建 z 分数；其真实判别力仍需独立验证。"
+         if recon_enabled else
+         "- 本次关闭重建判据，门控判档只读取确定性信息量；AE 仍用于本报告的重建诊断。"),
         "",
     ]
 
@@ -421,8 +435,10 @@ def main() -> int:
     raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     cfg = raw.get("visibility", raw)
     dcfg, rcfg = cfg.get("data", {}), cfg.get("report", {})
+    if dcfg.get("split_mode", "fixed") == "random":
+        logger.error("评估不能重建训练时的随机分区；请使用 data.split_mode=fixed 的匹配检查点")
+        return 2
 
-    size = tuple(cfg.get("model", {}).get("input_size", MODEL_DEFAULTS["input_size"]))
     acdc_root = root / dcfg.get("acdc_root", "data/raw/acdc")
 
     ckpt = Path(args.checkpoint) if args.checkpoint else (
@@ -439,6 +455,8 @@ def main() -> int:
         cfg=cfg.get("model", {}),
         scoring_cfg=cfg.get("scoring", {}),
     )
+    # 检查点决定模型有效尺寸，参考图与真实恶劣图必须沿用同一解码口径。
+    size = scorer.input_size
     gate = VisibilityGate.from_config(cfg)
     if scorer.calibration is None:
         logger.warning(
@@ -462,11 +480,21 @@ def main() -> int:
 
     report: dict[str, Any] = {
         "checkpoint": str(ckpt),
+        "config_path": str(cfg_path),
+        "config": cfg,
+        "input_size": list(size),
+        "scoring": scorer.scoring_cfg,
+        "evaluation_protocol": {
+            "sample_per_condition": n,
+            "sample_seed": 0,
+            "severities": list(args.severities),
+            "synthetic_kinds": ["fog", "darkness", "occlusion", "blur"],
+        },
         "calibration": scorer.calibration.to_dict() if scorer.calibration else None,
         "thresholds": vars(gate.thresholds),
     }
 
-    # 先做过拟合检查 —— 模型本身没训好的话，后面的召回率数字都没有意义
+    # 重建质量与判档指标分别报告；实际使用的判据由 thresholds 记录。
     report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)
     report["real_adverse"] = eval_real_adverse(

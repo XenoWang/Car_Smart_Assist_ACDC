@@ -215,7 +215,7 @@ class TestGateBlocksPerception:
         assert not r.perception.road_obstacle_detection_available
 
     def test_degraded_still_runs_perception(self):
-        """DEGRADED 只降低置信度，不应阻断——误报会让用户学会忽略它。"""
+        """DEGRADED允许感知并保留0.6兼容乘子；策略可靠性仍使用原始置信度。"""
         predictor = StubPredictor()
         r = make_pipeline(information=0.40, predictor=predictor).run(frame())
         assert r.blocked is False

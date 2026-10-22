@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -52,29 +53,41 @@ class JointDataset(YOLODataset):
         super().__init__(*args, **kwargs)
 
     def __getitem__(self, item):
-        sample = super().__getitem__(item)
-        row = self.index[str(Path(sample["im_file"]).resolve())]
-        height, width = sample["img"].shape[-2:]
-        roi = np.ones((height, width), dtype=np.uint8)
+        labels = self.get_image_and_label(item)
+        row = self.index[str(Path(labels["im_file"]).resolve())]
+        roi = None
         if row["roi_mask"]:
-            raw = native_roi(row, self.manifest)
-            original_height, original_width = raw.shape
-            ratio = min(height / original_height, width / original_width)
-            resized_height, resized_width = (
-                round(original_height * ratio),
-                round(original_width * ratio),
+            raw = native_roi(row, self.manifest).astype(np.uint8)
+            # BaseDataset.load_image已按长边/ceil缩放，保留这一实际中间尺寸。
+            resized_height, resized_width = labels["img"].shape[:2]
+            resized = cv2.resize(
+                raw, (resized_width, resized_height), interpolation=cv2.INTER_NEAREST
             )
-            resized = np.asarray(
-                Image.fromarray(raw.astype(np.uint8)).resize(
-                    (resized_width, resized_height), Image.Resampling.NEAREST
+            # 8.3.162的验证LetterBox禁止scaleup；rect_shape包含stride/pad扩边。
+            # 训练仅允许颜色/模糊增强，LetterBox使用scaleup=True，空间变换为恒等。
+            target_height, target_width = labels.get("rect_shape", (self.imgsz, self.imgsz))
+            ratio = min(target_height / resized_height, target_width / resized_width)
+            if not self.augment:
+                ratio = min(ratio, 1.0)
+            unpad_width, unpad_height = (
+                round(resized_width * ratio), round(resized_height * ratio)
+            )
+            if (unpad_width, unpad_height) != (resized_width, resized_height):
+                resized = cv2.resize(
+                    resized, (unpad_width, unpad_height), interpolation=cv2.INTER_NEAREST
                 )
-            )
             top, left = (
-                round((height - resized_height) / 2 - 0.1),
-                round((width - resized_width) / 2 - 0.1),
+                round((target_height - unpad_height) / 2 - 0.1),
+                round((target_width - unpad_width) / 2 - 0.1),
             )
-            roi.fill(0)
-            roi[top : top + resized_height, left : left + resized_width] = resized
+            roi = np.zeros((target_height, target_width), dtype=np.uint8)
+            roi[top : top + unpad_height, left : left + unpad_width] = resized
+        sample = self.transforms(labels)
+        height, width = sample["img"].shape[-2:]
+        if roi is None:
+            roi = np.ones((height, width), dtype=np.uint8)
+        elif roi.shape != (height, width):
+            raise ValueError("Joint ROI/image transforms differ; spatial augmentation is unsupported")
         coverage = torch.zeros(len(self.manifest["classes"]), dtype=torch.bool)
         coverage[row["supervised_classes"]] = True
         sample.update(

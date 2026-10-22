@@ -536,3 +536,162 @@ def test_continuation_preserves_state_reopens_swad_and_resumes_exactly(cfg, tmp_
             fresh=True,
         )
     assert hashlib.sha256(source_path.read_bytes()).hexdigest() == source_hash
+
+
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_attention_checkpoint_factory_matches_public_copy_and_isolates_config(
+    cfg, tmp_path, monkeypatch, channels_last
+):
+    import car_smart_assist.perception.weather_attention as attention_module
+
+    cfg = replace(
+        cfg,
+        device="cpu",
+        train={**cfg.train, "channels_last": channels_last},
+    )
+    source = WeatherAttention(cfg)
+    if channels_last:
+        source.to(memory_format=torch.channels_last)
+    source.train()
+    original_state = {name: value.detach().clone() for name, value in source.state_dict().items()}
+    original_modes = {name: module.training for name, module in source.named_modules()}
+    reference = optimize_attention_inference(source)
+
+    assert source.training
+    assert {name: module.training for name, module in source.named_modules()} == original_modes
+    assert all(
+        torch.equal(value, source.state_dict()[name]) for name, value in original_state.items()
+    )
+
+    checkpoint = tmp_path / "tiny_calibrated.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "model_config": attention_model_config(cfg),
+            "model_state": source.state_dict(),
+            "calibration_signature": "synthetic-test-only",
+            "decision_thresholds": dict.fromkeys(cfg.attributes, 0.5),
+        },
+        checkpoint,
+    )
+
+    real_deepcopy = attention_module.copy.deepcopy
+
+    def reject_whole_model_deepcopy(value, memo=None):
+        if isinstance(value, WeatherAttention):
+            raise AssertionError("checkpoint factory must not deepcopy the whole model")
+        return real_deepcopy(value, memo)
+
+    monkeypatch.setattr(attention_module.copy, "deepcopy", reject_whole_model_deepcopy)
+    predictor = WeatherAttentionPredictor.from_checkpoint(checkpoint, cfg, device="cpu")
+
+    assert predictor.cfg is cfg
+    assert predictor.model.cfg is not cfg
+    assert predictor.model.cfg.train is not cfg.train
+    assert predictor.model.cfg.backbone is not cfg.backbone
+    assert predictor.model.cfg.train["channels_last"] is channels_last
+    assert not predictor.model.training
+    reference_state = reference.state_dict()
+    actual_state = predictor.model.state_dict()
+    assert actual_state.keys() == reference_state.keys()
+    assert all(torch.equal(actual_state[name], reference_state[name]) for name in actual_state)
+    four_dimensional = next(p for p in predictor.model.parameters() if p.ndim == 4)
+    assert four_dimensional.is_contiguous(
+        memory_format=torch.channels_last if channels_last else torch.contiguous_format
+    )
+
+    image = np.arange(64 * 96 * 3, dtype=np.uint32).reshape(64, 96, 3)
+    image = (image % 256).astype(np.uint8)
+    input_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
+    with torch.inference_mode():
+        expected_probabilities = reference(input_tensor).float().sigmoid()[0].numpy()
+    result = predictor.predict(image)
+    expected = dict(zip(cfg.attributes, expected_probabilities.tolist(), strict=True))
+    assert result.probabilities == expected
+    assert result.decisions == {
+        name: probability >= 0.5 for name, probability in expected.items()
+    }
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="需要可用 CUDA GPU")
+@pytest.mark.parametrize("channels_last", [False, True])
+def test_attention_checkpoint_factory_matches_public_copy_on_cuda(
+    cfg, tmp_path, monkeypatch, channels_last
+):
+    import car_smart_assist.perception.weather_attention as attention_module
+
+    cfg = replace(
+        cfg,
+        device="cuda",
+        train={**cfg.train, "channels_last": channels_last},
+    )
+    source = WeatherAttention(cfg).to("cuda")
+    if channels_last:
+        source.to(memory_format=torch.channels_last)
+    source.train()
+    original_state = {name: value.detach().clone() for name, value in source.state_dict().items()}
+    original_modes = {name: module.training for name, module in source.named_modules()}
+    reference = optimize_attention_inference(source)  # 旧工厂也在目标设备上融合。
+
+    assert source.training
+    assert {name: module.training for name, module in source.named_modules()} == original_modes
+    assert all(
+        torch.equal(value, source.state_dict()[name]) for name, value in original_state.items()
+    )
+
+    checkpoint = tmp_path / "tiny_calibrated_cuda.pt"
+    torch.save(
+        {
+            "format_version": 1,
+            "model_config": attention_model_config(cfg),
+            "model_state": source.state_dict(),
+            "calibration_signature": "synthetic-test-only",
+            "decision_thresholds": dict.fromkeys(cfg.attributes, 0.5),
+        },
+        checkpoint,
+    )
+
+    real_deepcopy = attention_module.copy.deepcopy
+
+    def reject_whole_model_deepcopy(value, memo=None):
+        if isinstance(value, WeatherAttention):
+            raise AssertionError("checkpoint factory must not deepcopy the whole model")
+        return real_deepcopy(value, memo)
+
+    monkeypatch.setattr(attention_module.copy, "deepcopy", reject_whole_model_deepcopy)
+    predictor = WeatherAttentionPredictor.from_checkpoint(checkpoint, cfg, device="cuda")
+
+    assert predictor.device.type == "cuda"
+    assert predictor.model.cfg is not cfg
+    assert predictor.model.cfg.train is not cfg.train
+    assert predictor.model.cfg.backbone is not cfg.backbone
+    assert predictor.model.cfg.train["channels_last"] is channels_last
+    assert not predictor.model.training
+    reference_state = reference.state_dict()
+    actual_state = predictor.model.state_dict()
+    assert actual_state.keys() == reference_state.keys()
+    assert all(torch.equal(actual_state[name], reference_state[name]) for name in actual_state)
+    four_dimensional = next(p for p in predictor.model.parameters() if p.ndim == 4)
+    assert four_dimensional.device.type == "cuda"
+    assert four_dimensional.is_contiguous(
+        memory_format=torch.channels_last if channels_last else torch.contiguous_format
+    )
+
+    image = np.arange(64 * 96 * 3, dtype=np.uint32).reshape(64, 96, 3)
+    image = (image % 256).astype(np.uint8)
+    input_tensor = (
+        torch.from_numpy(image)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .to("cuda", dtype=torch.float32)
+        .div_(255.0)
+    )
+    with torch.inference_mode():
+        expected_probabilities = reference(input_tensor).float().sigmoid()[0].cpu().numpy()
+    result = predictor.predict(image)
+    expected = dict(zip(cfg.attributes, expected_probabilities.tolist(), strict=True))
+    assert result.probabilities == expected
+    assert result.decisions == {
+        name: probability >= 0.5 for name, probability in expected.items()
+    }

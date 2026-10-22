@@ -13,12 +13,53 @@ import torch
 from car_smart_assist.config.detection import yolo_selection_validator_args
 
 
+STOPPER_FIELDS = ("best_fitness", "best_epoch", "patience", "possible_stop")
+EARLY_STOPPING_POLICY = "preserve_history"
+
+
 def require_model_selection_contract(record, contract):
     previous = record.get("model_selection_contract")
     if previous is None or json.dumps(previous, sort_keys=True) != json.dumps(contract, sort_keys=True):
         raise ValueError(
             "Existing run model-selection contract is missing or changed; "
             "use a new run directory (--name) to fine-tune from the old best weights"
+        )
+
+
+def require_best_checkpoint(state, checkpoint: Path) -> str:
+    expected = state.get("best_checkpoint_sha256")
+    if not expected or not checkpoint.is_file():
+        raise ValueError(
+            "Paired best checkpoint or its identity is missing; full resume/final output is refused. "
+            "Use the original paired run or a new run directory (--name) to fine-tune weights"
+        )
+    actual = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    if actual != expected:
+        raise ValueError(
+            "Best checkpoint does not match the paired training state; full resume/final output "
+            "is refused. Restore the paired best or use a new run directory (--name)"
+        )
+    return actual
+
+
+def require_training_history(state):
+    stopper = state.get("early_stopper")
+    segment = state.get("training_segment")
+    if (
+        state.get("format_version") != 4
+        or not isinstance(stopper, dict)
+        or any(name not in stopper for name in STOPPER_FIELDS)
+        or not isinstance(segment, dict)
+        or segment.get("early_stopping_policy") != EARLY_STOPPING_POLICY
+        or type(segment.get("start_epoch")) is not int
+        or type(segment.get("target_epochs")) is not int
+        or segment["start_epoch"] < 0
+        or segment["target_epochs"] <= segment["start_epoch"]
+        or not {"resume_extra_epochs", "epochs_override"}.issubset(segment)
+    ):
+        raise ValueError(
+            "Complete early-stopper/segment resume history is missing or incompatible; "
+            "use a new run directory (--name) to fine-tune trained weights"
         )
 
 
@@ -37,7 +78,8 @@ def load_training_state(
 ) -> dict:
     if not path.is_file():
         raise ValueError(
-            "Full-precision resume state is missing; start a new run from trained weights"
+            "Full-precision resume state is missing; use a new run directory (--name) "
+            "to fine-tune trained weights"
         )
     state = torch.load(path, map_location="cpu", weights_only=True)
     require_model_selection_contract(state, selection_contract)
@@ -46,22 +88,40 @@ def load_training_state(
         or state["checkpoint_sha256"] != hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     ):
         raise ValueError("Resume state does not match dataset/checkpoint")
+    require_best_checkpoint(state, checkpoint.parent / "best.pt")
+    require_training_history(state)
     return state
 
 
 def attach_training_state_callbacks(
     model, dataset_signature: str, resume_state: dict | None, best_fitness: float | None = None,
-    *, selection_contract: dict,
+    *, selection_contract: dict, training_segment: dict,
 ) -> None:
     if resume_state is not None:
         require_model_selection_contract(resume_state, selection_contract)
+        require_training_history(resume_state)
+    elif best_fitness is not None:
+        raise ValueError("Historical best fitness requires paired complete training state")
 
     def save_state(trainer):
+        if trainer.best_fitness == trainer.fitness:
+            # Ultralytics刚把本轮checkpoint同时保存为best，可建立新身份。
+            best_sha256 = hashlib.sha256(trainer.best.read_bytes()).hexdigest()
+        else:
+            best_sha256 = require_best_checkpoint(
+                {"best_checkpoint_sha256": trainer._project_best_checkpoint_sha256}, trainer.best
+            )
+        trainer._project_best_checkpoint_sha256 = best_sha256
         state = {
-            "format_version": 3,
+            "format_version": 4,
             "dataset_signature": dataset_signature,
             "model_selection_contract": selection_contract,
             "checkpoint_sha256": hashlib.sha256(trainer.last.read_bytes()).hexdigest(),
+            "best_checkpoint_sha256": best_sha256,
+            "training_segment": dict(training_segment),
+            "early_stopper": {
+                name: _plain_numbers(getattr(trainer.stopper, name)) for name in STOPPER_FIELDS
+            },
             "epoch": trainer.epoch,
             "best_fitness": trainer.best_fitness,
             "model": trainer.model.state_dict(),
@@ -79,30 +139,33 @@ def attach_training_state_callbacks(
         temporary.replace(path)
 
     def restore_state(trainer):
+        trainer._project_best_checkpoint_sha256 = None
         if resume_state is None:
-            if best_fitness is not None:
-                trainer.best_fitness = best_fitness
             return
         if resume_state["epoch"] != trainer.start_epoch - 1:
             raise ValueError("Resume epoch does not match full-precision state")
+        trainer._project_best_checkpoint_sha256 = require_best_checkpoint(resume_state, trainer.best)
         trainer.model.load_state_dict(resume_state["model"])
         trainer.optimizer.load_state_dict(resume_state["optimizer"])
         trainer.scheduler.load_state_dict(resume_state["scheduler"])
         trainer.scaler.load_state_dict(resume_state["scaler"])
         trainer.ema.ema.load_state_dict(resume_state["ema"])
         trainer.ema.updates = resume_state["ema_updates"]
-        trainer.best_fitness = resume_state.get("best_fitness", trainer.best_fitness)
+        trainer.best_fitness = resume_state["best_fitness"]
+        # 中断恢复和新追加段都保留完整等待历史，不重置patience窗口。
+        for name in STOPPER_FIELDS:
+            setattr(trainer.stopper, name, resume_state["early_stopper"][name])
         torch.set_rng_state(resume_state["torch_rng"])
         if torch.cuda.is_available() and resume_state["cuda_rng"]:
             torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
 
     def finalize_state(trainer):
-        # Ultralytics 在训练完成时会从 last.pt 里删掉 optimizer/epoch。把
-        # 独立的 FP32 状态绑到最终文件上，这样跑完的训练也能续训。
+        # final_eval已核验旧best，并记录strip_optimizer合法改写后的身份。
         path = trainer.wdir / "last_training_state.pt"
-        if not path.is_file():
-            return
         state = torch.load(path, map_location="cpu", weights_only=True)
+        state["best_checkpoint_sha256"] = require_best_checkpoint(
+            {"best_checkpoint_sha256": trainer._project_best_checkpoint_sha256}, trainer.best
+        )
         state["checkpoint_sha256"] = hashlib.sha256(trainer.last.read_bytes()).hexdigest()
         temporary = path.with_suffix(".tmp")
         torch.save(state, temporary)
@@ -146,6 +209,17 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
                 self.test_loader, save_dir=self.save_dir, args=self.validation_args(),
                 _callbacks=self.callbacks,
             )
+
+        def final_eval(self):
+            state = torch.load(
+                self.wdir / "last_training_state.pt", map_location="cpu", weights_only=True
+            )
+            if state["checkpoint_sha256"] != hashlib.sha256(self.last.read_bytes()).hexdigest():
+                raise ValueError("Final last checkpoint does not match the paired training state")
+            require_best_checkpoint(state, self.best)
+            # 8.3.162会合法重写last/best，先核验再交给原实现收尾。
+            super().final_eval()
+            self._project_best_checkpoint_sha256 = hashlib.sha256(self.best.read_bytes()).hexdigest()
 
         def check_resume(self, overrides):
             super().check_resume(overrides)

@@ -1,3 +1,4 @@
+# 当前生效的是advisory.policy；backend、LLM/VLM训练与生成配置仍属预留，不能仅凭配置视为已接入。
 base: default.yaml
 
 advisory:

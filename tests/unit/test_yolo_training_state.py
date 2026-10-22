@@ -14,6 +14,9 @@ from car_smart_assist.perception.yolo_training import (
 )
 
 
+TRAINING_SEGMENT = {"start_epoch": 0, "target_epochs": 3, "resume_extra_epochs": None, "epochs_override": None, "early_stopping_policy": "preserve_history"}
+
+
 SELECTION_CONTRACT = {
     "schema_version": 1,
     "postprocess_version": "best_class_threshold_v1",
@@ -70,6 +73,8 @@ def trainer(tmp_path):
     optimizer.param_groups[0]["lr"] = np.float64(0.001)
     last = tmp_path / "last.pt"
     last.write_bytes(b"paired checkpoint")
+    best = tmp_path / "best.pt"
+    best.write_bytes(b"paired best checkpoint")
     return SimpleNamespace(
         model=module,
         optimizer=optimizer,
@@ -78,6 +83,9 @@ def trainer(tmp_path):
         ema=SimpleNamespace(ema=copy.deepcopy(module), updates=1),
         epoch=0,
         best_fitness=0.2,
+        fitness=0.2,
+        best=best,
+        stopper=SimpleNamespace(best_fitness=0.2, best_epoch=0, patience=3, possible_stop=False),
         start_epoch=1,
         last=last,
         wdir=tmp_path,
@@ -89,7 +97,7 @@ def test_adam_small_variance_and_model_restored_without_half_rounding(tmp_path, 
     callbacks = {}
     model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
     original = trainer(tmp_path)
-    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT)
+    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT, training_segment=TRAINING_SEGMENT)
     callbacks["on_model_save"](original)
     state = load_training_state(
         tmp_path / "last_training_state.pt", original.last, "dataset", SELECTION_CONTRACT
@@ -104,7 +112,7 @@ def test_adam_small_variance_and_model_restored_without_half_rounding(tmp_path, 
     restored = trainer(tmp_path)
     with torch.no_grad():
         restored.model.weight.fill_(100)
-    attach_training_state_callbacks(model, "dataset", state, selection_contract=SELECTION_CONTRACT)
+    attach_training_state_callbacks(model, "dataset", state, selection_contract=SELECTION_CONTRACT, training_segment=TRAINING_SEGMENT)
     callbacks["on_train_start"](restored)
     torch.testing.assert_close(restored.model.weight, original.model.weight)
     restored_variance = next(iter(restored.optimizer.state.values()))["exp_avg_sq"]
@@ -122,7 +130,7 @@ def test_missing_or_mismatched_training_state_rejected(tmp_path, monkeypatch):
         load_training_state(state_path, saved.last, "dataset", SELECTION_CONTRACT)
     callbacks = {}
     model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
-    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT)
+    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT, training_segment=TRAINING_SEGMENT)
     callbacks["on_model_save"](saved)
     with pytest.raises(ValueError, match="match"):
         load_training_state(state_path, saved.last, "different dataset", SELECTION_CONTRACT)
@@ -136,7 +144,7 @@ def test_missing_or_changed_selection_contract_rejected(tmp_path, monkeypatch):
     saved = trainer(tmp_path)
     callbacks = {}
     model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
-    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT)
+    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT, training_segment=TRAINING_SEGMENT)
     callbacks["on_model_save"](saved)
     state_path = tmp_path / "last_training_state.pt"
     state = torch.load(state_path, map_location="cpu", weights_only=True)
@@ -155,14 +163,59 @@ def test_completed_checkpoint_rebound_to_final_file(tmp_path, monkeypatch):
     saved = trainer(tmp_path)
     callbacks = {}
     model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
-    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT)
+    attach_training_state_callbacks(model, "dataset", None, selection_contract=SELECTION_CONTRACT, training_segment=TRAINING_SEGMENT)
     callbacks["on_model_save"](saved)
     saved.last.write_bytes(b"final stripped checkpoint")
     callbacks["on_train_end"](saved)
     state = load_training_state(
         tmp_path / "last_training_state.pt", saved.last, "dataset", SELECTION_CONTRACT
     )
-    assert state["format_version"] == 3
+    assert state["format_version"] == 4
     assert state["model_selection_contract"] == SELECTION_CONTRACT
     assert state["epoch"] == 0
     assert state["best_fitness"] == 0.2
+    assert state["best_checkpoint_sha256"] == __import__("hashlib").sha256(saved.best.read_bytes()).hexdigest()
+    assert state["training_segment"] == TRAINING_SEGMENT
+def test_resume_restores_saved_early_stopper_history(tmp_path, monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    original = trainer(tmp_path)
+    callbacks = {}
+    model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
+    attach_training_state_callbacks(model, "dataset", None,
+                                    selection_contract=SELECTION_CONTRACT,
+                                    training_segment=TRAINING_SEGMENT)
+    callbacks["on_model_save"](original)
+    state = load_training_state(tmp_path / "last_training_state.pt", original.last,
+                                "dataset", SELECTION_CONTRACT)
+    state["early_stopper"] = {
+        "best_fitness": 0.17, "best_epoch": 4, "patience": 9, "possible_stop": True,
+    }
+    restored = trainer(tmp_path)
+    restored.stopper = SimpleNamespace(best_fitness=None, best_epoch=0,
+                                       patience=3, possible_stop=False)
+    callbacks = {}
+    model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
+    attach_training_state_callbacks(model, "dataset", state,
+                                    selection_contract=SELECTION_CONTRACT,
+                                    training_segment=TRAINING_SEGMENT)
+    callbacks["on_train_start"](restored)
+    assert vars(restored.stopper) == state["early_stopper"]
+
+
+@pytest.mark.parametrize("best_mode", ["missing", "replaced"])
+def test_resume_refuses_missing_or_replaced_paired_best(tmp_path, monkeypatch, best_mode):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    saved = trainer(tmp_path)
+    callbacks = {}
+    model = SimpleNamespace(add_callback=lambda key, callback: callbacks.update({key: callback}))
+    attach_training_state_callbacks(model, "dataset", None,
+                                    selection_contract=SELECTION_CONTRACT,
+                                    training_segment=TRAINING_SEGMENT)
+    callbacks["on_model_save"](saved)
+    if best_mode == "missing":
+        saved.best.unlink()
+    else:
+        saved.best.write_bytes(b"unpaired same-structure fixture")
+    with pytest.raises(ValueError, match="best"):
+        load_training_state(tmp_path / "last_training_state.pt", saved.last,
+                            "dataset", SELECTION_CONTRACT)

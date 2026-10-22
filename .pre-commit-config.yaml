@@ -5,7 +5,7 @@
 # 这些检查主要用来拦住下面几类问题：
 #   - 误提交 .pt 权重或大数据文件
 #   - 手滑把 yaml 改坏导致配置静默回退默认值
-# - 提交 notebook 时带上了巨大的输出单元格
+#   - 提交 notebook 时带上了巨大的输出单元格
 default_language_version:
   python: python3.12
 

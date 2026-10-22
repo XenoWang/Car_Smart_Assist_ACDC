@@ -1,6 +1,6 @@
 # 标签规范
 
-本文定义标签编码和输入输出格式。改变编码时需同步检查对应权重、配置与评估。
+本文区分当前接口、历史数据观察和待确认的标签方案。改变编码时需同步检查对应权重、配置与评估。第1、3、4.1—4.3、5、6节涉及的分割、学习式接管、方向、距离和指令训练仍未实现；其中旧候选不代表本轮已批准路线。
 
 ---
 
@@ -10,7 +10,7 @@
 |------|------|
 | 类别体系 | Cityscapes 19 类 |
 | ignore_index | 255 |
-| 映射函数 | `data/label_mapping.py` |
+| 映射位置（待实现） | `src/car_smart_assist/data/label_mapping.py`，当前仅占位 |
 | 调色板 | 官方 Cityscapes 调色板，保证可视化跨实验可比 |
 
 **为什么用 Cityscapes 19 类而不是 ACDC 原始类**：
@@ -21,7 +21,7 @@ Cityscapes 上的预训练权重可以直接复用，19 类也是分割领域常
 
 ## 2. 天气现象与光照属性标签
 
-当前使用 `perception/weather_attention.py` 的独立属性注意力模型，默认路由在 `configs/model/weather_default.yaml`，训练参数在 `configs/model/weather_attention_swad.yaml`。Stage 1 的旧 `road_condition` 头已禁用；不另行训练一套天气分类。属性顺序由配置校验，四个推理阈值读取已完成独立校准的检查点。
+当前使用 `perception/weather_attention.py` 的独立属性注意力模型，默认路由在 `configs/model/weather_default.yaml`，当前A组训练参数在 `configs/model/weather_attention_a.yaml`，SWAD对照参数另见 `configs/model/weather_attention_swad.yaml`。Stage 1 的旧 `road_condition` 头已禁用；不另行训练一套天气分类。属性顺序由配置校验，四个推理阈值读取已完成独立校准的检查点。
 
 | 分组 | 属性 | 向量位置 | 含义 |
 |------|------|----------|------|
@@ -59,11 +59,11 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 - `weather_warning` 用于独立天气提醒。接管策略只在已识别 fog/rain/snow 且能见度为 DEGRADED 时将其作为辅助条件；night 单独不触发。
 - 旧 `PerceptionResult.road_condition` 保留给既有调用方；独立模型通过 `weather_attributes` / `weather_probabilities` 传递，不将多标签压回单类别。
 
-当前默认是 format_version=1 的 `artifacts/checkpoints/weather_attention_swad/best.pt`，本轮按验证评分选择了第 52 轮单点模型。平均权重另存 `swad.pt`；不同版本都通过 `WeatherAttentionPredictor` 的结构和校准签名检查。
+当前默认是 format_version=1 的A组第85轮权重 `artifacts/checkpoints/weather_attention_ablation/reduced_tuning/best.pt`，由 `weather_default.yaml` 路由。SWAD实验导出的第52轮单点与平均权重保留作对照；各版本由 `WeatherAttentionPredictor` 检查结构与校准签名。
 
 旧 CNN 的 format_version=2 及金字塔 ASL 的 format_version=3 只保留作历史对照，分别由原预测器读取。雨天残差增强路线已废弃，其实现、配置和多余权重已清理。
 
-本轮按 ACDC 采集协议和 Pixel Accurate 元数据生成四属性完整监督；损坏清单、完整录制组、参考配对和重复图绑定沿用现有数据入口。数据量 9,612 张，四分 5,696／796／962／2,158，种子 42。没有新增物理雨量、水深或逐像素积雪面积标签。当前预测的 `cues` 保持空字典，接口仍兼容历史字段。
+当前按 ACDC 采集协议和 Pixel Accurate 元数据生成四属性标签，known_mask全1；这不表示共存天气已逐图人工核验；损坏清单、完整录制组、参考配对和重复图绑定沿用现有数据入口。数据量 9,612 张，四分 5,696／796／962／2,158，种子 42。没有新增物理雨量、水深或逐像素积雪面积标签。当前预测的 `cues` 保持空字典，接口仍兼容历史字段。
 
 ---
 
@@ -74,7 +74,7 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 | 类别 | 0=clear / 1=approaching / 2=takeover_required |
 | 编码 | 有序整数（**有序**，不是 one-hot 无序类别） |
 | 类型 | 三档有序分级 |
-| 来源 | **本项目构造**，口径见 `docs/handover_policy.md` |
+| 来源 | 待构造并人工核验；当前规则输出不等同训练真值，规则见 `docs/handover_policy.md` |
 
 **有序性的影响**：等级之间不是等距的，但顺序有意义。
 如果后续尝试序回归（ordinal regression），这个标签可以直接用；
@@ -88,7 +88,7 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 |------|------|
 | ACDC 原始格式 | **COCO JSON**，`bbox` 为 `[x, y, w, h]`（左上角坐标 + 宽高） |
 | 内部统一格式 | `[x1, y1, x2, y2]`，绝对像素坐标，左上原点 |
-| 坐标系 | 变换后的图像坐标（**不是原图坐标**） |
+| 坐标系 | 训练时随图像几何变换；当前YOLO对外输出为原图绝对像素坐标，见4.5 |
 | ACDC 类别 | 8 类，用 Cityscapes ID（见 4.4） |
 | 方向（前车/来车） | **独立属性，不在上述 8 类里**，需另行推导（见 4.1） |
 | YOLO 检测小框 | 所有有效框保留，包括低于 20 px 的框 |
@@ -104,7 +104,7 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 **来车与前车的区分依据**：两者的安全含义不同 ——
 前车过近的处理是减速，来车过近的处理是注意会车，混在一起会影响模型判断。
 
-### 4.1 方向标签（「前车 / 来车」）—— 用序列时序推导
+### 4.1 方向标签（「前车 / 来车」）—— 历史时序候选，待确认
 
 > ⚠️ **已确认（基于实际解压数据）**：ACDC 的检测标注**不包含任何朝向或 3D 信息**。
 > 标注字段全集仅七个：`area, bbox, category_id, id, image_id, iscrowd, segmentation`。
@@ -114,10 +114,10 @@ ACDC 目前按子集名称生成单正标签，其余位置为 0；这是现有�
 > `configs/model/perception_multitask.yaml` 早期配置的 `strategy: yaw_angle`
 > 是照搬 KITTI 的能力，ACDC 没有对应的数据支撑 —— 该配置已更正。
 
-**采用方案：从 ACDC 的视频序列时序推导方向标签。**
+**历史候选：从序列时序辅助推导方向标签；当前尚未实现，也未形成经验证的真值。** 本轮仍需按PRD RQ-07选择数据和路线。
 
 ACDC 的图像按视频序列组织，文件名形如
-`{sequence}_frame_{frame:0>6}_rgb_anon.png`，同一 sequence 内帧号连续。
+`{sequence}_frame_{frame:0>6}_rgb_anon.png`。帧号不能单独证明采样连续或帧间时间一致，使用时序前需核实实际帧间隔。
 目标在画面中的运动方式是可直接观测的：
 
 ```
@@ -128,8 +128,7 @@ ACDC 的图像按视频序列组织，文件名形如
 ```
 
 **关键设计：时序只用于离线生成标签，推理仍然是单帧。**
-这样既拿到了 ACDC 域内的真方向标签（无域差异），也保持了现有的单帧推理架构 ——
-不需要在模型里引入 RNN/时序模块，不需要维护帧间状态。
+若仅离线生成标签，推理可继续采用单帧接口；但跟踪启发式受自车运动、转弯与遮挡影响，输出必须人工核验，不能直接称为真方向标签。当前没有实现该标签生成流程。
 
 **标签编码：**
 ```
@@ -146,9 +145,7 @@ unknown         : -1    ← 不参与方向分类损失，但仍参与检测框�
 方向给不出就标 unknown，不要给错 —— 方向错会导致完全相反的驾驶建议
 （前车近该减速，来车近该注意会车）。
 
-**KITTI 侧的参考**：KITTI 的 `rotation_y`（第 15 字段）可直接给出朝向角，
-可用于交叉验证时序推导的可靠性。但 KITTI 在本项目中只负责距离监督，
-不参与方向标签的生成 —— 避免方向也背上域差异。
+**KITTI 侧的候选参考**：`rotation_y`（第15字段）是相机坐标系中的朝向角，不能直接当运动方向真值。KITTI距离／方向训练尚未接入；如需跨域核验，须先明确目标定义、相机坐标和标注协议。
 
 ### 4.2 KITTI 的 `DontCare` 必须特殊处理
 
@@ -203,7 +200,7 @@ KITTI 标注里有一类 **`DontCare`**，实测占目标总数的 **26%**（抽
 
 > `train` 是**铁路列车**（Cityscapes 沿用的类别）。城市道路场景中出现 212 个实例
 > 值得怀疑是标注噪声或确实途经铁路。**不要**把它当作"训练集"的笔误，
-> 处理时按异常类对待，实现阶段核对一下原始图像再决定是否并入。
+> 当前按配置保留为独立类别；不能仅凭实例数将其判成噪声或合并，进一步标签审计需核对原图。
 
 **标注条目字段**：`iscrowd, category_id, bbox, area, segmentation, image_id, id`
 `segmentation` 是 **COCO RLE 压缩格式**，解码需要 `pycocotools`（已列入依赖）。
@@ -313,7 +310,7 @@ Source-aware 验证只评价对应类别及已标注区域，推理不读取真�
 
 ### 5.4 不确定度
 
-距离头额外输出不确定度估计。这是给 Stage 2 用的：
+规划中的距离头拟额外输出不确定度估计，尚未实现或验证。这是供未来策略使用的候选接口：
 模型对某帧没把握时，提示策略应当更保守。
 
 不确定度**不参与** Stage 1 的指标报告（它没有真值），

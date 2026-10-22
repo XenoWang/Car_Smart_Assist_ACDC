@@ -96,7 +96,7 @@ class TestMultiScaleBlock:
         assert y.shape == (3, 30, 24, 24)
 
     def test_output_channels_not_divisible_by_branches(self):
-        """out_channels 不能被分支数整除时也要能跑（通道数是向上取整的）。"""
+        """out_channels 不能被分支数整除时也要能跑（分支通道数使用整数除法，拼接后经1×1卷积映射到指定输出通道数）。"""
         blk = MultiScaleBlock(8, 32, kernel_sizes=(3, 5, 7), stride=2)
         y = blk(torch.randn(2, 8, 32, 32))
         assert y.shape[1] == 32
@@ -135,7 +135,7 @@ class TestMultiScaleBlock:
 class TestCheckpointResume:
     """检查点保存与续训。
 
-    这里守住的是「每次训练都存档、有存档就接着训」。
+    这里守住的是「每次训练存档，存在兼容检查点且历史best身份核验通过时恢复」。
     测试不用真实数据 —— VisibilityTrainer.__init__ 只建模型、不建数据集，
     所以用临时目录就能把存档/载入逻辑完整跑一遍。
     """
@@ -617,7 +617,7 @@ class TestDilatedBranches:
         assert [c.dilation[0] for c in blk.branches] == [1, 2, 3]
 
     def test_dilation_keeps_branch_sizes_aligned(self):
-        """padding = d*(k-1)//2 让任意 (k,d) 组合输出同尺寸 —— 这是拼接的前提。
+        """padding = d*(k-1)//2 让正奇数核、正整数空洞率在相同步长下输出同尺寸 —— 这是拼接的前提。
 
         如果沿用常见的 k//2，dilation>1 时各分支尺寸会各不相同，拼接直接报错。
         """
@@ -788,8 +788,8 @@ class TestConvAutoencoder:
         2.8 倍与 5.4 倍，但先把通道压到 out/3 再做多尺度卷积之后，
         净效果比单尺度还省。所以「多尺度一定更重」这个直觉是错的。
 
-        只比 encoder 部分 —— 总参数被 to_latent/from_latent 两个全连接层
-        （约 9.4M）主导，比 total 看不出编码器的差异。
+        只比较encoder参数，以隔离编码器差异；to_latent/from_latent的参数量
+        还受pre_latent_channels等配置影响，不能固定称为约9.4M。
         """
         cfg = {"input_size": (144, 256)}
         ms = sum(

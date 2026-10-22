@@ -19,7 +19,11 @@ def main() -> int:
         description="历史 CNN 复现实验；当前模型请使用 train_weather_attention.py"
     )
     parser.add_argument("--config", default="configs/model/weather_classifier.yaml")
-    parser.add_argument("--fresh", action="store_true", help="保留历史后重开旧 CNN 复现实验")
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="先将已有 best/last 归档到输出目录的 history，再重开旧 CNN 实验；部署目录拒绝写入",
+    )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     try:

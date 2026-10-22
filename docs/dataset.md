@@ -49,7 +49,7 @@ scene{编号}_{day|night}_{clear|fog数值|rain数值}_{帧编号}.png
 ```
 
 fog／rain 与 night 分别形成标签；文件名中的数值保留为来源元数据，模型目前不输出物理雨量或雾距离。
-同一个 scene 整体划分。增强配置使用 scene 1–2 训练、scene 4 验证、scene 3 校准。
+同一个 scene 整体划分。当前注意力天气模型的项目四分为scene 3训练、scene 2验证、scene 4校准、scene 1开发测试；旧雨残差增强的三分约定仅属历史，不用于当前默认模型。
 
 ## Lost & Found
 

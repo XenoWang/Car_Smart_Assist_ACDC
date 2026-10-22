@@ -1,11 +1,13 @@
 """Validation uses the inference selection contract without changing training args."""
 
+import hashlib
 import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from car_smart_assist.config.detection import yolo_model_selection_contract
 
@@ -160,13 +162,16 @@ def test_both_trainers_separate_validation_args_and_final_eval(
     assert original_args.conf == 0.25
     assert original_args.hsv_h == 0.015
 
-    # BaseTrainer.final_eval is inherited by both project trainer classes. Exercise
-    # its last/best path with synthetic checkpoint files and a mocked validator.
-    assert trainer_type.final_eval is trainer_module.BaseTrainer.final_eval
+    # The project wrapper must verify paired files and retain the base last/best validation path.
     trainer.last = tmp_path / "last.pt"
     trainer.best = tmp_path / "best.pt"
     trainer.last.write_bytes(b"synthetic last")
     trainer.best.write_bytes(b"synthetic best")
+    trainer.wdir = tmp_path
+    torch.save({
+        "checkpoint_sha256": hashlib.sha256(trainer.last.read_bytes()).hexdigest(),
+        "best_checkpoint_sha256": hashlib.sha256(trainer.best.read_bytes()).hexdigest(),
+    }, tmp_path / "last_training_state.pt")
     stripped = []
 
     def strip_optimizer(path, updates=None):
@@ -178,6 +183,11 @@ def test_both_trainers_separate_validation_args_and_final_eval(
     trainer.run_callbacks = callbacks.append
     trainer.final_eval()
     assert [path for path, _ in stripped] == [trainer.last, trainer.best]
+    assert trainer._project_best_checkpoint_sha256 == hashlib.sha256(trainer.best.read_bytes()).hexdigest()
+    trainer.best.write_bytes(b"replaced best")
+    with pytest.raises(ValueError, match="Best checkpoint does not match"):
+        trainer.final_eval()
+    assert len(stripped) == 2  # 拒绝配对错误时不得先strip或评估。
     assert validator_calls == [trainer.best]
     assert trainer.metrics == {"mAP50": 0.7}
     assert callbacks == ["on_fit_epoch_end"]
@@ -235,6 +245,8 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
     monkeypatch.setattr(cli, "resolve_yolo_device", lambda _device: "cpu")
     monkeypatch.setattr(cli.importlib.metadata, "version", lambda _name: "synthetic-version")
     monkeypatch.setattr(cli, "attach_training_state_callbacks", lambda *args, **kwargs: None)
+    # This entry-point test isolates contract propagation; paired-state rejection is covered separately.
+    monkeypatch.setattr(cli, "load_training_state", lambda *_args: {"best_checkpoint_sha256": "fixture-best"})
     captured = {}
 
     class FakeModel:
@@ -247,7 +259,7 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
         def train(self, **kwargs):
             captured["train_kwargs"] = kwargs
             self.callbacks["on_model_save"](None)
-            self.trainer = SimpleNamespace(best=tmp_path / "best.pt", epoch=1)
+            self.trainer = SimpleNamespace(best=tmp_path / "best.pt", last=tmp_path / "last.pt", epoch=1)
             return SimpleNamespace(results_dict={"metrics/mAP50(B)": 0.5})
 
     model = FakeModel()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from car_smart_assist.perception.detection_yolo import (  # noqa: E402
     load_yolo_model,
 )
 from car_smart_assist.perception.yolo_training import (  # noqa: E402
+    EARLY_STOPPING_POLICY,
     attach_training_state_callbacks,
     detection_trainer_for_resume,
     load_training_state,
@@ -51,6 +53,13 @@ def resolve_training_plan(
         "best_fitness": None,
         "epochs_before_run": 0,
         "completed": False,
+        "training_segment": {
+            "start_epoch": 0,
+            "target_epochs": train["epochs"],
+            "resume_extra_epochs": None,
+            "epochs_override": epochs,
+            "early_stopping_policy": EARLY_STOPPING_POLICY,
+        },
         "model_selection_contract": yolo_model_selection_contract(cfg, manifest),
     }
     if fresh:
@@ -87,42 +96,77 @@ def resolve_training_plan(
     completed = False
     if same_run:
         state_path = checkpoint.parent / "last_training_state.pt"
-        if checkpoint.name == "last.pt" and state_path.is_file():
-            state = load_training_state(
-                state_path, checkpoint, manifest["signature"], selection_contract
+        if checkpoint.name != "last.pt":
+            raise ValueError(
+                "Same-directory resume requires paired last/best/FP32 state; "
+                "use a new run directory (--name) to fine-tune best weights"
             )
+        state = load_training_state(
+            state_path, checkpoint, manifest["signature"], selection_contract
+        )
         # 旧metadata在以上检查中拒绝；仅合法同目录恢复需要读取checkpoint的epoch。
         # 反序列化会导入Ultralytics，须先设好项目本地配置。
         configure_yolo_environment(root)
         payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
         completed = int(payload.get("epoch", -1)) < 0
-        if checkpoint.name == "last.pt" and not completed and state is None:
-            state = load_training_state(
-                state_path, checkpoint, manifest["signature"], selection_contract
-            )
     plan["checkpoint"] = checkpoint
     plan["completed"] = completed
     if state is not None:
         train = dict(previous["train_args"])
         train.pop("resume_extra_epochs", None)
         start = int(state["epoch"]) + 1
+        saved_segment = state["training_segment"]
+        # 请求先写metadata再启动训练；若首轮保存前中断，仍绑定旧last恢复本段目标。
+        if previous.get("segment_resume_checkpoint_sha256") == state["checkpoint_sha256"]:
+            saved_segment = previous["training_segment"]
         target = epochs if epochs is not None else int(train["epochs"])
         if extra is not None:
-            target = start + extra
+            if (
+                saved_segment["resume_extra_epochs"] == extra
+                and saved_segment["epochs_override"] == epochs
+                and start < saved_segment["target_epochs"]
+            ):
+                target = saved_segment["target_epochs"]
+            else:
+                target = start + extra
         elif start >= target:
             target = start + (epochs if epochs is not None else cfg["train"]["epochs"])
+        if (
+            target == saved_segment["target_epochs"]
+            and start < target
+            and (
+                extra is None
+                or (
+                    saved_segment["resume_extra_epochs"] == extra
+                    and saved_segment["epochs_override"] == epochs
+                )
+            )
+        ):
+            segment = dict(saved_segment)
+        else:
+            segment = {
+                "start_epoch": start,
+                "target_epochs": target,
+                "resume_extra_epochs": extra,
+                "epochs_override": epochs,
+                "early_stopping_policy": EARLY_STOPPING_POLICY,
+            }
         train["epochs"] = target
         plan.update(
             mode="resume",
             resume_state=state,
             train=train,
+            training_segment=segment,
             epochs_before_run=previous.get("epochs_before_run", 0),
         )
     else:
-        # 新目录只微调best权重；同目录无FP32状态时仅允许合同匹配的历史分数。
+        # 新目录只微调权重，不继承不能核验的历史best分数。
         best = checkpoint.parent / "best.pt"
         plan["checkpoint"] = best if best.is_file() else checkpoint
         train["epochs"] = extra or train["epochs"]
+        plan["training_segment"].update(
+            target_epochs=train["epochs"], resume_extra_epochs=extra
+        )
         plan.update(
             mode="finetune",
             epochs_before_run=summary.get(
@@ -130,8 +174,6 @@ def resolve_training_plan(
                 previous.get("epochs_before_run", 0) + summary.get("epochs_completed", 0),
             ),
         )
-        if same_run:
-            plan["best_fitness"] = summary.get("validation_metrics", {}).get("fitness")
     plan["train"]["close_mosaic"] = min(plan["train"]["close_mosaic"], plan["train"]["epochs"])
     return plan
 
@@ -207,6 +249,10 @@ def main() -> int:
             "epochs_before_run": plan["epochs_before_run"],
             "joint_foreground_exclusive": cfg.get("joint_foreground_exclusive", True),
             "model_selection_contract": plan["model_selection_contract"],
+            "training_segment": plan["training_segment"],
+            "segment_resume_checkpoint_sha256": (
+                plan["resume_state"]["checkpoint_sha256"] if plan["resume_state"] else None
+            ),
         }
         run.mkdir(parents=True, exist_ok=True)
         model = load_yolo_model(root, plan["checkpoint"])
@@ -215,13 +261,15 @@ def main() -> int:
         attach_training_state_callbacks(
             model, manifest["signature"], plan["resume_state"], plan["best_fitness"],
             selection_contract=plan["model_selection_contract"],
+            training_segment=plan["training_segment"],
         )
 
         def save_metadata(_trainer):
             temporary = metadata_path.with_suffix(".tmp")
-            temporary.write_text(
-                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
+            with temporary.open("w", encoding="utf-8") as stream:
+                stream.write(json.dumps(metadata, ensure_ascii=False, indent=2))
+                stream.flush()
+                os.fsync(stream.fileno())
             temporary.replace(metadata_path)
 
         model.add_callback("on_model_save", save_metadata)
@@ -242,6 +290,8 @@ def main() -> int:
                 plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
                 selection_contract=plan["model_selection_contract"],
             )
+        if plan["resume_state"] is not None:
+            save_metadata(None)
         results = model.train(
             data=str(data),
             project=str(project),
@@ -252,9 +302,14 @@ def main() -> int:
             trainer=trainer_class,
             **train,
         )
+        final_state = load_training_state(
+            run / "weights/last_training_state.pt", model.trainer.last,
+            manifest["signature"], plan["model_selection_contract"],
+        )
         summary = {
             **metadata,
             "best_checkpoint": str(model.trainer.best),
+            "best_checkpoint_sha256": final_state["best_checkpoint_sha256"],
             "epochs_completed": model.trainer.epoch + 1,
             "total_epochs_completed": plan["epochs_before_run"] + model.trainer.epoch + 1,
             "validation_metrics": {

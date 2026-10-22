@@ -75,7 +75,7 @@ def _to_array(image: np.ndarray | Image.Image | str | Path) -> np.ndarray:
     if isinstance(image, np.ndarray):
         a = image
     elif isinstance(image, Image.Image):
-        if not np.isfinite(np.asarray(image)).all():
+        if image.mode == "F" and not np.isfinite(np.asarray(image)).all():
             raise ValueError("图像包含 NaN 或 Inf")
         a = np.asarray(image.convert("RGB"), dtype=np.uint8)
     elif isinstance(image, (str, Path)):
@@ -90,7 +90,7 @@ def _to_array(image: np.ndarray | Image.Image | str | Path) -> np.ndarray:
         raise ValueError(f"图像通道数必须为 3 或 4，实际形状: {a.shape}")
     if a.dtype.kind not in "buif":
         raise TypeError(f"图像必须使用实数数值类型，实际类型: {a.dtype}")
-    if not np.isfinite(a).all():
+    if a.dtype.kind == "f" and not np.isfinite(a).all():
         raise ValueError("图像包含 NaN 或 Inf")
     if a.ndim == 2:
         a = np.stack([a] * 3, axis=-1)

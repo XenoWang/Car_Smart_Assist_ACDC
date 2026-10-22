@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -62,7 +63,7 @@ class TestLostAndFoundCleaning:
 
         def denied(_tasks):
             return [{"path": str(path), "ok": False, "error": "PermissionError: denied",
-                     "width": None, "height": None}]
+                     "width": None, "height": None, "corrupt": False, "stats_error": None}]
 
         monkeypatch.setattr(pp, "_probe_batch", denied)
         report = pp.CleaningReport()
@@ -551,3 +552,91 @@ class TestManifest:
         data = json.loads(p.read_text(encoding="utf-8"))
         assert data["counts"]["valid"] == 49, "valid 计数被反转了"
         assert data["counts"]["invalid"] == 1
+# KB-V003-12—15 regression preparation; execute only after approval.
+def test_valid_small_image_statistics_failure_is_not_decode_corruption(tmp_path: Path):
+    path = tmp_path / "small-valid.png"
+    Image.fromarray(np.zeros((4, 24, 3), dtype=np.uint8)).save(path)
+    result = pp._probe_image((str(path), True, True, 4))
+    assert result["ok"] is True
+    assert result["error"] is None
+    assert result["stats_error"] is None
+    assert np.isfinite(result["edge_density"])
+    assert result["corrupt"] is False
+
+
+def test_statistics_exception_keeps_successful_decode_as_suspect(tmp_path: Path, monkeypatch):
+    path = tmp_path / "stats-error.png"
+    Image.fromarray(np.zeros((8, 24, 3), dtype=np.uint8)).save(path)
+    monkeypatch.setattr(pp, "_image_stats", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("stats")))
+    result = pp._probe_image((str(path), True, True, 1))
+    assert result["ok"] is True and result["error"] is None
+    assert "RuntimeError" in result["stats_error"] and result["corrupt"] is False
+    report = pp.CleaningReport()
+    pp._run_probes([path], report, check="fixture/stats", force_load=True,
+                   want_stats=True, downsample=1, num_workers=1)
+    assert report.status_of(path) is pp.SampleStatus.SUSPECT
+    assert str(path) not in report.invalid_paths()
+
+
+def test_unconfirmed_decode_failure_is_suspect_not_invalid(tmp_path: Path, monkeypatch):
+    path = tmp_path / "resource.png"
+    path.write_bytes(b"fixture")
+    report = pp.CleaningReport()
+    def denied_open(*_args, **_kwargs):
+        raise PermissionError("access denied")
+    monkeypatch.setattr(pp.Image, "open", denied_open)
+    pp._run_probes([path], report, check="fixture/integrity", force_load=True,
+                   want_stats=False, downsample=1, num_workers=1)
+    assert report.status_of(path) is pp.SampleStatus.SUSPECT
+    assert str(path) not in report.invalid_paths()
+
+
+def test_zip_resource_read_error_is_not_counted_as_corrupt(tmp_path: Path, monkeypatch):
+    archive_path = tmp_path / "fixture.zip"
+    archive_path.write_bytes(b"fixture")
+    member = SimpleNamespace(filename="frame.png", is_dir=lambda: False)
+
+    class FakeZip:
+        def __init__(self, _path): pass
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def infolist(self): return [member]
+        def read(self, _info): raise PermissionError("access denied")
+
+    monkeypatch.setattr(pp.zipfile, "ZipFile", FakeZip)
+    report = pp.CleaningReport()
+    pp.check_zip_image_integrity([archive_path], report, check="fixture/images",
+                                 project_root=tmp_path)
+    sample = f"{archive_path.resolve().relative_to(tmp_path.resolve())}::frame.png"
+    assert report.status_of(sample) is pp.SampleStatus.SUSPECT
+    assert sample not in report.invalid_paths()
+    assert report.stats["fixture_total_images"] == 1
+    assert report.stats["fixture_corrupt_images"] == 0
+
+
+def test_cleaning_summary_counts_registered_valid_suspect_and_invalid_samples():
+    report = pp.CleaningReport()
+    report.register_samples(["valid.png", "suspect.png", "invalid.png"])
+    report.warn("read", "suspect.png", "pending")
+    report.error("decode", "invalid.png", "confirmed")
+    report.error("annotations", "annotations.json", "malformed metadata")
+    summary = report.to_dict()["summary"]
+    assert summary["sample_total"] == 3
+    assert summary["samples"] == {"valid": 1, "suspect": 1, "invalid": 1}
+
+
+def test_exact_duplicate_check_compares_full_files_after_prefix_candidate(tmp_path: Path):
+    prefix = b"x" * 262144
+    first, same, different_tail = (tmp_path / name for name in
+                                   ("first.bin", "same.bin", "different-tail.bin"))
+    first.write_bytes(prefix + b"tail-a")
+    same.write_bytes(prefix + b"tail-a")
+    different_tail.write_bytes(prefix + b"tail-b")
+    report = pp.CleaningReport()
+    pp.check_duplicates([first, same, different_tail], report,
+                        {"exact_hash_bytes": 262144},
+                        {"duplicates_exact": True, "duplicates_near": False}, label="fixture")
+    assert report.stats["fixture_exact_duplicate_groups"] == 1
+    warnings = [i for i in report.issues if i.check == "fixture/duplicates_exact"]
+    assert len(warnings) == 1 and warnings[0].path == str(same)
+    assert "完整文件 SHA256" in warnings[0].message

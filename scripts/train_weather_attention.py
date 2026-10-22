@@ -23,6 +23,7 @@ from car_smart_assist.perception.weather_attention_training import (  # noqa: E4
     model_report,
     preflight_attention,
     prepare_attention_datasets,
+    require_independent_weather_output,
     train_attention,
     write_json,
 )
@@ -46,6 +47,12 @@ def main(argv=None):
     if args.total_epochs is not None:
         cfg = replace(cfg, train={**cfg.train, "epochs": args.total_epochs})
         validate_weather_attention_config(cfg)
+    if not args.preflight:
+        try:
+            require_independent_weather_output(root, root / cfg.checkpoint_root)
+        except ValueError as exc:
+            print(f"天气注意力训练未开始：{exc}", file=sys.stderr)
+            return 2
     lock_path = root / cfg.checkpoint_root / "run.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:

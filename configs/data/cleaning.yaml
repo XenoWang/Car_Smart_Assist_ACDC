@@ -13,12 +13,12 @@ cleaning:
 
   checks:
     image_integrity: true          # 能否解码、是否截断
-    image_statistics: true         # 尺寸、退化（纯色/极低方差）
+    image_statistics: true         # 尺寸、退化（纯色/极低标准差）
     acdc_image_mask_pairing: true  # 图像与 5 个标注变体是否配套
     acdc_mask_validity: true       # 掩码是否全为 ignore、类别是否越界
     detection_annotations: true    # bbox 越界、零面积、引用不存在的图像
     kitti_triplets: true           # image / label / calib 三者是否齐全
-    duplicates_exact: true         # 精确重复（按文件内容哈希）
+    duplicates_exact: true         # 文件前缀哈希重复候选，尚未进行全文复核
     duplicates_near: false         # 近重复（dHash），开销较大，默认关
     statistical_outliers: false    # sklearn 离群检测，默认关，见下方说明
 
@@ -34,7 +34,7 @@ cleaning:
     severity:
       min_side: warning       # 尺寸过小
       aspect_ratio: warning   # 宽高比异常
-      low_std: warning        # 灰度方差偏低（浓雾/夜路/雪地都会触发）
+      low_std: warning        # 灰度标准差偏低（浓雾/夜路/雪地都会触发）
 
   mask_validity:
     ignore_index: 255
@@ -61,7 +61,7 @@ cleaning:
 
   statistical_outliers:
     features: [brightness_mean, brightness_std, entropy, edge_density, colorfulness]
-    method: isolation_forest       # isolation_forest | robust_zscore
+    method: isolation_forest       # 当前固定使用isolation_forest，尚未按method分派
     contamination: 0.01            # 预期异常比例，调大误报变多
     random_state: 42
 

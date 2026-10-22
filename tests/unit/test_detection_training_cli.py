@@ -57,6 +57,16 @@ def setup_run(root, *, epoch=-1, state_version=None):
                 "checkpoint_sha256": hashlib.sha256((weights / "last.pt").read_bytes()).hexdigest(),
                 "epoch": epoch if epoch >= 0 else 1,
                 "best_fitness": 0.2,
+                "best_checkpoint_sha256": hashlib.sha256((weights / "best.pt").read_bytes()).hexdigest(),
+                "training_segment": {
+                    "start_epoch": 0, "target_epochs": 2,
+                    "resume_extra_epochs": None, "epochs_override": None,
+                    "early_stopping_policy": "preserve_history",
+                },
+                "early_stopper": {
+                    "best_fitness": 0.2, "best_epoch": 1, "patience": 3,
+                    "possible_stop": False,
+                },
             },
             weights / "last_training_state.pt",
         )
@@ -78,13 +88,12 @@ def test_no_checkpoint_and_explicit_resume(tmp_path):
         cli.resolve_training_plan(tmp_path, cfg, manifest, tmp_path / "new", require_resume=True)
 
 
-def test_matching_completed_model_without_full_state_reuses_best_fitness(tmp_path):
+def test_matching_completed_model_without_full_state_is_rejected(tmp_path):
     cfg, manifest, run = setup_run(tmp_path)
-    plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
-    assert plan["mode"] == "finetune"
-    assert plan["checkpoint"] == run / "weights/best.pt"
-    assert plan["best_fitness"] == 0.2
-    assert plan["epochs_before_run"] == 2
+    before = {path: path.read_bytes() for path in (run / "weights").iterdir()}
+    with pytest.raises(ValueError, match="resume state is missing"):
+        cli.resolve_training_plan(tmp_path, cfg, manifest, run)
+    assert {path: path.read_bytes() for path in before} == before
 
 
 def test_new_directory_finetunes_old_best_without_old_state_or_fitness(tmp_path, monkeypatch):
@@ -116,20 +125,22 @@ def test_new_directory_finetunes_old_best_without_old_state_or_fitness(tmp_path,
 
 
 def test_project_settings_configured_before_checkpoint_import(tmp_path, monkeypatch):
-    cfg, manifest, run = setup_run(tmp_path)
+    cfg, manifest, run = setup_run(tmp_path, state_version=4)
     monkeypatch.delenv("YOLO_CONFIG_DIR", raising=False)
     original_load = torch.load
 
     def checked_load(*args, **kwargs):
-        assert os.environ["YOLO_CONFIG_DIR"] == str(tmp_path / "artifacts/ultralytics_settings")
+        # The tensor-only FP32 state cannot import Ultralytics; the model payload can.
+        if kwargs.get("weights_only") is False:
+            assert os.environ["YOLO_CONFIG_DIR"] == str(tmp_path / "artifacts/ultralytics_settings")
         return original_load(*args, **kwargs)
 
     monkeypatch.setattr(torch, "load", checked_load)
-    assert cli.resolve_training_plan(tmp_path, cfg, manifest, run)["mode"] == "finetune"
+    assert cli.resolve_training_plan(tmp_path, cfg, manifest, run)["mode"] == "resume"
 
 
 def test_interrupted_run_defaults_to_full_resume(tmp_path):
-    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=3)
+    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=4)
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
     assert plan["mode"] == "resume"
     assert plan["train"]["epochs"] == 2
@@ -138,7 +149,7 @@ def test_interrupted_run_defaults_to_full_resume(tmp_path):
 
 @pytest.mark.parametrize("extra,override,expected", [(None, None, 4), (1, None, 3), (None, 1, 3)])
 def test_completed_full_state_adds_epochs(tmp_path, extra, override, expected):
-    cfg, manifest, run = setup_run(tmp_path, state_version=3)
+    cfg, manifest, run = setup_run(tmp_path, state_version=4)
     cfg["train"]["resume_extra_epochs"] = extra
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run, epochs=override)
     assert plan["mode"] == "resume"
@@ -212,3 +223,39 @@ def test_archive_retains_original_files_and_separate_snapshots(tmp_path):
     assert (run / "weights/best.pt").read_bytes() == original
     for number in (1, 2):
         assert (run / f"history/round_{number:04d}/weights/best.pt").read_bytes() == original
+def test_interrupted_extra_segment_keeps_original_target_after_second_resume(tmp_path, monkeypatch):
+    cfg, manifest, run = setup_run(tmp_path, epoch=11, state_version=3)
+    weights = run / "weights"
+    best, last = weights / "best.pt", weights / "last.pt"
+    segment = {
+        "start_epoch": 10, "target_epochs": 15, "resume_extra_epochs": 5,
+        "epochs_override": None, "early_stopping_policy": "preserve_history",
+    }
+    state_path = weights / "last_training_state.pt"
+    state = torch.load(state_path, map_location="cpu", weights_only=True)
+    state.update(
+        format_version=4,
+        checkpoint_sha256=hashlib.sha256(last.read_bytes()).hexdigest(),
+        best_checkpoint_sha256=hashlib.sha256(best.read_bytes()).hexdigest(),
+        training_segment=segment,
+        early_stopper={"best_fitness": 0.2, "best_epoch": 8, "patience": 4,
+                       "possible_stop": False},
+    )
+    torch.save(state, state_path)
+    metadata_path = run / "run_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["train_args"] = {**metadata["train_args"], "epochs": 15}
+    metadata["training_segment"] = segment
+    metadata["segment_resume_checkpoint_sha256"] = hashlib.sha256(last.read_bytes()).hexdigest()
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    cfg["train"]["resume_extra_epochs"] = 5
+    plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
+    assert plan["mode"] == "resume"
+    assert plan["training_segment"]["target_epochs"] == 15
+    assert plan["train"]["epochs"] == 15
+
+
+def test_old_format3_complete_resume_is_explicitly_rejected(tmp_path):
+    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=3)
+    with pytest.raises(ValueError, match="history is missing or incompatible"):
+        cli.resolve_training_plan(tmp_path, cfg, manifest, run)

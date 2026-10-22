@@ -10,7 +10,7 @@ import math
 import shutil
 import time
 from collections import Counter
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -52,7 +52,11 @@ from car_smart_assist.perception.weather_swad import (
     finish_swad_checkpoints,
     source_balanced_bce,
 )
-from car_smart_assist.perception.weather_training import WeatherDataset, _save_checkpoint
+from car_smart_assist.perception.weather_training import (
+    WeatherDataset,
+    _save_checkpoint,
+    require_independent_weather_output,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +266,10 @@ def model_report(cfg, root, progress, comparison=None):
         if stopping.get("enabled", False)
         else "不提前早停"
     )
+    fraction = cfg.evaluation["ap_selection_fraction"]
+    selection_weights = "、".join(
+        f"{name}={cfg.evaluation['selection_weights'][name]:g}" for name in cfg.attributes
+    )
     lines = [
         "# 天气模型报告",
         "",
@@ -277,7 +285,7 @@ def model_report(cfg, root, progress, comparison=None):
         "- 原模型、已训练的金字塔 ASL 仅作对照，不强制蒸馏其错误输出。",
         f"- 沿用固定种子 {cfg.data['seed']} 的录制组四分；ACDC 正常参考及原图绑定，原始数据保留。",
         f"- 验证选模型，校准选阈值，最后评估开发测试；不在 {cfg.train['epochs']} 轮中反复挑测试分数。",
-        "- 验证评分按来源等权的 AP 和最优 F1 各占一半，雨／雾权重各为 2。验证阈值不用于部署。",
+        f"- 验证评分按来源等权，AP 占 {100 * fraction:g}%、最优 F1 占 {100 * (1 - fraction):g}%；属性权重：{selection_weights}。验证阈值不用于部署。",
         f"- {cfg.train['epochs']} 轮是累计训练预算，不保证最后一轮或更长训练更好。"
         + (
             "追加阶段由收尾脚本按验证评分处理部署或回退。"
@@ -292,7 +300,7 @@ def model_report(cfg, root, progress, comparison=None):
             "## 本轮 SWAD",
             "",
             f"从第 {options['start_epoch']} 轮起，在每次有效参数更新后密集平均；每轮验证一次，收敛／容忍窗口为 {options['n_converge']}／{options['n_tolerance']}，容忍比例 {options['tolerance_ratio']}。",
-            "验证监测使用来源等权 BCE，雨雾权重沿用现有验证配置。ASL 训练目标、余弦学习率和冻结 BN 保留；谷底结束只停止收集权重，训练仍完成固定预算。这是对当前多标签模型的适配，没有完整复现原论文的分类与学习率配方。",
+            "验证监测使用来源等权 BCE，雨雾权重沿用现有验证配置。ASL 训练目标、余弦学习率和冻结 BN 保留；谷底结束只停止收集权重，训练终止仍由上述预算与早停配置控制。这是对当前多标签模型的适配，没有完整复现原论文的分类与学习率配方。",
             "单点权重保存在 single_best.pt，平均权重在成功找到谷底后保存为 swad.pt。两个版本各自独立校准，按相同验证评分选择 best.pt，不使用测试分数来选择。",
             "",
         ]
@@ -326,7 +334,7 @@ def model_report(cfg, root, progress, comparison=None):
             )
         lines += [
             "",
-            "CPU 为配置的 4 线程；只计模型前向，未计整条车载 pipeline。预训练模型尚未训练时的输出不代表天气能力。",
+            f"CPU 前向预检线程数：{profile.get('cpu_threads', '未记录（旧预检）')}；当前配置为 {cfg.evaluation['cpu_threads']}。只计模型前向，未计整条车载 pipeline。预训练模型尚未训练时的输出不代表天气能力。",
             "",
             f"随机批读取与传到 GPU：向量路径 {profile['batch_transfer_ms']['vector']:.2f} ms，选用 stack 路径 {profile['batch_transfer_ms']['selected_stack']:.2f} ms；两种像素一致。",
             "",
@@ -398,7 +406,7 @@ def model_report(cfg, root, progress, comparison=None):
     lines += [
         "## 文件",
         "",
-        "- 配置：`configs/model/weather_attention.yaml`。",
+        "- 配置来源：调用方传入的 WeatherAttentionConfig；本次有效配置快照见下方。",
         f"- 实际进度：`{cfg.report_dir}/progress.json`。",
         f"- 每轮验证：`{cfg.report_dir}/history.json`。",
         f"- 完整对照：`{cfg.report_dir}/comparison.json`（训练完成后生成）。",
@@ -406,6 +414,12 @@ def model_report(cfg, root, progress, comparison=None):
         f"- best／last：`{cfg.checkpoint_root}`。",
         "",
         "输入仍是单帧视觉估计，没有新加水深、雨量或水花实测输出。属性不确定不单独请求接管。",
+        "",
+        "### 本次有效配置",
+        "",
+        "```json",
+        json.dumps(asdict(cfg), ensure_ascii=False, indent=2, allow_nan=False),
+        "```",
     ]
     destination = root / cfg.report_file
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -552,6 +566,7 @@ def preflight_attention(cfg, root, datasets, split_info):
         "models": models,
         "batch_read_speedup": slow / max(quick, 1e-9),
         "batch_transfer_ms": transfer,
+        "cpu_threads": cfg.evaluation["cpu_threads"],
         "batch_transfer_speedup": transfer["vector"] / max(transfer["selected_stack"], 1e-9),
         "training_batch_forward_backward_seconds": training_probe_seconds,
         "l2_sp_coefficient": cfg.train.get("l2_sp", 0.0),
@@ -583,9 +598,11 @@ def preflight_attention(cfg, root, datasets, split_info):
 
 
 def train_attention(cfg, root, datasets, split_info, *, fresh=False):
+    root = Path(root).resolve()
+    destination = root / cfg.checkpoint_root
+    require_independent_weather_output(root, destination)
     device = select_device(cfg.device)
     weights = ensure_pretrained_weights(cfg, root)
-    destination = root / cfg.checkpoint_root
     swad_options = cfg.train.get("swad", {})
     use_swad = swad_options.get("enabled", False)
     stopping = cfg.train.get("early_stopping", {})

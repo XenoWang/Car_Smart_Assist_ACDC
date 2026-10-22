@@ -180,6 +180,8 @@ class VisibilityTrainer:
         project_root: str | Path = ".",
         resume: ResumeSpec = "auto",
     ) -> None:
+        if cfg.get("data", {}).get("split_mode", "fixed") == "random":
+            raise ValueError("训练／校准不能重建随机分区；请设置 data.split_mode=fixed 以供恢复和评估复用")
         self.cfg = cfg
         self.root = Path(project_root)
         self.device = resolve_device(str(cfg.get("device", "auto")))
@@ -451,17 +453,31 @@ class VisibilityTrainer:
         if ckpt.get("scheduler_state") is not None and sched is not None:
             sched.load_state_dict(ckpt["scheduler_state"])
 
-        self.history.train_loss = list(ckpt.get("train_loss", []))
-        self.history.val_loss = list(ckpt.get("val_loss", []))
+        epoch = int(ckpt.get("epoch", 0))
+        train_loss = list(ckpt.get("train_loss", []))
+        val_loss = list(ckpt.get("val_loss", []))
+        if epoch < 0 or len(train_loss) < epoch or len(val_loss) < epoch:
+            raise ValueError("检查点的恢复轮次与损失历史不完整，不能完整续训；请保留原件并用 --fresh 新开实验")
+        trimmed_history = len(train_loss) > epoch or len(val_loss) > epoch
+        if trimmed_history:
+            logger.warning(
+                "检查点包含恢复轮次 %d 之后的汇总历史，续训仅保留前 %d 轮；"
+                "旧汇总耗时不能归属恢复点，将从0重新累计", epoch, epoch,
+            )
+        self.history.train_loss = train_loss[:epoch]
+        self.history.val_loss = val_loss[:epoch]
         self.history.best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
         self.history.best_epoch = int(ckpt.get("best_epoch", -1))
         self.history.resumed_from = str(self.resume_path)
-        epoch = int(ckpt.get("epoch", 0))
         self.history.start_epoch = epoch
         self.history.planned_epochs = int(ckpt.get("planned_epochs", 0))
         self._resume_train_cfg = ckpt.get("config_snapshot", {}).get("train")
-        self._resume_training_complete = bool(ckpt.get("training_complete", False))
-        self.history.seconds = float(ckpt.get("history", {}).get("seconds", 0.0))
+        self._resume_training_complete = (
+            not trimmed_history and bool(ckpt.get("training_complete", False))
+        )
+        self.history.seconds = (
+            0.0 if trimmed_history else float(ckpt.get("history", {}).get("seconds", 0.0))
+        )
         self._since_best = int(ckpt.get("early_stopping_state", {}).get("wait", 0))
         rng_state = ckpt.get("rng_state")
         if rng_state is not None:
@@ -703,17 +719,35 @@ class VisibilityTrainer:
         self.model.to(self.device).eval()
         self.calibration = self._calibrate(calib_loader)
 
+        best_epoch = int(best_payload["epoch"])
+        best_train_loss = list(best_payload.get("train_loss", []))
+        best_val_loss = list(best_payload.get("val_loss", []))
+        if len(best_train_loss) > best_epoch or len(best_val_loss) > best_epoch:
+            # 兼容旧版收尾时写入完整历史的best；这些摘要不能伪装成恢复点状态。
+            best_payload["history"] = {
+                **best_payload.get("history", {}),
+                "epochs_run": best_epoch,
+                "final_train_loss": best_train_loss[best_epoch - 1] if best_epoch else None,
+                "seconds": 0.0,
+                "stopped_early": False,
+                "termination_reason": None,
+            }
+            best_payload["training_complete"] = False
+            best_payload["termination_reason"] = None
+        best_payload["train_loss"] = best_train_loss[:best_epoch]
+        best_payload["val_loss"] = best_val_loss[:best_epoch]
         best_payload["scoring_cfg"] = self.scoring_cfg
         best_payload["calibration"] = self.calibration.to_dict()
-        best_payload["history"] = self.history.to_dict()
-        best_payload["train_loss"] = self.history.train_loss
-        best_payload["val_loss"] = self.history.val_loss
-        best_payload["best_val_loss"] = self.history.best_val_loss
-        best_payload["best_epoch"] = self.history.best_epoch
-        best_payload["current_val_loss"] = self.history.best_val_loss
-        best_payload["training_complete"] = True
-        best_payload["termination_reason"] = self.history.termination_reason
-        best_payload["planned_epochs"] = self.history.planned_epochs
+        # epoch、优化器、RNG 与顶层历史始终属于 best 恢复点。
+        # 全程摘要单独保存，不能让从 best 恢复把后续轮次重复追加到曲线末尾。
+        best_payload["final_summary"] = {
+            "history": self.history.to_dict(),
+            "train_loss": list(self.history.train_loss),
+            "val_loss": list(self.history.val_loss),
+            "training_complete": True,
+            "termination_reason": self.history.termination_reason,
+            "planned_epochs": self.history.planned_epochs,
+        }
         _atomic_save(best_payload, best_path)
         logger.info("检查点已保存: %s（last: %s）", best_path, last_path)
         return self.history

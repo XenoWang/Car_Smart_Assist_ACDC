@@ -237,8 +237,8 @@ SWAD实验中的单点 `single_best.pt` 和平均 `swad.pt` 各自校准；实�
 这三个工具读取已有结果或现有模型，把误例、证据缺口和运行成本单独整理出来。不会自动重标图片，也不会训练或替换模型。输出目录必须是新目录。
 
 ```powershell
-# 天气：按模型、来源、录制组、场景和属性统计，生成待人工复核表
-.\.venv\Scripts\python.exe -X utf8 scripts\audit_weather_predictions.py --input artifacts\reports\weather_attention\test_predictions.csv --output artifacts\reports\weather_audit_v003
+# 天气：读取当前默认A85的已有导出，按模型、来源、录制组、场景和属性生成复核表
+.\.venv\Scripts\python.exe -X utf8 scripts\audit_weather_predictions.py --input artifacts\reports\weather_attention_ablation\reduced_tuning\test_predictions.csv --output artifacts\reports\weather_audit_v003
 
 # 接管：读取之前保存的pipeline JSON，统计缺距离／方向及风险触发代码
 .\.venv\Scripts\python.exe -X utf8 scripts\summarize_pipeline_evidence.py --input 已保存的pipeline结果.json --output artifacts\reports\evidence_audit_v003
