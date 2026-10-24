@@ -416,6 +416,10 @@ class VisibilityTrainer:
                 "numpy": np.random.get_state(),
                 "torch": torch.get_rng_state(),
                 "cuda": torch.cuda.get_rng_state_all() if self.device.type == "cuda" else [],
+                "cuda_device_ids": [
+                    str(torch.cuda.get_device_properties(i).uuid)
+                    for i in range(torch.cuda.device_count())
+                ] if self.device.type == "cuda" else [],
                 "loader": self.loader_generator.get_state(),
             },
         }
@@ -459,6 +463,24 @@ class VisibilityTrainer:
                 "请确认数据和 split 配置未变，或使用 --fresh 重新训练。"
             )
 
+        rng_state = ckpt.get("rng_state")
+        if self.device.type == "cuda" and rng_state is not None and rng_state["cuda"]:
+            saved_devices = rng_state.get("cuda_device_ids")
+            if not saved_devices:
+                raise ValueError(
+                    "旧AE检查点缺少CUDA设备身份，无法核验RNG布局，不能完整CUDA续训；"
+                    "请保留原件并用 --fresh 新开实验，旧权重仍可推理。"
+                )
+            current_devices = [
+                str(torch.cuda.get_device_properties(i).uuid)
+                for i in range(torch.cuda.device_count())
+            ]
+            if len(rng_state["cuda"]) != len(current_devices) or saved_devices != current_devices:
+                raise ValueError(
+                    "CUDA设备数量、顺序或身份已变化，不能完整恢复AE随机状态；"
+                    "请恢复原可见GPU布局，或使用 --fresh 新开实验。"
+                )
+
         self._load_verified_best(ckpt)
         self._best_model_sha256 = ckpt["best_model_sha256"]
         self.model.load_state_dict(ckpt["model_state"])
@@ -497,7 +519,6 @@ class VisibilityTrainer:
             0.0 if trimmed_history else float(ckpt.get("history", {}).get("seconds", 0.0))
         )
         self._since_best = int(ckpt.get("early_stopping_state", {}).get("wait", 0))
-        rng_state = ckpt.get("rng_state")
         if rng_state is not None:
             if ckpt.get("seed") != self.seed:
                 raise ValueError("检查点随机种子与当前配置不一致，请用 --fresh 新开实验")
@@ -713,7 +734,7 @@ class VisibilityTrainer:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(), clip if clip > 0 else float("inf"),
-                    error_if_nonfinite=True,
+                    error_if_nonfinite=not scaler.is_enabled(),
                 )
                 scaler.step(opt)
                 scaler.update()

@@ -99,7 +99,7 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         raise ValueError("Classification loss source weights must be positive")
     base_path = root / cfg["acdc_manifest"]
     base = json.loads(base_path.read_text(encoding="utf-8"))
-    validate_detection_export(base_path.parent)
+    validate_detection_export(base_path.parent, verify_hashes=True)
     if base["seed"] != cfg["seed"]:
         raise ValueError("Joint and ACDC split seeds differ")
     output = (root / cfg["output_root"]).resolve()
@@ -235,7 +235,7 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         (output / name).write_text(yaml.safe_dump(value), encoding="utf-8")
     summary = {
         "signature": signature,
-        "counts": validate_detection_export(output),
+        "counts": validate_detection_export(output, verify_hashes=True),
         "sources": {
             source: {
                 split: {

@@ -302,12 +302,11 @@ def _label_text(labels: tuple[tuple[float, ...], ...]) -> str:
 def _materialize_image(source: Path, destination: Path, mode: str, digest: str) -> str:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
-        if (
-            not source.samefile(destination)
-            and hashlib.sha256(destination.read_bytes()).hexdigest() != digest
-        ):
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
             raise ValueError(f"Existing exported image differs from source: {destination}")
         return "existing"
+    if hashlib.sha256(source.read_bytes()).hexdigest() != digest:
+        raise ValueError(f"Source image content changed: {source}")
     if mode == "hardlink":
         try:
             os.link(source, destination)
