@@ -260,35 +260,39 @@ def main(argv=None):
     work = directory / "current"
     if not work.resolve().is_relative_to(directory) or work.is_symlink():
         raise ValueError("Pipeline current directory must remain inside its run directory")
-    with FileLock(str(directory / "pipeline.lock"), timeout=0), controller:
-        if options.fresh:
-            if work.exists():
-                if not (work / "state.json").is_file():
-                    raise ValueError("Existing current directory has no pipeline state; refusing to archive unrelated files")
-                previous = json.loads((work / "state.json").read_text(encoding="utf-8"))
-                require_terminal_children(previous)
-                archived = directory / "history" / timestamp()
-                archived.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(work, archived)
-            controller.resume()
-            state = prepare(work, options)
-        else:
-            path = work / "state.json"
-            if not path.is_file():
-                raise ValueError("No saved training queue; use --fresh explicitly to start one")
-            state = json.loads(path.read_text(encoding="utf-8"))
-            verify_identity(state)
+    with FileLock(str(directory / "pipeline.lock"), timeout=0):
+        if options.continue_run:
             for name in ("weather", "visibility", "detection"):
                 controller.watch_directory(model_checkpoints(work, name)["last"].parent)
-            controller.resume()
-        def request_stop(_signum, _frame):
-            controller.request_stop_file()
-        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-            signum = getattr(signal, name, None)
-            if signum is not None:
-                signal.signal(signum, request_stop)
-        print(f"Training queue: {work / 'state.json'}; STOP: {controller.path}", flush=True)
-        return execute(work, state, controller)
+        # Clear the previous run's markers before handling this invocation's stops.
+        controller.resume()
+        with controller:
+            def request_stop(_signum, _frame):
+                controller.request_stop_file()
+            for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+                signum = getattr(signal, name, None)
+                if signum is not None:
+                    signal.signal(signum, request_stop)
+            if options.fresh:
+                if work.exists():
+                    if not (work / "state.json").is_file():
+                        raise ValueError("Existing current directory has no pipeline state; refusing to archive unrelated files")
+                    previous = json.loads((work / "state.json").read_text(encoding="utf-8"))
+                    require_terminal_children(previous)
+                    controller.require_running()
+                    archived = directory / "history" / timestamp()
+                    archived.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(work, archived)
+                controller.require_running()
+                state = prepare(work, options)
+            else:
+                path = work / "state.json"
+                if not path.is_file():
+                    raise ValueError("No saved training queue; use --fresh explicitly to start one")
+                state = json.loads(path.read_text(encoding="utf-8"))
+                verify_identity(state)
+            print(f"Training queue: {work / 'state.json'}; STOP: {controller.path}", flush=True)
+            return execute(work, state, controller)
 
 
 if __name__ == "__main__":

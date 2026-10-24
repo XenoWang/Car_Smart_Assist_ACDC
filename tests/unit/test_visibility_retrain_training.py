@@ -167,7 +167,7 @@ def test_last_checkpoint_restores_python_numpy_torch_and_loader_rng(tmp_path, mo
     checkpoint = tmp_path / "checkpoints/last.pt"
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     rng = payload["rng_state"]
-    assert set(rng) == {"python", "numpy", "torch", "cuda", "loader"}
+    assert set(rng) == {"python", "numpy", "torch", "cuda", "cuda_device_ids", "loader"}
 
     expected_python_state = random.getstate()
     expected_numpy_state = np.random.get_state()

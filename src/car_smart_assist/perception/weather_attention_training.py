@@ -762,7 +762,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 else:
                     tracker.step = payload["swad_state"]["step"]
             optimizer.load_state_dict(payload["optimizer_state"])
-            scaler.load_state_dict(payload["scaler_state"])
+            if scaler.is_enabled() and payload["scaler_state"]:
+                scaler.load_state_dict(payload["scaler_state"])
             generator.set_state(payload["generator_state"])
             torch.set_rng_state(payload["torch_rng"])
             if device.type == "cuda" and payload["cuda_rng"] is not None:
