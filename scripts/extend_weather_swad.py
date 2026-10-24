@@ -18,7 +18,7 @@ from scripts.train_weather_attention import main as train_main  # noqa: E402
 from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
 
 from car_smart_assist.config.weather_attention import load_weather_attention_config  # noqa: E402
-from car_smart_assist.perception.weather_extension import finish_extension  # noqa: E402
+from car_smart_assist.perception.weather_extension import finish_extension, require_run_manifest  # noqa: E402
 
 
 def main(argv=None):
@@ -61,6 +61,8 @@ def main(argv=None):
         folder.mkdir(parents=True, exist_ok=True)
         try:
             with FileLock(folder / "extension.lock", timeout=0):
+                if not args.preflight:
+                    require_run_manifest(ROOT, folder, "extension_manifest.json", policy=policy)
                 code = train_main(arguments, stop_controller=controller)
                 if code or args.preflight:
                     return code

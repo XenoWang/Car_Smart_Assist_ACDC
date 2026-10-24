@@ -185,8 +185,13 @@ def _selection_score(metrics, cfg):
 
 
 def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_epochs=None, stop_controller=None, continue_only=False):
+    from car_smart_assist.perception.weather_training import require_independent_weather_output
+
     output = root / cfg.checkpoint_root / name
+    require_independent_weather_output(root, output)
     best_path, last_path = output / "best.pt", output / "last.pt"
+    if not fresh and best_path.exists() and not last_path.exists():
+        raise ValueError("已有 best 但缺少配对 last；保留原件，使用 --fresh 或独立输出目录")
     stop_controller = stop_controller or StopController(default_directory=output)
     stop_controller.watch_directory(output)
     stop_controller.require_running()

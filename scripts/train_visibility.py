@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import json
 import logging
 import sys
 from pathlib import Path
 
 import yaml
+from filelock import FileLock, Timeout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -71,11 +73,17 @@ def main() -> int:
         cfg["device"] = args.device
 
     directory = root / cfg.get("train", {}).get("checkpoint_dir", "artifacts/checkpoints/visibility")
-    with StopController(args.stop_file, default_directory=directory) as controller:
+    with StopController(args.stop_file, default_directory=directory) as controller, ExitStack() as locks:
         if args.stop:
             controller.request_stop_file()
             print(f"已请求轮末停止：{controller.path}")
             return 0
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            locks.enter_context(FileLock(str((directory / "run.lock").resolve()), timeout=0, is_singleton=True))
+        except Timeout:
+            logging.getLogger(__name__).error("已有能见度训练占用此输出目录")
+            return 2
         if args.fresh or args.continue_training:
             controller.resume()
         controller.require_running()
@@ -93,7 +101,7 @@ def main() -> int:
                     root / cfg.get("report", {}).get("output_dir", "artifacts/reports/visibility") / "train_history.json",
                 )
             trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
-        except ValueError as exc:
+        except (ValueError, RuntimeError) as exc:
             logging.getLogger(__name__).error("无法初始化训练设备或检查点：%s", exc)
             return 2
         if trainer.resume_path is not None:
@@ -103,7 +111,7 @@ def main() -> int:
 
         try:
             history = trainer.fit(stop_controller=controller, continue_only=args.continue_training)
-        except ValueError as exc:
+        except (ValueError, RuntimeError) as exc:
             logging.getLogger(__name__).error("无法继续训练：%s", exc)
             return 2
 

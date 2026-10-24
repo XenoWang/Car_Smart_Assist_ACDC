@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import importlib.metadata
 import json
 import os
@@ -11,6 +12,7 @@ import sys
 from pathlib import Path
 
 import torch
+from filelock import FileLock, Timeout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -254,16 +256,18 @@ def main() -> int:
             raise ValueError("Run name must be a simple directory name")
         project = root / cfg["project"]
         run = project / name
-        with StopController(args.stop_file, default_directory=run / "weights") as controller:
+        with StopController(args.stop_file, default_directory=run / "weights") as controller, ExitStack() as locks:
             if args.stop:
                 controller.request_stop_file()
                 print(f"Stop requested: {controller.path}")
                 return 0
+            run.mkdir(parents=True, exist_ok=True)
+            locks.enter_context(FileLock(str((run / "run.lock").resolve()), timeout=0))
             if args.fresh or args.continue_training:
                 controller.resume()
             controller.require_running()
             data = root / cfg["data"]
-            counts = validate_detection_export(data.parent)
+            counts = validate_detection_export(data.parent, verify_hashes=True)
             manifest = json.loads((data.parent / "manifest.json").read_text(encoding="utf-8"))
             metadata_path = run / "run_metadata.json"
             plan = resolve_training_plan(
@@ -384,7 +388,7 @@ def main() -> int:
             )
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return STOP_EXIT_CODE if final_state.get("manual_stop") or controller.requested else 0
-    except (ImportError, OSError, ValueError, KeyError) as exc:
+    except (ImportError, OSError, ValueError, KeyError, RuntimeError, Timeout) as exc:
         print(f"YOLO training failed: {exc}", file=sys.stderr)
         return 2
 

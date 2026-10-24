@@ -353,9 +353,10 @@ def verify_reproducibility(base, options, root, datasets, manifest):
                 "initial_matches_reconstructed_baseline",
                 "sampling_matches_fixed_seed",
                 "consecutive_epochs",
+                "no_skipped_updates",
             )
         ):
-            raise ValueError(f"{name} 初始化、采样或训练轮次不一致")
+            raise ValueError(f"{name} 初始化、采样、训练轮次不一致或存在跳过的更新")
     result = {
         "seed": base.data["seed"],
         "split_signature": manifest["plan"]["split_signature"],

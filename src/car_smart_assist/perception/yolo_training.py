@@ -18,6 +18,10 @@ STOPPER_FIELDS = ("best_fitness", "best_epoch", "patience", "possible_stop")
 EARLY_STOPPING_POLICY = "preserve_history"
 
 
+def _cuda_device_ids():
+    return [str(torch.cuda.get_device_properties(i).uuid) for i in range(torch.cuda.device_count())]
+
+
 def require_model_selection_contract(record, contract):
     previous = record.get("model_selection_contract")
     if previous is None or json.dumps(previous, sort_keys=True) != json.dumps(contract, sort_keys=True):
@@ -138,10 +142,12 @@ def attach_training_state_callbacks(
             "optimizer": _plain_numbers(trainer.optimizer.state_dict()),
             "scheduler": _plain_numbers(trainer.scheduler.state_dict()),
             "scaler": trainer.scaler.state_dict(),
+            "scaler_enabled": trainer.scaler.is_enabled(),
             "ema": trainer.ema.ema.state_dict(),
             "ema_updates": trainer.ema.updates,
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+            "cuda_device_ids": _cuda_device_ids() if torch.cuda.is_available() else [],
         }
         path = trainer.wdir / "last_training_state.pt"
         temporary = path.with_suffix(".tmp")
@@ -163,11 +169,19 @@ def attach_training_state_callbacks(
             return
         if resume_state["epoch"] != trainer.start_epoch - 1:
             raise ValueError("Resume epoch does not match full-precision state")
+        saved_cuda = resume_state["cuda_rng"]
+        if saved_cuda and (
+            not torch.cuda.is_available()
+            or len(saved_cuda) != torch.cuda.device_count()
+            or resume_state.get("cuda_device_ids") != _cuda_device_ids()
+        ):
+            raise ValueError("CUDA device layout changed; restore the original visible GPUs or use --fresh/new run")
         trainer._project_best_checkpoint_sha256 = require_best_checkpoint(resume_state, trainer.best)
         trainer.model.load_state_dict(resume_state["model"])
         trainer.optimizer.load_state_dict(resume_state["optimizer"])
         trainer.scheduler.load_state_dict(resume_state["scheduler"])
-        trainer.scaler.load_state_dict(resume_state["scaler"])
+        if trainer.scaler.is_enabled() and resume_state.get("scaler_enabled", bool(resume_state["scaler"])):
+            trainer.scaler.load_state_dict(resume_state["scaler"])
         trainer.ema.ema.load_state_dict(resume_state["ema"])
         trainer.ema.updates = resume_state["ema_updates"]
         trainer.best_fitness = resume_state["best_fitness"]

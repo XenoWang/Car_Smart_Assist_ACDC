@@ -6,6 +6,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import random
 import shutil
 import time
@@ -18,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from filelock import FileLock
 
 from car_smart_assist.config.visibility import MODEL_DEFAULTS, training_config
 from car_smart_assist.perception.visibility.autoencoder import (
@@ -296,6 +298,7 @@ class VisibilityTrainer:
             list_ref_images,
             sequence_of,
             split_ref_indices,
+            reference_split_signature,
         )
 
         dcfg = self.cfg.get("data", {})
@@ -334,30 +337,9 @@ class VisibilityTrainer:
             groups=groups,
         )
 
-        split_payload = {
-            "paths": [
-                (
-                    p.relative_to(acdc_root).as_posix(),
-                    p.stat().st_size,
-                    p.stat().st_mtime_ns,
-                )
-                for p in paths
-            ],
-            "input_size": size,
-            "grouping": "recording_family-v1" if groups is not None else "image",
-            "split_algorithm": (
-                "recording-family-greedy-nonempty-sse-v1"
-                if groups is not None else "image-permutation-v1"
-            ),
-            "groups": groups,
-            "train": train_idx.tolist(),
-            "val": val_idx.tolist(),
-            "calib": calib_idx.tolist(),
-            "test": test_idx.tolist(),
-        }
-        self.split_signature = hashlib.sha256(
-            json.dumps(split_payload, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        self.split_signature = reference_split_signature(
+            paths, acdc_root, size, groups, train_idx, val_idx, calib_idx, test_idx
+        )
 
         # 只有训练子集做增强。验证和校准都用原图，保持评价口径一致。
         tcfg = training_config(self.cfg.get("train", {}))
@@ -543,7 +525,8 @@ class VisibilityTrainer:
     def fit(self, *, stop_controller: StopController | None = None, continue_only: bool = False) -> TrainHistory:
         controller = stop_controller or StopController(default_directory=self.ckpt_dir)
         controller.watch_directory(self.ckpt_dir)
-        with controller:
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        with FileLock(str((self.ckpt_dir / "run.lock").resolve()), timeout=0, is_singleton=True), controller:
             controller.require_running()
             if continue_only and (
                 self.resume_path is None
@@ -724,10 +707,14 @@ class VisibilityTrainer:
                 ):
                     recon = self.model(noisy)
                     loss = nn.functional.mse_loss(recon.float(), clean.float())
+                if not torch.isfinite(loss):
+                    raise ValueError("训练损失非有限，保留上一轮检查点并停止")
                 scaler.scale(loss).backward()
-                if clip > 0:
-                    scaler.unscale_(opt)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), clip)
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), clip if clip > 0 else float("inf"),
+                    error_if_nonfinite=True,
+                )
                 scaler.step(opt)
                 scaler.update()
                 batch_n = len(clean)
@@ -740,6 +727,8 @@ class VisibilityTrainer:
             self.history.train_loss.append(train_loss)
 
             val_loss = self._eval_loss(val_loader)
+            if not math.isfinite(train_loss) or not math.isfinite(val_loss):
+                raise ValueError("训练或验证损失非有限，拒绝发布检查点")
             self.history.val_loss.append(val_loss)
             improved = val_loss < self.history.best_val_loss - min_delta
             if improved:
@@ -867,6 +856,8 @@ class VisibilityTrainer:
             x = x.to(self.device, non_blocking=True)
             batch_n = len(x)
             loss = nn.functional.mse_loss(self.model(x).float(), x.float())
+            if not torch.isfinite(loss):
+                raise ValueError("验证损失非有限，保留上一轮检查点并停止")
             run.add_(loss.to(torch.float64), alpha=batch_n)
             n += batch_n
         if n == 0:

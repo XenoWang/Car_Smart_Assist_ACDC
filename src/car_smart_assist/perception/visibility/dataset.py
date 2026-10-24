@@ -479,3 +479,31 @@ class VisibilityImageDataset(Dataset):
     def path_of(self, i: int) -> Path:
         idx = self.indices[i] if self.indices is not None else i
         return self.paths[idx]
+
+
+def reference_split_signature(paths, acdc_root, size, groups, train_idx, val_idx, calib_idx, test_idx):
+    """Fingerprint the exact reference files and four fixed partitions."""
+    split_payload = {
+        "paths": [
+            (
+                p.relative_to(acdc_root).as_posix(),
+                p.stat().st_size,
+                p.stat().st_mtime_ns,
+            )
+            for p in paths
+        ],
+        "input_size": size,
+        "grouping": "recording_family-v1" if groups is not None else "image",
+        "split_algorithm": (
+            "recording-family-greedy-nonempty-sse-v1"
+            if groups is not None else "image-permutation-v1"
+        ),
+        "groups": groups,
+        "train": train_idx.tolist(),
+        "val": val_idx.tolist(),
+        "calib": calib_idx.tolist(),
+        "test": test_idx.tolist(),
+    }
+    return hashlib.sha256(
+        json.dumps(split_payload, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()

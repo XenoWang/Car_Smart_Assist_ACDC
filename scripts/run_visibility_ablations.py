@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from filelock import FileLock
 import hashlib
 import json
 import logging
@@ -273,7 +274,7 @@ def main() -> int:
                     if (archive / path.name).read_bytes() != original:
                         raise OSError(f"消融历史归档回读不一致：{path}")
         results: dict[str, Any] = {}
-        if results_path.exists() and not (args.force or args.fresh):
+        if results_path.exists():
             results = json.loads(results_path.read_text(encoding="utf-8"))
             if not isinstance(results, dict):
                 logger.error("已有消融结果身份不明；请保留原结果，使用 --force 明确重跑")
@@ -316,7 +317,7 @@ def main() -> int:
             signature = _signature(identity)
             tag = preset["tag"]
             previous = results.get(tag)
-            if tag in results and (
+            if tag in results and not (args.force or args.fresh) and (
                 not isinstance(previous, dict)
                 or previous.get("experiment_signature") != signature
                 or previous.get("experiment_identity") != identity
@@ -377,7 +378,7 @@ def main() -> int:
                     ):
                         logger.error("%s 已完成结果或配对检查点已改变", tag)
                         return 2
-            if tag in results:
+            if tag in results and not (args.force or args.fresh):
                 if not args.continue_training and all(
                     (directory / item).is_file() for item in ("last.pt", "best.pt")
                 ):
@@ -393,12 +394,14 @@ def main() -> int:
 
             t0 = time.time()
             record_group(tag, "running", directory)
-            if args.fresh or args.force:
-                archive_visibility_checkpoints(directory)
-            trainer = VisibilityTrainer(
-                cfg, project_root=root, resume=directory / "last.pt" if group_continue else "none"
-            )
-            history = trainer.fit(stop_controller=controller, continue_only=group_continue)
+            directory.mkdir(parents=True, exist_ok=True)
+            with FileLock(str((directory / "run.lock").resolve()), timeout=0, is_singleton=True):
+                if args.fresh or args.force:
+                    archive_visibility_checkpoints(directory)
+                trainer = VisibilityTrainer(
+                    cfg, project_root=root, resume=directory / "last.pt" if group_continue else "none"
+                )
+                history = trainer.fit(stop_controller=controller, continue_only=group_continue)
             if history.manual_stop or controller.requested:
                 record_group(tag, "paused", directory)
                 return STOP_EXIT_CODE
@@ -427,6 +430,7 @@ def main() -> int:
             metrics["experiment_signature"] = signature
             metrics["comparison_signature"] = _signature({
                 "data": identity["data"], "evaluation_protocol": identity["evaluation_protocol"],
+                "thresholds": vars(gate.thresholds), "scoring": scorer.scoring_cfg,
             })
             metrics["thresholds"] = vars(gate.thresholds)
             metrics["scoring"] = scorer.scoring_cfg
@@ -501,7 +505,9 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
                 continue
             m = results[tag]
             if (not m.get("comparison_signature")
-                    or m["comparison_signature"] != base.get("comparison_signature")):
+                    or m["comparison_signature"] != base.get("comparison_signature")
+                    or m.get("thresholds") != base.get("thresholds")
+                    or m.get("scoring") != base.get("scoring")):
                 L.append(f"| {tag} | 数据或协议不同，不作直接比较 | — | — |")
                 continue
             L.append(

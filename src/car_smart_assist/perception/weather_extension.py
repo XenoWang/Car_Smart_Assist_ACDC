@@ -64,6 +64,24 @@ def _check_pipeline(outputs):
         raise ValueError("黑帧阻断或接管提示未通过")
 
 
+def require_run_manifest(root, folder, filename, *, policy=None):
+    """Require externally captured provenance before starting a long SWAD run."""
+    path = folder / filename
+    if not path.is_file():
+        raise ValueError(f"运行前需提供实验/源文件/保护文件身份清单：{path}；尚未开始训练")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if policy is not None and manifest.get("policy") != policy:
+        raise ValueError("追加阶段清单的选优策略不匹配")
+    assert_protected_files(root, manifest)
+    field = "experiment_hashes" if policy is not None else "source_hashes"
+    if not manifest.get(field):
+        raise ValueError(f"运行清单缺少 {field}")
+    for name, expected in manifest[field].items():
+        if hashlib.sha256((root / name).read_bytes()).hexdigest() != expected:
+            raise ValueError(f"运行清单已过期，配置或代码改变：{name}")
+    return manifest
+
+
 def finish_extension(cfg, root, config_path, policy, *, stop_controller=None):
     from car_smart_assist.utils.stop import StopController
 

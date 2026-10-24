@@ -285,7 +285,9 @@ def model_report(cfg, root, progress, comparison=None):
         f"- 验证集最佳轮次：{progress.get('best_epoch', '尚未选出')}。",
         "- 新候选：预训练 MobileNetV3 三层特征＋四属性注意力，使用 ASL。",
         "- 原模型、已训练的金字塔 ASL 仅作对照，不强制蒸馏其错误输出。",
-        f"- 沿用固定种子 {cfg.data['seed']} 的录制组四分；ACDC 正常参考及原图绑定，原始数据保留。",
+        f"- 沿用固定种子 {cfg.data['seed']} 的录制组四分；"
+        + ("ACDC 正常参考及原图绑定" if cfg.data.get("include_normal_references", True) else "未加入 ACDC 正常参考图")
+        + "，原始数据保留。",
         f"- 验证选模型，校准选阈值，最后评估开发测试；不在 {cfg.train['epochs']} 轮中反复挑测试分数。",
         f"- 验证评分按来源等权，AP 占 {100 * fraction:g}%、最优 F1 占 {100 * (1 - fraction):g}%；属性权重：{selection_weights}。验证阈值不用于部署。",
         f"- {cfg.train['epochs']} 轮是累计训练预算，不保证最后一轮或更长训练更好。"
@@ -430,7 +432,30 @@ def model_report(cfg, root, progress, comparison=None):
     temporary.replace(destination)
 
 
+def require_independent_weather_reports(cfg, root):
+    """Preflight and training must preserve the deployed model's report artifacts."""
+    import yaml
+
+    route_path = root / "configs/model/weather_default.yaml"
+    if not route_path.is_file():
+        return
+    route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
+    document = yaml.safe_load((root / route["config"]).read_text(encoding="utf-8"))
+    deployed = next(iter(document.values()))
+    protected_dir = deployed.get("report_dir")
+    protected_file = deployed.get("report_file")
+    targets = [root / cfg.report_dir / name for name in ("preflight.json", "progress.json")]
+    targets.append(root / cfg.report_file)
+    for path in targets:
+        if (
+            protected_dir and path.resolve().is_relative_to((root / protected_dir).resolve())
+            or protected_file and path.resolve() == (root / protected_file).resolve()
+        ):
+            raise ValueError("报告输出包含受保护的默认天气运行证据；请使用独立 report_dir/report_file")
+
+
 def preflight_attention(cfg, root, datasets, split_info):
+    require_independent_weather_reports(cfg, root)
     device = select_device(cfg.device)
     weights = ensure_pretrained_weights(cfg, root)
     model = WeatherAttention(cfg, weights).to(device)
@@ -617,14 +642,19 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
     root = Path(root).resolve()
     destination = root / cfg.checkpoint_root
     require_independent_weather_output(root, destination)
-    device = select_device(cfg.device)
-    weights = ensure_pretrained_weights(cfg, root)
+    require_independent_weather_reports(cfg, root)
     swad_options = cfg.train.get("swad", {})
     use_swad = swad_options.get("enabled", False)
     stopping = cfg.train.get("early_stopping", {})
     use_early_stopping = stopping.get("enabled", False)
     best_path = destination / ("single_best.pt" if use_swad else "best.pt")
     last_path = destination / "last.pt"
+    if not fresh and not last_path.exists() and any(
+        path.exists() for path in (best_path, destination / "best.pt")
+    ):
+        raise ValueError("已有 best 但缺少配对 last；保留原件，使用 --fresh 或独立输出目录")
+    device = select_device(cfg.device)
+    weights = ensure_pretrained_weights(cfg, root)
     if "continuation" in cfg.train and any(
         (root / cfg.train["continuation"][key]).resolve().parent == destination.resolve()
         for key in ("checkpoint", "single_best")
@@ -949,6 +979,7 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 "training_complete": last["training_complete"],
             }
             write_json(root / cfg.report_dir / "progress.json", progress)
+            model_report(cfg, root, progress)
             return model.eval(), {
                 **progress, "checkpoint": str(best_path),
                 "trained_through_epoch": last["epoch"],
@@ -1012,7 +1043,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
             return paused
     return inference, {
         "checkpoint": str(destination / "best.pt"),
-        "best_epoch": payload["epoch"],
+        "best_epoch": last["best_epoch"],
+        "selected_epoch": payload["epoch"],
         "trained_through_epoch": last["epoch"],
         "training_complete": last["training_complete"],
         "manual_stop": False,
@@ -1184,6 +1216,8 @@ def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_c
         "status": "完成",
         "epoch": trained.get("trained_through_epoch", cfg.train["epochs"]),
         "best_epoch": trained["best_epoch"],
+        "selected_kind": trained.get("selected_kind", "attention_asl"),
+        "selected_epoch": trained.get("selected_epoch", trained["best_epoch"]),
         "termination_reason": trained.get("termination_reason", "budget_completed"),
         **({"early_stopping": trained["early_stopping"]} if "early_stopping" in trained else {}),
         "updated": datetime.now().isoformat(timespec="seconds"),
