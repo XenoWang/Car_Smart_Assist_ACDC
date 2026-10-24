@@ -92,7 +92,7 @@ def main() -> int:
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Trained weights missing: {checkpoint}")
         data = root / cfg["data"]
-        validate_detection_export(data.parent)
+        validate_detection_export(data.parent, verify_hashes=True)
         manifest = json.loads((data.parent / "manifest.json").read_text(encoding="utf-8"))
         calibration_file = calibration_path(root, cfg, args.output_dir)
         if args.split == "test" and not calibration_file.is_file():

@@ -77,6 +77,8 @@ python -m venv .venv
 
 ## 能见度与检测训练
 
+单独模型与训练管线提供 `--stop / --continue / --fresh`：轮末保存暂停、恢复原目标、归档后从头训练。接口与验证状态见 [统一训练控制](docs/training_stop.md)。
+
 能见度：
 
 ```powershell

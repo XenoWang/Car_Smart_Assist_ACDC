@@ -101,6 +101,7 @@ def eval_fit_quality(
     from car_smart_assist.perception.visibility.dataset import (
         sequence_of,
         split_ref_indices,
+        reference_split_signature,
     )
 
     if dcfg.get("split_mode", "fixed") == "random":
@@ -123,6 +124,12 @@ def eval_fit_quality(
         groups=groups,
     )
 
+    acdc_root = Path(__file__).resolve().parents[1] / dcfg.get("acdc_root", "data/raw/acdc")
+    signature = reference_split_signature(
+        ref_paths, acdc_root, scorer.input_size, groups, tr_idx, val_idx, ca_idx, te_idx
+    )
+    if not scorer.split_signature or scorer.split_signature != signature:
+        raise ValueError("检查点与评估参考图/四分身份不一致；请使用训练时匹配的数据及配置")
     rng = np.random.default_rng(int(dcfg.get("split_seed", 42)))
 
     def probe(idx: np.ndarray):
@@ -419,7 +426,7 @@ def main() -> int:
     ap.add_argument("--config", default="configs/model/visibility.yaml")
     ap.add_argument("--checkpoint", default=None, help="默认取配置中的 checkpoint_dir/best.pt")
     ap.add_argument("--samples", type=int, default=None, help="每个条件下抽多少张")
-    ap.add_argument("--severities", type=float, nargs="*", default=[0.25, 0.5, 0.75, 1.0])
+    ap.add_argument("--severities", type=float, nargs="+", default=[0.25, 0.5, 0.75, 1.0])
     ap.add_argument("--device", default=None)
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args()

@@ -241,7 +241,11 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
         "joint_foreground_exclusive": False,
     }
     monkeypatch.setattr(cli, "load_yolo_config", lambda _path: cfg)
-    monkeypatch.setattr(cli, "validate_detection_export", lambda _path: {"images": 1})
+    def validate_export(_path, *, verify_hashes=False):
+        assert verify_hashes is True
+        return {"images": 1}
+
+    monkeypatch.setattr(cli, "validate_detection_export", validate_export)
     monkeypatch.setattr(cli, "resolve_yolo_device", lambda _device: "cpu")
     monkeypatch.setattr(cli.importlib.metadata, "version", lambda _name: "synthetic-version")
     monkeypatch.setattr(cli, "attach_training_state_callbacks", lambda *args, **kwargs: None)

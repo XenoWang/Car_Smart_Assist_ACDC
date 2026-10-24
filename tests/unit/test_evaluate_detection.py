@@ -55,7 +55,10 @@ def _fake_backend(monkeypatch, output, calls):
                 }
             return metrics
 
-    monkeypatch.setattr(evaluate, "validate_detection_export", lambda path: None)
+    def validate_export(path, *, verify_hashes=False):
+        assert verify_hashes is True
+
+    monkeypatch.setattr(evaluate, "validate_detection_export", validate_export)
     monkeypatch.setattr(evaluate, "load_yolo_model", lambda root, checkpoint: Model())
     monkeypatch.setattr(
         evaluate,

@@ -172,6 +172,8 @@ def read_detection_annotations(
 def _verify_record(record: DetectionImage) -> tuple[DetectionImage, str | None]:
     result = probe_image_integrity(record.source)
     if not result["ok"]:
+        if not result.get("corrupt", False):
+            raise OSError(f"Image read incomplete; cannot exclude as corrupt: {record.source}: {result['error']}")
         return record, result["error"]
     if (result["width"], result["height"]) != (record.width, record.height):
         raise ValueError(f"Image/annotation dimensions disagree: {record.source}")
@@ -272,7 +274,10 @@ def stratified_group_split(
         rng.shuffle(conditions)
         for condition in conditions:
             counts = candidates[condition][2]
-            other = sum(candidates[c][2][choices[c]] for c in candidates if c != condition)
+            other = sum(
+                (candidates[c][2][choices[c]] for c in candidates if c != condition),
+                np.zeros_like(counts[0]),
+            )
             scores = score(counts + other[None]) + 0.25 * score(counts)
             selected = int(np.argmin(scores))
             changed |= selected != choices[condition]
@@ -388,6 +393,8 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
                 )
             else:
                 eligible.append(record)
+    if not eligible:
+        raise ValueError(f"No eligible detection images: {len(records)} checked, {len(excluded)} excluded")
     eligible = _merge_duplicate_groups(eligible)
     partitions = stratified_group_split(
         eligible, cfg["split_ratios"], cfg["seed"], len(cfg["classes"])

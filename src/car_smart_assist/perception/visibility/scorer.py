@@ -231,6 +231,8 @@ def _aggregation_parameters(
     raw_weights = aggregate_cfg.get("weights", _INFO_WEIGHTS) if weights is None else weights
     if not isinstance(raw_weights, dict) or not raw_weights:
         raise ValueError("scoring.aggregation.weights 必须是非空特征权重映射")
+    if set(raw_weights) != set(_INFO_WEIGHTS):
+        raise ValueError("scoring.aggregation.weights 必须完整包含四个信息量特征")
     validated = {}
     for name, raw_weight in raw_weights.items():
         if name not in _INFO_WEIGHTS:
@@ -373,6 +375,7 @@ class VisibilityScorer:
         self.calibration = calibration
         self.device = torch.device(device)
         self.input_size = tuple(input_size)
+        self.split_signature = None
 
     # --- 构建 ---
 
@@ -401,13 +404,15 @@ class VisibilityScorer:
                 "checkpoint 中没有校准统计，z 分数不可用。"
                 "判定需要以正常天气分布为零点，请用 scripts/train_visibility.py 重新训练。"
             )
-        return cls(
+        scorer = cls(
             model,
             calibration,
             device=device,
             input_size=tuple(model_cfg.get("input_size", MODEL_DEFAULTS["input_size"])),
             scoring_cfg=effective_scoring_cfg,
         )
+        scorer.split_signature = ckpt.get("split_signature")
+        return scorer
 
     # --- 打分 ---
 

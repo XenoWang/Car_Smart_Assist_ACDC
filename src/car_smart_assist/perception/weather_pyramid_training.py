@@ -19,6 +19,7 @@ from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from car_smart_assist.config.weather import load_weather_config
+from car_smart_assist.utils.stop import StopController
 from car_smart_assist.config.weather_pyramid import WeatherPyramidConfig, pyramid_model_config
 from car_smart_assist.data.weather_pyramid import (
     PyramidDataset,
@@ -183,9 +184,17 @@ def _selection_score(metrics, cfg):
     return total / weight_sum
 
 
-def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_epochs=None):
+def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_epochs=None, stop_controller=None, continue_only=False):
+    from car_smart_assist.perception.weather_training import require_independent_weather_output
+
     output = root / cfg.checkpoint_root / name
+    require_independent_weather_output(root, output)
     best_path, last_path = output / "best.pt", output / "last.pt"
+    if not fresh and best_path.exists() and not last_path.exists():
+        raise ValueError("已有 best 但缺少配对 last；保留原件，使用 --fresh 或独立输出目录")
+    stop_controller = stop_controller or StopController(default_directory=output)
+    stop_controller.watch_directory(output)
+    stop_controller.require_running()
     if fresh and output.exists():
         files = [p for p in (best_path, last_path) if p.exists()]
         if files:
@@ -233,6 +242,9 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
     epoch, wait, best_epoch, best_score, history = 0, 0, 0, -1.0, []
     planned_epochs = cfg.train["epochs"]
     force_epochs = cfg.train["force_epochs"]
+    completed_stage = False
+    if continue_only and (fresh or not last_path.is_file()):
+        raise ValueError("--continue 需要本训练输出目录的配对 last.pt")
     if not fresh and last_path.exists():
         previous = torch.load(last_path, map_location="cpu", weights_only=True)
         if previous["recipe"] != recipe:
@@ -262,21 +274,28 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
         )
         planned_epochs = previous["planned_epochs"]
         force_epochs = previous.get("force_epochs", force_epochs)
-        if previous["training_complete"]:
+        completed_stage = continue_only and bool(previous["training_complete"])
+        if previous["training_complete"] and not continue_only:
             planned_epochs = epoch + cfg.train["resume_extra_epochs"]
             force_epochs = cfg.train["force_epochs"]
             wait = 0
     if total_epochs is not None:
+        if continue_only and total_epochs != planned_epochs:
+            raise ValueError("--continue 不允许改变原累计训练目标")
         if type(total_epochs) is not int or total_epochs <= 0 or total_epochs < epoch:
             raise ValueError("累计训练目标必须为正整数，且不能小于已完成轮数")
-        planned_epochs, force_epochs = total_epochs, True
-        wait = 0
+        if not continue_only:
+            planned_epochs, force_epochs = total_epochs, True
+            wait = 0
     logger.info(
         "%s 恢复轮数=%d 累计目标=%d 提前早停=%s", name, epoch, planned_epochs, not force_epochs
     )
     defaults = dict.fromkeys(cfg.attributes, 0.5)
     started = time.perf_counter()
-    for current in range(epoch + 1, planned_epochs + 1):
+    remaining = () if completed_stage else range(epoch + 1, planned_epochs + 1)
+    for current in remaining:
+        if stop_controller.requested:
+            break
         model.train()
         total, batches = 0.0, 0
         for images, labels, mask in loader:
@@ -362,6 +381,10 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
                 "planned_epochs": planned_epochs,
                 "force_epochs": force_epochs,
                 "training_complete": complete,
+                "termination_reason": "budget_completed" if current == planned_epochs else (
+                    "early_stopping" if complete else None
+                ),
+                "manual_stop": False,
                 "wait": wait,
                 "best_epoch": best_epoch,
                 "best_score": best_score,
@@ -374,11 +397,33 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
             },
             last_path,
         )
-        if complete:
+        if stop_controller.requested or complete:
             break
+    def pause_if_requested():
+        if not stop_controller.requested:
+            return None
+        if not last_path.is_file():
+            stop_controller.require_running()
+        last = torch.load(last_path, map_location="cpu", weights_only=True)
+        last.update(termination_reason="manual_stop", manual_stop=True)
+        _save_checkpoint(last, last_path)
+        return model.eval(), {
+            "checkpoint": str(best_path), "best_epoch": best_epoch,
+            "trained_through_epoch": last["epoch"],
+            "training_complete": last["training_complete"],
+            "manual_stop": True, "termination_reason": "manual_stop",
+            "history": history, "initial_state_sha256": initial_hash,
+            "training_seconds": time.perf_counter() - started, "calibrated": False,
+        }
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     payload = torch.load(best_path, map_location="cpu", weights_only=True)
     model.load_state_dict(payload["model_state"])
     values = pyramid_probabilities(model, datasets["calibration"], cfg, device)
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     thresholds = calibrate_thresholds(datasets["calibration"], values, cfg)
     payload.update(
         {
@@ -392,11 +437,23 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
     _save_checkpoint(payload, best_path)
     previous = torch.load(last_path, map_location="cpu", weights_only=True)
     previous["best_sha256"] = hashlib.sha256(best_path.read_bytes()).hexdigest()
+    if continue_only and previous["training_complete"]:
+        previous.update(manual_stop=False, termination_reason=(
+            "budget_completed" if previous["epoch"] == planned_epochs else "early_stopping"
+        ))
     _save_checkpoint(previous, last_path)
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     report = {
         "checkpoint": str(best_path),
         "best_epoch": best_epoch,
         "trained_through_epoch": history[-1]["epoch"],
+        "training_complete": previous["training_complete"],
+        "termination_reason": previous.get("termination_reason") or (
+            "budget_completed" if previous["epoch"] == planned_epochs else "early_stopping"
+        ),
+        "manual_stop": False,
         "thresholds": thresholds,
         "initial_state_sha256": initial_hash,
         "parameters": sum(p.numel() for p in model.parameters()),
@@ -410,18 +467,24 @@ def _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_e
         "history": history,
         "training_seconds": time.perf_counter() - started,
     }
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     return model.eval(), report
 
 
-def train_pyramid_variant(cfg, root, datasets, split_info, name, *, fresh=False, total_epochs=None):
+def train_pyramid_variant(cfg, root, datasets, split_info, name, *, fresh=False, total_epochs=None, stop_controller=None, continue_only=False):
     device = select_device(cfg.device)
     devices = (
         [device.index if device.index is not None else torch.cuda.current_device()]
         if device.type == "cuda"
         else []
     )
-    with torch.random.fork_rng(devices=devices):
-        return _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_epochs)
+    controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root / name)
+    controller.watch_directory(root / cfg.checkpoint_root / name)
+    with controller, torch.random.fork_rng(devices=devices):
+        controller.require_running()
+        return _train_variant(cfg, root, datasets, split_info, name, device, fresh, total_epochs, controller, continue_only)
 
 
 def benchmark_model(model, image, cfg, *, cues=None):
@@ -478,7 +541,11 @@ def compare_pyramid_models(
     variants=("focal", "asl"),
     evaluate_only=False,
     total_epochs=None,
+    stop_controller=None,
+    continue_only=False,
 ):
+    stop_controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root)
+    stop_controller.require_running()
     old_path = root / cfg.evaluation["old_checkpoint"]
     old_hash = hashlib.sha256(old_path.read_bytes()).hexdigest()
     splits, split_info = prepare_pyramid_splits(cfg, root)
@@ -488,7 +555,43 @@ def compare_pyramid_models(
     }
     device = select_device(cfg.device)
     models, reports = {}, {}
+    state_path = root / cfg.checkpoint_root / "training_progress.json"
+    identity = json.loads(json.dumps({"variants": list(variants), "split_signature": split_info["signature"],
+                                      "model": pyramid_model_config(cfg), "train": cfg.train, "loss": cfg.loss}))
+    if continue_only:
+        if not state_path.is_file():
+            raise ValueError("--continue 缺少金字塔组状态，不能推测缺失 last 是未开始")
+        suite = json.loads(state_path.read_text(encoding="utf-8"))
+        if suite.get("identity") != identity:
+            raise ValueError("金字塔组配置、划分或原目标已改变")
+    else:
+        if fresh and state_path.is_file():
+            archive = state_path.parent / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            archive.mkdir(parents=True)
+            original = state_path.read_bytes()
+            shutil.copy2(state_path, archive / state_path.name)
+            if (archive / state_path.name).read_bytes() != original:
+                raise OSError("金字塔组进度归档回读不一致")
+        suite = {"identity": identity, "groups": {n: {"status": "pending"} for n in variants}}
+
+    def record_group(name, status, report=None):
+        row = {"status": status}
+        if report is not None:
+            row["report"] = report
+            row["last_sha256"] = hashlib.sha256(
+                (root / cfg.checkpoint_root / name / "last.pt").read_bytes()
+            ).hexdigest()
+            row["best_sha256"] = hashlib.sha256(
+                (root / cfg.checkpoint_root / name / "best.pt").read_bytes()
+            ).hexdigest()
+        suite["groups"][name] = row
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(suite, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(state_path)
+
     for name in variants:
+        stop_controller.require_running()
         if evaluate_only:
             path = root / cfg.checkpoint_root / name / "best.pt"
             predictor = WeatherPyramidPredictor.from_checkpoint(path, cfg)
@@ -507,9 +610,35 @@ def compare_pyramid_models(
                 "parameters": sum(p.numel() for p in predictor.model.parameters()),
             }
         else:
+            row = suite["groups"].get(name, {})
+            group_dir = root / cfg.checkpoint_root / name
+            group_continue = continue_only and row.get("status") != "pending"
+            if continue_only:
+                if row.get("status") not in {"pending", "running", "paused", "completed"}:
+                    raise ValueError(f"{name} 的原组进度缺失或无效")
+                if row.get("status") == "pending":
+                    if any((group_dir / item).exists() for item in ("last.pt", "best.pt")):
+                        raise ValueError(f"{name} 标记未开始但已有检查点，拒绝猜测恢复")
+                elif not all((group_dir / item).is_file() for item in ("last.pt", "best.pt")):
+                    raise ValueError(f"{name} 缺少已开始组的配对 last/best")
+                if row.get("status") == "completed":
+                    for item, key in (("last.pt", "last_sha256"), ("best.pt", "best_sha256")):
+                        if hashlib.sha256((group_dir / item).read_bytes()).hexdigest() != row.get(key):
+                            raise ValueError(f"{name} 已完成检查点身份已改变")
+                    reports[name] = row["report"]
+                    models[name] = WeatherPyramidPredictor.from_checkpoint(group_dir / "best.pt", cfg).model
+                    continue
+            record_group(name, "running")
             models[name], reports[name] = train_pyramid_variant(
-                cfg, root, datasets, split_info, name, fresh=fresh, total_epochs=total_epochs
+                cfg, root, datasets, split_info, name, fresh=fresh, total_epochs=total_epochs,
+                stop_controller=stop_controller, continue_only=group_continue
             )
+            if reports[name].get("manual_stop") or stop_controller.requested:
+                record_group(name, "paused")
+                return {"status": "手动停止", "manual_stop": True,
+                        "termination_reason": "manual_stop", "models": reports}
+            record_group(name, "completed", reports[name])
+    stop_controller.require_running()
     if len({r["initial_state_sha256"] for r in reports.values()}) > 1:
         raise ValueError("Focal 和 ASL 初始参数不一致")
     old_cfg = replace(load_weather_config(root / cfg.evaluation["old_config"]), device=cfg.device)
@@ -522,10 +651,11 @@ def compare_pyramid_models(
     }
     old_calibration = _old_probabilities(old, old_sets["calibration"], cfg.evaluation["batch_size"])
     old_thresholds = calibrate_thresholds(datasets["calibration"], old_calibration, cfg)
-    test_values = {
-        name: pyramid_probabilities(model, datasets["test"], cfg, device)
-        for name, model in models.items()
-    }
+    test_values = {}
+    for name, model in models.items():
+        stop_controller.require_running()
+        test_values[name] = pyramid_probabilities(model, datasets["test"], cfg, device)
+    stop_controller.require_running()
     test_values["original"] = _old_probabilities(
         old, old_sets["test"], cfg.evaluation["batch_size"]
     )
@@ -547,6 +677,7 @@ def compare_pyramid_models(
         if s.path is not None and s.group not in known_development
     ]
     for name, values in test_values.items():
+        stop_controller.require_running()
         thresholds = reports[name]["thresholds"]
         reports[name]["test"] = grouped_metrics(datasets["test"], values, cfg, thresholds)
         reports[name]["test_at_0_5"] = grouped_metrics(
@@ -580,6 +711,7 @@ def compare_pyramid_models(
             reports[name]["forward_ms"] = benchmark_model(models[name], pixels, cfg)
     if hashlib.sha256(old_path.read_bytes()).hexdigest() != old_hash:
         raise ValueError("对照期间旧天气权重被外部修改")
+    stop_controller.require_running()
     report = {
         "protocol": "project_fourfold",
         "official_test_protocol": False,

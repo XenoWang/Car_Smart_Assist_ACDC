@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+from filelock import FileLock
 import hashlib
 import json
 import logging
+import shutil
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +18,8 @@ import numpy as np
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
 
 from car_smart_assist.config.visibility import MODEL_DEFAULTS  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
@@ -33,6 +38,7 @@ from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
 from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
     VisibilityTrainer,
     apply_config_overrides,
+    archive_visibility_checkpoints,
 )
 
 logger = logging.getLogger(__name__)
@@ -206,6 +212,11 @@ def main() -> int:
              "例如只想比较重建质量。",
     )
     ap.add_argument("--log-level", default="INFO")
+    modes = ap.add_mutually_exclusive_group()
+    modes.add_argument("--stop", action="store_true", help="只写停止请求")
+    modes.add_argument("--continue", dest="continue_training", action="store_true", help="继续原组进度与预算")
+    modes.add_argument("--fresh", action="store_true", help="归档后从头重训所选组")
+    ap.add_argument("--stop-file", type=Path, default=None)
     args = ap.parse_args()
 
     logging.basicConfig(
@@ -234,122 +245,211 @@ def main() -> int:
         logger.error("消融不能独立重建训练和评估随机分区；请设置 data.split_mode=fixed")
         return 2
 
-    out_dir = root / "artifacts/reports/visibility/ablations"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    results_path = out_dir / "results.json"
-    results: dict[str, Any] = {}
-    if results_path.exists() and not args.force:
-        results = json.loads(results_path.read_text(encoding="utf-8"))
-        if not isinstance(results, dict):
-            logger.error("已有消融结果身份不明；请保留原结果，使用 --force 明确重跑")
+    with StopController(
+        args.stop_file, default_directory=root / "artifacts/checkpoints/visibility_ablations"
+    ) as controller:
+        for preset in presets:
+            controller.watch_directory(root / "artifacts/checkpoints/visibility_ablations" / preset["tag"])
+        if args.stop:
+            controller.request_stop_file()
+            print(f"已请求轮末停止：{controller.path}")
+            return 0
+        if args.fresh or args.continue_training:
+            controller.resume()
+        controller.require_running()
+        if args.continue_training and args.force:
+            logger.error("--continue 不能与重新执行全部组的 --force 一起使用")
             return 2
-        logger.info("已载入 %d 组历史结果，复用前逐组核对实验身份", len(results))
+        out_dir = root / "artifacts/reports/visibility/ablations"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        results_path = out_dir / "results.json"
+        if args.fresh or args.force:
+            old = [p for p in (results_path, out_dir / "training_progress.json") if p.is_file()]
+            if old:
+                archive = out_dir / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                archive.mkdir(parents=True)
+                for path in old:
+                    original = path.read_bytes()
+                    shutil.copy2(path, archive / path.name)
+                    if (archive / path.name).read_bytes() != original:
+                        raise OSError(f"消融历史归档回读不一致：{path}")
+        results: dict[str, Any] = {}
+        if results_path.exists():
+            results = json.loads(results_path.read_text(encoding="utf-8"))
+            if not isinstance(results, dict):
+                logger.error("已有消融结果身份不明；请保留原结果，使用 --force 明确重跑")
+                return 2
+            logger.info("已载入 %d 组历史结果，复用前逐组核对实验身份", len(results))
 
-    runs = []
-    for preset in presets:
-        cfg = apply_config_overrides(base, preset.get("set", {}))
-        cfg.setdefault("train", {})["checkpoint_dir"] = (
-            f"artifacts/checkpoints/visibility_ablations/{preset['tag']}"
-        )
-        if args.epochs is not None:
-            cfg["train"]["epochs"] = args.epochs
-        runs.append((preset, cfg))
-
-    # 关闭重建判据时，同一输入与评分配置下的判档不经过 AE。
-    # 参数量、重建质量和训练耗时仍可用于模型比较；不自动开启重建判据。
-    disabled = [p["tag"] for p, cfg in runs
-                if not bool(cfg.get("thresholds", {}).get("use_recon_z", False))]
-    if disabled and not args.force_meaningless:
-        logger.error(
-            "预设 %s 关闭重建判据；同一输入和信息量配置下的判档与AE结构无关。"
-            "如需比较参数量、重建质量或耗时，请显式加 --force-meaningless。", disabled,
-        )
-        return 3
-
-    # 在启动任何训练前核验所有所选缓存，避免训练一半才发现另一行身份冲突。
-    inputs_by_config: dict[str, dict[str, Any]] = {}
-    prepared = []
-    for preset, cfg in runs:
-        data_key = _signature({"data": cfg.get("data", {}),
-                               "input_size": cfg.get("model", {}).get(
-                                   "input_size", MODEL_DEFAULTS["input_size"])})
-        if data_key not in inputs_by_config:
-            inputs_by_config[data_key] = _prepare_inputs(cfg, root)
-        inputs = inputs_by_config[data_key]
-        identity = {"version": 1, "config": cfg, "data": inputs["data_identity"],
-                    "evaluation_protocol": inputs["protocol"]}
-        signature = _signature(identity)
-        tag = preset["tag"]
-        previous = results.get(tag)
-        if tag in results and (
-            not isinstance(previous, dict)
-            or previous.get("experiment_signature") != signature
-            or previous.get("experiment_identity") != identity
-            or "val_fpr" not in previous or "synth" not in previous
-        ):
-            logger.error(
-                "%s 的历史结果缺少可核验身份，或数据/配置/评估协议已变；"
-                "拒绝复用和混表。请保留原结果，使用 --force 明确重跑。", tag,
+        runs = []
+        for preset in presets:
+            cfg = apply_config_overrides(base, preset.get("set", {}))
+            cfg.setdefault("train", {})["checkpoint_dir"] = (
+                f"artifacts/checkpoints/visibility_ablations/{preset['tag']}"
             )
-            return 2
-        prepared.append((preset, cfg, inputs, identity, signature))
+            if args.epochs is not None:
+                cfg["train"]["epochs"] = args.epochs
+            runs.append((preset, cfg))
 
-    for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
-        tag = preset["tag"]
-        if tag in results:
-            logger.info("[%d/%d] 跳过 %s（实验身份一致）", i, len(presets), tag)
-            continue
-        logger.info("[%d/%d] %s  覆盖: %s", i, len(presets), tag, preset.get("set", {}))
-        if "refs" not in inputs:
-            logger.info("解码参考图 %d 张，尺寸 %s", len(inputs["paths"]), inputs["size"])
-            inputs["refs"] = load_refs(inputs["paths"], inputs["size"])
-        refs = inputs["refs"]
-        tr_idx, val_idx, ca_idx, _ = inputs["splits"]
+        # 关闭重建判据时，同一输入与评分配置下的判档不经过 AE。
+        # 参数量、重建质量和训练耗时仍可用于模型比较；不自动开启重建判据。
+        disabled = [p["tag"] for p, cfg in runs
+                    if not bool(cfg.get("thresholds", {}).get("use_recon_z", False))]
+        if disabled and not args.force_meaningless:
+            logger.error(
+                "预设 %s 关闭重建判据；同一输入和信息量配置下的判档与AE结构无关。"
+                "如需比较参数量、重建质量或耗时，请显式加 --force-meaningless。", disabled,
+            )
+            return 3
 
-        t0 = time.time()
-        trainer = VisibilityTrainer(cfg, project_root=root, resume="none")
-        history = trainer.fit()
-        train_s = time.time() - t0
+        # 在启动任何训练前核验所有所选缓存，避免训练一半才发现另一行身份冲突。
+        inputs_by_config: dict[str, dict[str, Any]] = {}
+        prepared = []
+        for preset, cfg in runs:
+            data_key = _signature({"data": cfg.get("data", {}),
+                                   "input_size": cfg.get("model", {}).get(
+                                       "input_size", MODEL_DEFAULTS["input_size"])})
+            if data_key not in inputs_by_config:
+                inputs_by_config[data_key] = _prepare_inputs(cfg, root)
+            inputs = inputs_by_config[data_key]
+            identity = {"version": 1, "config": cfg, "data": inputs["data_identity"],
+                        "evaluation_protocol": inputs["protocol"]}
+            signature = _signature(identity)
+            tag = preset["tag"]
+            previous = results.get(tag)
+            if tag in results and not (args.force or args.fresh) and (
+                not isinstance(previous, dict)
+                or previous.get("experiment_signature") != signature
+                or previous.get("experiment_identity") != identity
+                or "val_fpr" not in previous or "synth" not in previous
+            ):
+                logger.error(
+                    "%s 的历史结果缺少可核验身份，或数据/配置/评估协议已变；"
+                    "拒绝复用和混表。请保留原结果，使用 --force 明确重跑。", tag,
+                )
+                return 2
+            prepared.append((preset, cfg, inputs, identity, signature))
 
-        ckpt = root / cfg["train"]["checkpoint_dir"] / "best.pt"
-        scorer = VisibilityScorer.from_checkpoint(
-            ckpt,
-            device=resolve_device(str(cfg.get("device", "auto"))),
-            cfg=cfg.get("model", {}),
-            scoring_cfg=cfg.get("scoring", {}),
-        )
-        if scorer.input_size != inputs["size"]:
-            raise ValueError("有效检查点尺寸与已记录的消融评估尺寸不一致，拒绝发布结果")
-        gate = VisibilityGate.from_config(cfg)
+        state_path = out_dir / "training_progress.json"
+        suite_identity = {p["tag"]: sig for p, _, _, _, sig in prepared}
+        if args.continue_training:
+            if not state_path.is_file():
+                logger.error("--continue 缺少原组进度，不能推测缺失 last 是未开始")
+                return 2
+            suite = json.loads(state_path.read_text(encoding="utf-8"))
+            if suite.get("identity") != suite_identity:
+                logger.error("原消融配置或数据身份已改变")
+                return 2
+        else:
+            suite = {"identity": suite_identity,
+                     "groups": {p["tag"]: {"status": "pending"} for p in presets}}
 
-        rng = np.random.default_rng(0)
-        metrics = evaluate_run(
-            scorer, gate, refs, tr_idx, val_idx, ca_idx, rng
-        )
-        metrics["train_seconds"] = round(train_s, 1)
-        metrics["epochs_run"] = len(history.train_loss)
-        metrics["best_epoch"] = history.best_epoch
-        metrics["overrides"] = preset.get("set", {})
-        metrics["experiment_identity"] = identity
-        metrics["experiment_signature"] = signature
-        metrics["comparison_signature"] = _signature({
-            "data": identity["data"], "evaluation_protocol": identity["evaluation_protocol"],
-        })
-        metrics["thresholds"] = vars(gate.thresholds)
-        metrics["scoring"] = scorer.scoring_cfg
-        results[tag] = metrics
+        def record_group(tag, status, directory):
+            row = {"status": status}
+            if status == "completed":
+                row["last_sha256"] = _file_identity(directory / "last.pt")["sha256"]
+                row["best_sha256"] = _file_identity(directory / "best.pt")["sha256"]
+            suite["groups"][tag] = row
+            temporary = state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(suite, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(state_path)
 
-        results_path.write_text(
-            json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        logger.info(
-            "  %s 完成: 参数 %.2fM 过拟合比 %.3f 验证误报 %.1f%% 平均召回 %.1f%% (%.0f 秒)",
-            tag, metrics["params_m"], metrics["overfit_ratio"],
-            metrics["val_fpr"] * 100, metrics["mean_recall"] * 100, train_s,
-        )
+        for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
+            controller.require_running()
+            tag = preset["tag"]
+            directory = root / cfg["train"]["checkpoint_dir"]
+            row = suite["groups"].get(tag, {})
+            group_continue = args.continue_training and row.get("status") != "pending"
+            if args.continue_training:
+                if row.get("status") not in {"pending", "running", "paused", "completed"}:
+                    logger.error("%s 的原组进度缺失或无效", tag)
+                    return 2
+                if row.get("status") == "pending":
+                    if any((directory / item).exists() for item in ("last.pt", "best.pt")):
+                        logger.error("%s 标记未开始但已有检查点", tag)
+                        return 2
+                elif not all((directory / item).is_file() for item in ("last.pt", "best.pt")):
+                    logger.error("%s 缺少已开始组的配对 last/best", tag)
+                    return 2
+                if row.get("status") == "completed":
+                    if tag not in results or any(
+                        _file_identity(directory / item)["sha256"] != row.get(key)
+                        for item, key in (("last.pt", "last_sha256"), ("best.pt", "best_sha256"))
+                    ):
+                        logger.error("%s 已完成结果或配对检查点已改变", tag)
+                        return 2
+            if tag in results and not (args.force or args.fresh):
+                if not args.continue_training and all(
+                    (directory / item).is_file() for item in ("last.pt", "best.pt")
+                ):
+                    record_group(tag, "completed", directory)
+                logger.info("[%d/%d] 跳过 %s（实验身份一致）", i, len(presets), tag)
+                continue
+            logger.info("[%d/%d] %s  覆盖: %s", i, len(presets), tag, preset.get("set", {}))
+            if "refs" not in inputs:
+                logger.info("解码参考图 %d 张，尺寸 %s", len(inputs["paths"]), inputs["size"])
+                inputs["refs"] = load_refs(inputs["paths"], inputs["size"])
+            refs = inputs["refs"]
+            tr_idx, val_idx, ca_idx, _ = inputs["splits"]
 
-    # 未选择或未核验的历史行不进入本轮对比报告。
-    return write_report({p["tag"]: results[p["tag"]] for p in presets}, out_dir)
+            t0 = time.time()
+            record_group(tag, "running", directory)
+            directory.mkdir(parents=True, exist_ok=True)
+            with FileLock(str((directory / "run.lock").resolve()), timeout=0, is_singleton=True):
+                if args.fresh or args.force:
+                    archive_visibility_checkpoints(directory)
+                trainer = VisibilityTrainer(
+                    cfg, project_root=root, resume=directory / "last.pt" if group_continue else "none"
+                )
+                history = trainer.fit(stop_controller=controller, continue_only=group_continue)
+            if history.manual_stop or controller.requested:
+                record_group(tag, "paused", directory)
+                return STOP_EXIT_CODE
+            train_s = time.time() - t0
+
+            ckpt = root / cfg["train"]["checkpoint_dir"] / "best.pt"
+            scorer = VisibilityScorer.from_checkpoint(
+                ckpt,
+                device=resolve_device(str(cfg.get("device", "auto"))),
+                cfg=cfg.get("model", {}),
+                scoring_cfg=cfg.get("scoring", {}),
+            )
+            if scorer.input_size != inputs["size"]:
+                raise ValueError("有效检查点尺寸与已记录的消融评估尺寸不一致，拒绝发布结果")
+            gate = VisibilityGate.from_config(cfg)
+
+            rng = np.random.default_rng(0)
+            metrics = evaluate_run(
+                scorer, gate, refs, tr_idx, val_idx, ca_idx, rng
+            )
+            metrics["train_seconds"] = round(train_s, 1)
+            metrics["epochs_run"] = len(history.train_loss)
+            metrics["best_epoch"] = history.best_epoch
+            metrics["overrides"] = preset.get("set", {})
+            metrics["experiment_identity"] = identity
+            metrics["experiment_signature"] = signature
+            metrics["comparison_signature"] = _signature({
+                "data": identity["data"], "evaluation_protocol": identity["evaluation_protocol"],
+                "thresholds": vars(gate.thresholds), "scoring": scorer.scoring_cfg,
+            })
+            metrics["thresholds"] = vars(gate.thresholds)
+            metrics["scoring"] = scorer.scoring_cfg
+            controller.require_running()
+            results[tag] = metrics
+
+            results_path.write_text(
+                json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            record_group(tag, "completed", directory)
+            logger.info(
+                "  %s 完成: 参数 %.2fM 过拟合比 %.3f 验证误报 %.1f%% 平均召回 %.1f%% (%.0f 秒)",
+                tag, metrics["params_m"], metrics["overfit_ratio"],
+                metrics["val_fpr"] * 100, metrics["mean_recall"] * 100, train_s,
+            )
+
+        controller.require_running()
+        # 未选择或未核验的历史行不进入本轮对比报告。
+        return write_report({p["tag"]: results[p["tag"]] for p in presets}, out_dir)
 
 
 def write_report(results: dict[str, Any], out_dir: Path) -> int:
@@ -405,7 +505,9 @@ def write_report(results: dict[str, Any], out_dir: Path) -> int:
                 continue
             m = results[tag]
             if (not m.get("comparison_signature")
-                    or m["comparison_signature"] != base.get("comparison_signature")):
+                    or m["comparison_signature"] != base.get("comparison_signature")
+                    or m.get("thresholds") != base.get("thresholds")
+                    or m.get("scoring") != base.get("scoring")):
                 L.append(f"| {tag} | 数据或协议不同，不作直接比较 | — | — |")
                 continue
             L.append(

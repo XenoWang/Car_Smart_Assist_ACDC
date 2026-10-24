@@ -353,9 +353,10 @@ def verify_reproducibility(base, options, root, datasets, manifest):
                 "initial_matches_reconstructed_baseline",
                 "sampling_matches_fixed_seed",
                 "consecutive_epochs",
+                "no_skipped_updates",
             )
         ):
-            raise ValueError(f"{name} 初始化、采样或训练轮次不一致")
+            raise ValueError(f"{name} 初始化、采样、训练轮次不一致或存在跳过的更新")
     result = {
         "seed": base.data["seed"],
         "split_signature": manifest["plan"]["split_signature"],
@@ -365,16 +366,58 @@ def verify_reproducibility(base, options, root, datasets, manifest):
     return result
 
 
-def run_ablation(options, root, *, preflight_only=False):
+def run_ablation(options, root, *, preflight_only=False, stop_controller=None, fresh=False, continue_only=False):
+    from car_smart_assist.utils.stop import StopController
+
+    controller = stop_controller or StopController(default_directory=root / options["checkpoint_root"])
+    with controller:
+        controller.require_running()
+        return _run_ablation(options, root, preflight_only=preflight_only, stop_controller=controller,
+                             fresh=fresh, continue_only=continue_only)
+
+
+def _run_ablation(options, root, *, preflight_only, stop_controller, fresh=False, continue_only=False):
     base = load_weather_attention_config(root / options["base_config"])
     configs = experiment_configs(base, options, root)
+    for cfg in configs.values():
+        stop_controller.watch_directory(root / cfg.checkpoint_root)
+    stop_controller.require_running()
+    state_path = root / options["checkpoint_root"] / "training_progress.json"
+    if continue_only and not state_path.is_file():
+        raise ValueError("--continue 缺少对照组进度，不能推测缺失 last 是未开始")
     datasets, split_info = prepare_attention_datasets(base, root)
     manifest = preserve_baseline(base, options, root, split_info, configs)
     models = {}
     progress_path = root / options["report_dir"] / "progress.json"
+    identity = json.loads(json.dumps({"configs": {n: asdict(c) for n, c in configs.items()},
+                                      "split_signature": split_info["signature"]}))
+    if continue_only:
+        suite = json.loads(state_path.read_text(encoding="utf-8"))
+        if suite.get("identity") != identity:
+            raise ValueError("对照组配置、划分或原训练目标已改变")
+    else:
+        if fresh and state_path.is_file():
+            archive = state_path.parent / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            archive.mkdir(parents=True)
+            original = state_path.read_bytes()
+            shutil.copy2(state_path, archive / state_path.name)
+            if (archive / state_path.name).read_bytes() != original:
+                raise OSError("对照组进度归档回读不一致")
+        suite = {"identity": identity, "groups": {n: {"status": "pending"} for n in configs}}
+
+    def record_group(name, status, report=None):
+        row = {"status": status}
+        if report is not None:
+            row["report"] = report
+            row["last_sha256"] = file_hash(root / configs[name].checkpoint_root / "last.pt")
+            row["best_sha256"] = file_hash(root / configs[name].checkpoint_root / "best.pt")
+        suite["groups"][name] = row
+        write_json(state_path, suite)
+
     try:
         if preflight_only:
             for name, cfg in configs.items():
+                stop_controller.require_running()
                 with torch.random.fork_rng(devices=[]):
                     torch.manual_seed(cfg.data["seed"])
                     initial = WeatherAttention(cfg, ensure_pretrained_weights(cfg, root))
@@ -396,6 +439,25 @@ def run_ablation(options, root, *, preflight_only=False):
             write_ablation_report(options, root, manifest, {}, "训练前检查完成；正式训练尚未开始")
             return
         for name, cfg in configs.items():
+            stop_controller.require_running()
+            row = suite["groups"].get(name, {})
+            group_dir = root / cfg.checkpoint_root
+            group_continue = continue_only and row.get("status") != "pending"
+            if continue_only:
+                if row.get("status") not in {"pending", "running", "paused", "completed"}:
+                    raise ValueError(f"{name} 的原组进度缺失或无效")
+                if row.get("status") == "pending":
+                    if any((group_dir / item).exists() for item in ("last.pt", "best.pt")):
+                        raise ValueError(f"{name} 标记未开始但已有检查点")
+                elif not all((group_dir / item).is_file() for item in ("last.pt", "best.pt")):
+                    raise ValueError(f"{name} 缺少已开始组的配对 last/best")
+                if row.get("status") == "completed":
+                    if file_hash(group_dir / "last.pt") != row.get("last_sha256") or (
+                        file_hash(group_dir / "best.pt") != row.get("best_sha256")
+                    ):
+                        raise ValueError(f"{name} 已完成检查点身份已改变")
+                    models[name] = row["report"]
+                    continue
             output = root / cfg.report_dir
             profile_path = output / "preflight.json"
             if not profile_path.exists():
@@ -424,22 +486,38 @@ def run_ablation(options, root, *, preflight_only=False):
                 options["training_epochs"],
                 options["schedule_epochs"],
             )
+            record_group(name, "running")
             with FileLock(root / cfg.checkpoint_root / "run.lock", timeout=0):
-                model, trained = train_attention(cfg, root, datasets, split_info)
+                model, trained = train_attention(
+                    cfg, root, datasets, split_info, stop_controller=stop_controller,
+                    fresh=fresh, continue_only=group_continue,
+                )
+                if trained.get("manual_stop") or stop_controller.requested:
+                    record_group(name, "paused")
+                    result = {"status": "手动停止", "manual_stop": True,
+                              "termination_reason": "manual_stop", "active_group": name,
+                              "checkpoint": trained["checkpoint"], "models": models}
+                    write_json(progress_path, result)
+                    return result
                 if trained["initial_model_sha256"] != manifest["reconstructed_initial_sha256"]:
                     raise ValueError("新组初始模型与固定种子基线不同")
-                result = compare_attention(cfg, root, datasets, split_info, model, trained)
+                result = compare_attention(cfg, root, datasets, split_info, model, trained,
+                                           stop_controller=stop_controller)
             models[name] = result["models"]["attention_asl"]
+            record_group(name, "completed", models[name])
             del model
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             assert_protected_files(root, manifest)
+        stop_controller.require_running()
         models = {
             "baseline_147": baseline_metrics(base, options, root, datasets, manifest),
             **models,
         }
+        stop_controller.require_running()
         reproducibility = verify_reproducibility(base, options, root, datasets, manifest)
         assert_protected_files(root, manifest)
+        stop_controller.require_running()
         result = {
             "status": "完成",
             "protocol": "project_fourfold_development_regression",

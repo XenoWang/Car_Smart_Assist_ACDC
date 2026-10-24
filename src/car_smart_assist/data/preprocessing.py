@@ -459,7 +459,9 @@ def check_zip_image_integrity(
                 for info in archive.infolist():
                     if info.is_dir() or Path(info.filename).suffix.lower() not in image_extensions:
                         continue
-                    member_path = f"{archive_path.resolve().relative_to(base)}::{info.filename}"
+                    resolved = archive_path.resolve()
+                    archive_id = resolved.relative_to(base) if resolved.is_relative_to(base) else resolved
+                    member_path = f"{archive_id}::{info.filename}"
                     checked_paths.append(member_path)
                     report.register_samples([member_path])
                     checked += 1
@@ -774,6 +776,34 @@ def _check_detection_jsons(
             data = json.loads(jp.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             report.error("detection/json", jp, f"JSON 解析失败: {exc}")
+            continue
+
+        try:
+            if not isinstance(data, dict) or any(
+                not isinstance(data.get(key), list) for key in ("images", "annotations", "categories")
+            ):
+                raise ValueError("COCO images/annotations/categories 必须是列表")
+            for row in data["categories"]:
+                if not isinstance(row, dict) or type(row.get("id")) is not int:
+                    raise ValueError("category 缺少整数 id")
+            for row in data["images"]:
+                if (
+                    not isinstance(row, dict) or type(row.get("id")) is not int
+                    or not isinstance(row.get("file_name"), str)
+                    or any(type(row.get(k)) not in (int, float) or not np.isfinite(row[k])
+                           or row[k] <= 0 for k in ("width", "height"))
+                ):
+                    raise ValueError("image 缺少有效 id/file_name/width/height")
+            for row in data["annotations"]:
+                if (
+                    not isinstance(row, dict)
+                    or any(type(row.get(k)) is not int for k in ("image_id", "category_id"))
+                    or not isinstance(row.get("bbox"), list) or len(row["bbox"]) != 4
+                    or any(type(v) not in (int, float) or not np.isfinite(v) for v in row["bbox"])
+                ):
+                    raise ValueError("annotation 缺少有效 image_id/category_id/四元 bbox")
+        except (TypeError, ValueError, OverflowError) as exc:
+            report.error("detection/schema", jp, f"COCO 结构无效: {exc}")
             continue
 
         images = data.get("images", [])
