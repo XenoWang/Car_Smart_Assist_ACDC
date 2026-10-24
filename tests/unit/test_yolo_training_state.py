@@ -82,6 +82,8 @@ def trainer(tmp_path):
         scaler=torch.amp.GradScaler("cpu", enabled=False),
         ema=SimpleNamespace(ema=copy.deepcopy(module), updates=1),
         epoch=0,
+        epochs=TRAINING_SEGMENT["target_epochs"],
+        stop=False,
         best_fitness=0.2,
         fitness=0.2,
         best=best,

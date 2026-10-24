@@ -7,8 +7,10 @@ import hashlib
 import json
 import logging
 import random
+import shutil
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,6 +26,8 @@ from car_smart_assist.perception.visibility.autoencoder import (
 )
 from car_smart_assist.perception.visibility.dataset import VisibilityImageDataset
 from car_smart_assist.perception.visibility.scorer import CalibrationStats
+
+from car_smart_assist.utils.stop import StopController
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +48,8 @@ class TrainHistory:
     start_epoch: int = 0
     planned_epochs: int = 0
     termination_reason: str | None = None
+    training_complete: bool = False
+    manual_stop: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -55,6 +61,8 @@ class TrainHistory:
             "start_epoch": self.start_epoch,
             "planned_epochs": self.planned_epochs,
             "termination_reason": self.termination_reason,
+            "training_complete": self.training_complete,
+            "manual_stop": self.manual_stop,
             "resumed_from": self.resumed_from,
             "seconds": round(self.seconds, 1),
         }
@@ -120,6 +128,27 @@ def _atomic_save(payload: dict[str, Any], path: Path) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp)
     tmp.replace(path)
+
+
+def archive_visibility_checkpoints(directory: Path, report_path: Path | None = None) -> None:
+    """Preserve explicit-fresh artifacts before model initialization."""
+    paths = [directory / "last.pt", directory / "best.pt"]
+    if report_path is not None:
+        paths.append(report_path)
+    existing = {path: path.read_bytes() for path in paths if path.is_file()}
+    if not existing:
+        return
+    archive = directory / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    archive.mkdir(parents=True)
+    for path, original in existing.items():
+        target = archive / path.name
+        shutil.copy2(path, target)
+        if target.read_bytes() != original or path.read_bytes() != original:
+            raise OSError(f"检查点归档回读不一致：{path}")
+    if any(path.read_bytes() != original for path, original in existing.items()):
+        raise OSError("归档期间旧训练产物改变，保留原件并停止")
+    for path in existing:
+        path.unlink()
 
 
 def apply_config_overrides(cfg: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -392,7 +421,8 @@ class VisibilityTrainer:
             },
             "split_signature": self.split_signature,
             "seed": self.seed,
-            "training_complete": self.history.termination_reason is not None,
+            "training_complete": self.history.training_complete,
+            "manual_stop": self.history.manual_stop,
             "termination_reason": self.history.termination_reason,
             "planned_epochs": self.history.planned_epochs,
             "early_stopping_state": {
@@ -430,11 +460,16 @@ class VisibilityTrainer:
             raise ValueError(f"历史best权重身份或指标不匹配：{path}，拒绝完整续训")
         return best
 
-    def _restore(self, opt: torch.optim.Optimizer, sched: Any) -> int:
+    def _restore(self, opt: torch.optim.Optimizer, sched: Any, *, require_full_state=False) -> int:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
         # 用模型和优化器的 load_state_dict 迁移，避免完整检查点先占显存。
         ckpt = torch.load(self.resume_path, map_location="cpu", weights_only=False)
+        if require_full_state and any(
+            ckpt.get(key) is None
+            for key in ("optimizer_state", "scheduler_state", "scaler_state", "rng_state")
+        ):
+            raise ValueError("--continue 需要包含优化器、调度器、AMP 和 RNG 的完整 last 状态")
 
         if ckpt.get("split_signature") != self.split_signature:
             raise ValueError(
@@ -472,6 +507,7 @@ class VisibilityTrainer:
         self.history.start_epoch = epoch
         self.history.planned_epochs = int(ckpt.get("planned_epochs", 0))
         self._resume_train_cfg = ckpt.get("config_snapshot", {}).get("train")
+        self._resume_termination_reason = ckpt.get("termination_reason")
         self._resume_training_complete = (
             not trimmed_history and bool(ckpt.get("training_complete", False))
         )
@@ -504,10 +540,25 @@ class VisibilityTrainer:
 
     # --- 训练 ---
 
-    def fit(self) -> TrainHistory:
+    def fit(self, *, stop_controller: StopController | None = None, continue_only: bool = False) -> TrainHistory:
+        controller = stop_controller or StopController(default_directory=self.ckpt_dir)
+        controller.watch_directory(self.ckpt_dir)
+        with controller:
+            controller.require_running()
+            if continue_only and (
+                self.resume_path is None
+                or self.resume_path.resolve() != (self.ckpt_dir / "last.pt").resolve()
+            ):
+                raise ValueError("--continue 必须恢复本输出目录的配对 last.pt")
+            return self._fit(controller, continue_only=continue_only)
+
+    def _fit(self, stop_controller: StopController, *, continue_only=False) -> TrainHistory:
         """执行无监督训练（必要时先恢复已有检查点）。"""
         tcfg = training_config(self.cfg.get("train", {}))
         dcfg = self.cfg.get("data", {})
+        stop_controller.require_running()
+        if self.resume_path is None:
+            archive_visibility_checkpoints(self.ckpt_dir)
         # test 子集不在训练里构建 —— 只有评估脚本会用它
         train_ds, val_ds, calib_ds, _ = self._build_datasets()
 
@@ -542,54 +593,73 @@ class VisibilityTrainer:
 
         # --- 恢复 ---
         start_epoch = 0
+        completed_stage = False
         if self.resume_path is not None:
-            start_epoch = self._restore(opt, sched)
-            same_budget = self._resume_train_cfg is not None and all(
-                self._resume_train_cfg.get(key) == tcfg.get(key)
-                for key in ("epochs", "resume_extra_epochs")
-            )
-            if (
-                same_budget
-                and not self._resume_training_complete
-                and self.history.planned_epochs > start_epoch
-            ):
-                # 追加段中断后继续原终点，不能每次恢复都再加一份 extra。
+            start_epoch = self._restore(opt, sched, require_full_state=continue_only)
+            if continue_only:
                 epochs = self.history.planned_epochs
-            elif start_epoch >= epochs:
-                # 续训时 epochs 表示「再训多少轮」，不是「总共多少轮」，
-                # 否则从第 38 轮续训、epochs=40 就只剩 2 轮，等于什么都没做。
-                extra = tcfg.get("resume_extra_epochs")
-                extra = int(extra) if extra else epochs
-                logger.info(
-                    "已完成 %d 轮 >= 配置的 %d 轮；把 epochs 解释为「再训 %d 轮」",
-                    start_epoch, epochs, extra,
+                if epochs <= 0 or epochs < start_epoch:
+                    raise ValueError("--continue 的 last 缺少有效原累计训练目标")
+                if self._resume_training_complete or start_epoch == epochs:
+                    self.history.training_complete = True
+                    self.history.termination_reason = (
+                        "budget_completed" if start_epoch == epochs else "early_stopping"
+                    )
+                    self.history.stopped_early = self.history.termination_reason == "early_stopping"
+                    logger.info("原训练阶段已完成（%d/%d），--continue 不追加轮数", start_epoch, epochs)
+                    completed_stage = True
+                if not completed_stage and any(not np.isfinite(group["lr"]) or group["lr"] <= 0 for group in opt.param_groups):
+                    raise ValueError("恢复的学习率已为0或无效，不能继续原训练阶段")
+            else:
+                same_budget = self._resume_train_cfg is not None and all(
+                    self._resume_train_cfg.get(key) == tcfg.get(key)
+                    for key in ("epochs", "resume_extra_epochs")
                 )
-                epochs = start_epoch + extra
-            elif tcfg.get("resume_extra_epochs"):
-                epochs = start_epoch + int(tcfg["resume_extra_epochs"])
-
-            requested_remaining = epochs - start_epoch
-            if requested_remaining > 0:
-                restored_lrs = [float(group["lr"]) for group in opt.param_groups]
-                if any(not np.isfinite(lr) or lr <= 0 for lr in restored_lrs):
-                    raise ValueError(
-                        "恢复的学习率已为0或无效，不能继续追加训练。"
-                        "请另行指定微调方案；不会自动恢复初始学习率。"
-                    )
-                if requested_remaining != sched.T_max - sched.last_epoch:
-                    # scheduler.step 在每轮保存前执行；last_epoch 是当前段已走步数。
-                    for group, lr in zip(opt.param_groups, restored_lrs, strict=True):
-                        group["initial_lr"] = lr
-                    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        opt, T_max=requested_remaining, eta_min=0.0
-                    )
+                if (
+                    same_budget
+                    and not self._resume_training_complete
+                    and self.history.planned_epochs > start_epoch
+                ):
+                    # 追加段中断后继续原终点，不能每次恢复都再加一份 extra。
+                    epochs = self.history.planned_epochs
+                elif start_epoch >= epochs:
+                    # 续训时 epochs 表示「再训多少轮」，不是「总共多少轮」，
+                    # 否则从第 38 轮续训、epochs=40 就只剩 2 轮，等于什么都没做。
+                    extra = tcfg.get("resume_extra_epochs")
+                    extra = int(extra) if extra else epochs
                     logger.info(
-                        "续训预算调整：第 %d -> %d 轮，从恢复学习率 %s 连续余弦衰减至0",
-                        start_epoch, epochs, restored_lrs,
+                        "已完成 %d 轮 >= 配置的 %d 轮；把 epochs 解释为「再训 %d 轮」",
+                        start_epoch, epochs, extra,
                     )
+                    epochs = start_epoch + extra
+                elif tcfg.get("resume_extra_epochs"):
+                    epochs = start_epoch + int(tcfg["resume_extra_epochs"])
+
+                requested_remaining = epochs - start_epoch
+                if requested_remaining > 0:
+                    restored_lrs = [float(group["lr"]) for group in opt.param_groups]
+                    if any(not np.isfinite(lr) or lr <= 0 for lr in restored_lrs):
+                        raise ValueError(
+                            "恢复的学习率已为0或无效，不能继续追加训练。"
+                            "请另行指定微调方案；不会自动恢复初始学习率。"
+                        )
+                    if requested_remaining != sched.T_max - sched.last_epoch:
+                        # scheduler.step 在每轮保存前执行；last_epoch 是当前段已走步数。
+                        for group, lr in zip(opt.param_groups, restored_lrs, strict=True):
+                            group["initial_lr"] = lr
+                        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+                            opt, T_max=requested_remaining, eta_min=0.0
+                        )
+                        logger.info(
+                            "续训预算调整：第 %d -> %d 轮，从恢复学习率 %s 连续余弦衰减至0",
+                            start_epoch, epochs, restored_lrs,
+                        )
         self.history.planned_epochs = epochs
-        self.history.termination_reason = None
-        self.history.stopped_early = False
+        if not completed_stage:
+            self.history.termination_reason = None
+            self.history.training_complete = False
+            self.history.stopped_early = False
+        self.history.manual_stop = False
 
         use_amp = bool(tcfg["amp"]) and self.device.type == "cuda"
         dtype = str(tcfg["dtype"])
@@ -635,7 +705,10 @@ class VisibilityTrainer:
         t0 = time.time()
         elapsed_before = self.history.seconds
         since_best = self._since_best
-        for epoch in range(start_epoch + 1, epochs + 1):
+        remaining = () if completed_stage else range(start_epoch + 1, epochs + 1)
+        for epoch in remaining:
+            if stop_controller.requested:
+                break
             self.model.train()
             run = torch.zeros((), dtype=torch.float64, device=self.device)
             n = 0
@@ -683,6 +756,7 @@ class VisibilityTrainer:
                     "budget_completed" if epoch == epochs else None
                 )
             )
+            self.history.training_complete = self.history.stopped_early or epoch == epochs
             self.history.seconds = elapsed_before + time.time() - t0
 
             if self._best_model_sha256 is None:
@@ -700,11 +774,33 @@ class VisibilityTrainer:
                     self.history.best_val_loss, self.history.best_epoch,
                     "  *" if improved else "",
                 )
+            if stop_controller.requested:
+                break
             if self.history.stopped_early:
                 logger.info("  验证损失连续 %d 轮未改善，提前停止于 epoch %d", patience, epoch)
                 break
 
         self.history.seconds = elapsed_before + time.time() - t0
+
+        def pause_if_requested():
+            if not stop_controller.requested:
+                return False
+            if len(self.history.train_loss) == start_epoch:
+                stop_controller.require_running()
+            self.history.manual_stop = True
+            self.history.termination_reason = "manual_stop"
+            if not last_path.is_file():
+                stop_controller.require_running()
+            last = torch.load(last_path, map_location="cpu", weights_only=False)
+            last.update(
+                history=self.history.to_dict(), manual_stop=True,
+                termination_reason="manual_stop", training_complete=self.history.training_complete,
+            )
+            _atomic_save(last, last_path)
+            return True
+
+        if pause_if_requested():
+            return self.history
 
         # 回滚到验证集选出的最优权重，再用独立校准集算零校准统计。
         # 重算而不是沿用旧值：续训后模型变了，旧的重建误差分布不再匹配。
@@ -718,6 +814,8 @@ class VisibilityTrainer:
         logger.info("已回滚到 epoch %d 的最优权重", best_payload.get("epoch", -1))
         self.model.to(self.device).eval()
         self.calibration = self._calibrate(calib_loader)
+        if pause_if_requested():
+            return self.history
 
         best_epoch = int(best_payload["epoch"])
         best_train_loss = list(best_payload.get("train_loss", []))
@@ -749,6 +847,14 @@ class VisibilityTrainer:
             "planned_epochs": self.history.planned_epochs,
         }
         _atomic_save(best_payload, best_path)
+        if completed_stage:
+            last = torch.load(last_path, map_location="cpu", weights_only=False)
+            last.update(
+                history=self.history.to_dict(), training_complete=True,
+                manual_stop=False, termination_reason=self.history.termination_reason,
+            )
+            _atomic_save(last, last_path)
+        pause_if_requested()
         logger.info("检查点已保存: %s（last: %s）", best_path, last_path)
         return self.history
 

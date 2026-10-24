@@ -186,7 +186,7 @@ class SWADTracker:
         return model, metadata
 
 
-def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device):
+def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device, *, stop_controller=None):
     """两种权重独立校准，按验证评分导出 best；测试集不参与选择。"""
     from car_smart_assist.perception.weather_attention import optimize_attention_inference
     from car_smart_assist.perception.weather_attention_training import (
@@ -197,10 +197,15 @@ def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device
     )
     from car_smart_assist.perception.weather_training import _save_checkpoint
 
+    from car_smart_assist.utils.stop import StopController
+
+    stop_controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root)
+    stop_controller.require_running()
     destination = root / cfg.checkpoint_root
     models, payloads = {"single_best": model}, {"single_best": payload}
     average, metadata = tracker.final_model(model)
     if average is not None:
+        stop_controller.require_running()
         values = attention_probabilities(average, datasets["validation"], cfg, device)
         _, selection = balanced_thresholds(datasets["validation"], values, cfg)
         models["swad"] = average
@@ -220,9 +225,11 @@ def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device
         }
     candidates, inference_models = {}, {}
     for name, candidate in models.items():
+        stop_controller.require_running()
         candidate_payload = payloads[name]
         inference = optimize_attention_inference(candidate)
         values = attention_probabilities(inference, datasets["calibration"], cfg, device)
+        stop_controller.require_running()
         thresholds, _ = balanced_thresholds(datasets["calibration"], values, cfg)
         candidate_payload.update(
             checkpoint_kind=name,
@@ -231,10 +238,6 @@ def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device
             calibration=detailed_metrics(datasets["calibration"], values, cfg, thresholds),
         )
         path = destination / f"{name}.pt"
-        if name == "single_best":
-            save_attention_best(candidate_payload, path)
-        else:
-            _save_checkpoint(candidate_payload, path)
         inference_models[name] = inference
         candidates[name] = {
             "checkpoint": str(path),
@@ -252,6 +255,15 @@ def finish_swad_checkpoints(tracker, model, payload, cfg, root, datasets, device
     ):
         chosen = "swad"
     selected = {**payloads[chosen], "swad": metadata, "selected_kind": chosen}
+    # Calibrate all candidates before publishing any of them. A stopped calibration
+    # leaves the single-best/last hash pair unchanged and fabricates no export.
+    stop_controller.require_running()
+    for name, candidate_payload in payloads.items():
+        path = destination / f"{name}.pt"
+        if name == "single_best":
+            save_attention_best(candidate_payload, path)
+        else:
+            _save_checkpoint(candidate_payload, path)
     _save_checkpoint(selected, destination / "best.pt")
     return (
         inference_models[chosen],

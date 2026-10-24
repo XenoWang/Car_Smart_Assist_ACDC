@@ -11,6 +11,7 @@ import numpy as np
 import torch
 
 from car_smart_assist.config.detection import yolo_selection_validator_args
+from car_smart_assist.utils.stop import StopController
 
 
 STOPPER_FIELDS = ("best_fitness", "best_epoch", "patience", "possible_stop")
@@ -95,7 +96,7 @@ def load_training_state(
 
 def attach_training_state_callbacks(
     model, dataset_signature: str, resume_state: dict | None, best_fitness: float | None = None,
-    *, selection_contract: dict, training_segment: dict,
+    *, selection_contract: dict, training_segment: dict, stop_controller: StopController | None = None,
 ) -> None:
     if resume_state is not None:
         require_model_selection_contract(resume_state, selection_contract)
@@ -104,7 +105,7 @@ def attach_training_state_callbacks(
         raise ValueError("Historical best fitness requires paired complete training state")
 
     def save_state(trainer):
-        if trainer.best_fitness == trainer.fitness:
+        if getattr(trainer, "_project_best_written", trainer.best_fitness == trainer.fitness):
             # Ultralytics刚把本轮checkpoint同时保存为best，可建立新身份。
             best_sha256 = hashlib.sha256(trainer.best.read_bytes()).hexdigest()
         else:
@@ -123,6 +124,15 @@ def attach_training_state_callbacks(
                 name: _plain_numbers(getattr(trainer.stopper, name)) for name in STOPPER_FIELDS
             },
             "epoch": trainer.epoch,
+            "manual_stop": bool(getattr(trainer, "_project_manual_stop", False)),
+            "training_complete": trainer.epoch + 1 >= trainer.epochs or bool(
+                trainer.stop and not getattr(trainer, "_project_manual_stop", False)
+            ),
+            "termination_reason": "manual_stop" if getattr(trainer, "_project_manual_stop", False) else (
+                "budget_completed" if trainer.epoch + 1 >= trainer.epochs else (
+                    "early_stopping" if trainer.stop else None
+                )
+            ),
             "best_fitness": trainer.best_fitness,
             "model": trainer.model.state_dict(),
             "optimizer": _plain_numbers(trainer.optimizer.state_dict()),
@@ -137,8 +147,17 @@ def attach_training_state_callbacks(
         temporary = path.with_suffix(".tmp")
         torch.save(state, temporary)
         temporary.replace(path)
+        trainer._project_saved_epoch = trainer.epoch
 
     def restore_state(trainer):
+        trainer._project_stop_controller = stop_controller
+        trainer._project_manual_stop = False
+        trainer._project_saved_epoch = -1
+        if stop_controller is not None:
+            stop_controller.watch_directory(trainer.wdir)
+            stop_controller.require_running()
+            # Every epoch must retain the historical best, even with save=False.
+            trainer.args.save = True
         trainer._project_best_checkpoint_sha256 = None
         if resume_state is None:
             return
@@ -171,6 +190,34 @@ def attach_training_state_callbacks(
         torch.save(state, temporary)
         temporary.replace(path)
 
+    def mark_manual_stop(trainer):
+        trainer._project_manual_stop = True
+        path = trainer.wdir / "last_training_state.pt"
+        if path.is_file():
+            state = torch.load(path, map_location="cpu", weights_only=True)
+            state.update(manual_stop=True, termination_reason="manual_stop")
+            temporary = path.with_suffix(".tmp")
+            torch.save(state, temporary)
+            temporary.replace(path)
+
+    def before_epoch(trainer):
+        if stop_controller is not None and stop_controller.requested:
+            mark_manual_stop(trainer)
+            stop_controller.require_running()
+
+    def before_validation(trainer):
+        trainer._project_previous_best_fitness = trainer.best_fitness
+        if stop_controller is not None and stop_controller.requested:
+            trainer.args.val = True
+
+    def finish_epoch(trainer):
+        if stop_controller is not None and stop_controller.requested:
+            mark_manual_stop(trainer)
+            trainer.stop = True
+
+    model.add_callback("on_train_epoch_start", before_epoch)
+    model.add_callback("on_train_epoch_end", before_validation)
+    model.add_callback("on_fit_epoch_end", finish_epoch)
     model.add_callback("on_model_save", save_state)
     model.add_callback("on_train_start", restore_state)
     model.add_callback("on_train_end", finalize_state)
@@ -184,6 +231,25 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
     from ultralytics.utils.torch_utils import de_parallel
 
     class ProjectDetectionTrainer(DetectionTrainer):
+        def save_model(self):
+            # Keep each checkpoint replacement atomic, without changing vendor state.
+            last, best = self.last, self.best
+            self.last = last.with_name(last.name + ".tmp")
+            self.best = best.with_name(best.name + ".tmp")
+            previous = getattr(self, "_project_previous_best_fitness", None)
+            improved = not best.exists() or previous is None or self.fitness > previous
+            try:
+                super().save_model()
+                self.last.replace(last)
+                self._project_best_written = self.best.exists() and improved
+                if self._project_best_written:
+                    self.best.replace(best)
+            finally:
+                temporary_last, temporary_best = self.last, self.best
+                self.last, self.best = last, best
+                temporary_last.unlink(missing_ok=True)
+                temporary_best.unlink(missing_ok=True)
+
         def validation_args(self):
             args = copy(self.args)
             for name, value in yolo_selection_validator_args(selection_contract).items():
@@ -217,6 +283,14 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
             if state["checkpoint_sha256"] != hashlib.sha256(self.last.read_bytes()).hexdigest():
                 raise ValueError("Final last checkpoint does not match the paired training state")
             require_best_checkpoint(state, self.best)
+            controller = getattr(self, "_project_stop_controller", None)
+            if controller is not None and controller.requested:
+                self._project_manual_stop = True
+                state.update(manual_stop=True, termination_reason="manual_stop")
+                temporary = (self.wdir / "last_training_state.pt").with_suffix(".tmp")
+                torch.save(state, temporary)
+                temporary.replace(self.wdir / "last_training_state.pt")
+                return
             # 8.3.162会合法重写last/best，先核验再交给原实现收尾。
             super().final_eval()
             self._project_best_checkpoint_sha256 = hashlib.sha256(self.best.read_bytes()).hexdigest()

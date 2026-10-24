@@ -64,7 +64,16 @@ def _check_pipeline(outputs):
         raise ValueError("黑帧阻断或接管提示未通过")
 
 
-def finish_extension(cfg, root, config_path, policy):
+def finish_extension(cfg, root, config_path, policy, *, stop_controller=None):
+    from car_smart_assist.utils.stop import StopController
+
+    controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root)
+    with controller:
+        controller.require_running()
+        return _finish_extension(cfg, root, config_path, policy, controller)
+
+
+def _finish_extension(cfg, root, config_path, policy, stop_controller):
     from car_smart_assist.inference.pipeline import InferencePipeline
 
     folder, checkpoints = root / cfg.report_dir, root / cfg.checkpoint_root
@@ -88,6 +97,7 @@ def finish_extension(cfg, root, config_path, policy):
         raise ValueError("源历史被改变或追加轮次不连续")
     if any(row["skipped_updates"] for row in history):
         raise ValueError("出现跳过更新，需复核后再切换默认模型")
+    stop_controller.require_running()
     datasets, _ = prepare_attention_datasets(cfg, root)
     weights = attention_sampling_weights(datasets["train"], cfg)
     generator = torch.Generator()
@@ -134,6 +144,7 @@ def finish_extension(cfg, root, config_path, policy):
         (root / "configs/model/visibility.yaml").read_text(encoding="utf-8")
     )["visibility"]
     samples = _samples(root, visibility)
+    stop_controller.require_running()
     explicit = InferencePipeline.from_config(
         visibility,
         project_root=root,
@@ -141,14 +152,18 @@ def finish_extension(cfg, root, config_path, policy):
         weather_config=desired["weather_default"]["config"],
         weather_checkpoint=desired["weather_default"]["checkpoint"],
     )
+    stop_controller.require_running()
     before = explicit.run_batch([image for _, image in samples])
     _check_pipeline(before)
     del explicit
+    stop_controller.require_running()
     route_path = root / "configs/model/weather_default.yaml"
     original_bytes = route_path.read_bytes()
     current = yaml.safe_load(original_bytes)
     if current != manifest["default_route_before"] and current != desired:
         raise ValueError("默认路由被其他操作改变；未覆盖该修改")
+    # Once publication starts, finish or roll it back before honoring another stop.
+    stop_controller.require_running()
     temporary = route_path.with_suffix(".tmp.yaml")
     temporary.write_text(
         yaml.safe_dump(desired, sort_keys=False, allow_unicode=True), encoding="utf-8"
@@ -200,6 +215,7 @@ def finish_extension(cfg, root, config_path, policy):
             ],
         },
     )
+    stop_controller.require_running()
     if not verdict["swad_effective"]:
         archive = (
             root
@@ -236,6 +252,7 @@ def finish_extension(cfg, root, config_path, policy):
             folder / "readonly_manifest.json",
             {"folder": verdict["readonly_archive"], "hashes": hashes, "read_only": True},
         )
+    stop_controller.require_running()
     assert_protected_files(root, manifest)
     write_json(folder / "decision.json", verdict)
     section = f"\n## 追加600轮后的部署选择\n\n累计{last['epoch']}轮；按验证评分判断SWAD有效：{verdict['swad_effective']}。SWAD评分{verdict['swad_validation_score']}，旧A组{verdict['a_validation_score']:.6f}，同轮单点{verdict['single_validation_score']:.6f}。测试分数不参与选择。\n\n默认配置：`{desired['weather_default']['config']}`；权重：`{desired['weather_default']['checkpoint']}`。原始初始化、300轮历史、续接采样和连续学习率检查通过，实际默认管线及黑帧验证通过。\n"

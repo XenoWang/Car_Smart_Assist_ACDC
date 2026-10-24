@@ -10,6 +10,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
+
 from car_smart_assist.config.weather_pyramid import load_weather_pyramid_config  # noqa: E402
 from car_smart_assist.data.weather_pyramid import prepare_pyramid_splits  # noqa: E402
 from car_smart_assist.perception.weather_pyramid_training import (
@@ -33,6 +35,9 @@ def main():
     parser.add_argument(
         "--total-epochs", type=int, default=None, help="每个版本累计跑到指定轮数，期间不提前早停"
     )
+    modes.add_argument("--stop", action="store_true", help="只写停止请求")
+    modes.add_argument("--continue", dest="continue_training", action="store_true", help="继续原组进度和预算")
+    parser.add_argument("--stop-file", type=Path, default=None)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     root = Path(__file__).resolve().parents[1]
@@ -40,33 +45,47 @@ def main():
         if args.total_epochs is not None and (args.total_epochs <= 0 or args.evaluate_only):
             raise ValueError("累计目标必须为正数，且不能与只评估模式同时使用")
         cfg = load_weather_pyramid_config(root / args.config)
-        if args.prepare_only:
-            _, report = prepare_pyramid_splits(cfg, root)
-            report["splits"] = {
-                name: {key: value for key, value in row.items() if key != "records"}
-                for name, row in report["splits"].items()
-            }
-        else:
-            variants = ("focal", "asl")
-            if args.evaluate_only:
-                variants = tuple(
-                    name
-                    for name in variants
-                    if (root / cfg.checkpoint_root / name / "best.pt").is_file()
+        with StopController(args.stop_file, default_directory=root / cfg.checkpoint_root) as controller:
+            for variant in ("focal", "asl"):
+                controller.watch_directory(root / cfg.checkpoint_root / variant)
+            if args.stop:
+                controller.request_stop_file()
+                print(f"已请求轮末停止：{controller.path}")
+                return 0
+            if args.fresh or args.continue_training:
+                controller.resume()
+            controller.require_running()
+            if args.prepare_only:
+                _, report = prepare_pyramid_splits(cfg, root)
+                report["splits"] = {
+                    name: {key: value for key, value in row.items() if key != "records"}
+                    for name, row in report["splits"].items()
+                }
+            else:
+                variants = ("focal", "asl")
+                if args.evaluate_only:
+                    variants = tuple(
+                        name
+                        for name in variants
+                        if (root / cfg.checkpoint_root / name / "best.pt").is_file()
+                    )
+                    if not variants:
+                        raise FileNotFoundError("没有保留的金字塔对照权重")
+                report = compare_pyramid_models(
+                    cfg,
+                    root,
+                    fresh=args.fresh,
+                    evaluate_only=args.evaluate_only,
+                    total_epochs=args.total_epochs,
+                    variants=variants,
+                    stop_controller=controller,
+                    continue_only=args.continue_training,
                 )
-                if not variants:
-                    raise FileNotFoundError("没有保留的金字塔对照权重")
-            report = compare_pyramid_models(
-                cfg,
-                root,
-                fresh=args.fresh,
-                evaluate_only=args.evaluate_only,
-                total_epochs=args.total_epochs,
-                variants=variants,
-            )
-            for model in report["models"].values():
-                model.pop("history", None)
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+                for model in report["models"].values():
+                    model.pop("history", None)
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            if report.get("manual_stop") or controller.requested:
+                return STOP_EXIT_CODE
     except (ValueError, FileNotFoundError) as exc:
         print(f"历史天气对照未完成：{exc}", file=sys.stderr)
         return 2

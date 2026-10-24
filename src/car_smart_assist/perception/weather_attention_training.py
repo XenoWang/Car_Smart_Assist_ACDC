@@ -58,6 +58,8 @@ from car_smart_assist.perception.weather_training import (
     require_independent_weather_output,
 )
 
+from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController
+
 logger = logging.getLogger(__name__)
 
 
@@ -597,7 +599,21 @@ def preflight_attention(cfg, root, datasets, split_info):
     return result
 
 
-def train_attention(cfg, root, datasets, split_info, *, fresh=False):
+def train_attention(cfg, root, datasets, split_info, *, fresh=False, stop_controller=None, continue_only=False):
+    destination = Path(root).resolve() / cfg.checkpoint_root
+    controller = stop_controller or StopController(default_directory=destination)
+    controller.watch_directory(destination)
+    with controller:
+        controller.require_running()
+        if continue_only and (fresh or not (destination / "last.pt").is_file()):
+            raise ValueError("--continue 需要本训练输出目录已有的配对 last")
+        return _train_attention(
+            cfg, root, datasets, split_info, fresh=fresh, stop_controller=controller,
+            continue_only=continue_only,
+        )
+
+
+def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller, continue_only=False):
     root = Path(root).resolve()
     destination = root / cfg.checkpoint_root
     require_independent_weather_output(root, destination)
@@ -614,6 +630,7 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
         for key in ("checkpoint", "single_best")
     ):
         raise ValueError("追加训练输出必须使用独立目录，不能覆盖源检查点")
+    stop_controller.require_running()
     if fresh:
         existing = [
             p
@@ -726,6 +743,8 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                 payload["best_score"],
                 payload["history"],
             )
+            if continue_only and payload.get("planned_epochs") != cfg.train["epochs"]:
+                raise ValueError("--continue 不允许改变 last 的原累计训练目标或学习率计划")
             elapsed_before = payload["training_seconds"]
             initial_model_sha256 = payload.get("initial_model_sha256", initial_model_sha256)
             if use_early_stopping:
@@ -743,8 +762,11 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
             cfg.train["epochs"],
             dtype if amp else "关闭",
         )
-        remaining = () if stopping_state["stopped"] else range(epoch + 1, cfg.train["epochs"] + 1)
+        completed_stage = continue_only and own_resume and bool(payload.get("training_complete"))
+        remaining = () if stopping_state["stopped"] or completed_stage else range(epoch + 1, cfg.train["epochs"] + 1)
         for current in remaining:
+            if stop_controller.requested:
+                break
             tick = time.perf_counter()
             model.set_training_epoch(current)
             model.train()
@@ -907,20 +929,62 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
                 best_epoch,
                 row["seconds"],
             )
+            if stop_controller.requested:
+                break
             if stopping_state["stopped"]:
                 logger.info("验证评分连续 %d 轮未达改善门槛，提前停止于 epoch %d", stopping_state["wait"], current)
                 break
+        def pause_if_requested():
+            if not stop_controller.requested:
+                return None
+            if not last_path.is_file():
+                stop_controller.require_running()
+            last = torch.load(last_path, map_location="cpu", weights_only=True)
+            last.update(termination_reason="manual_stop", manual_stop=True)
+            _save_checkpoint(last, last_path)
+            progress = {
+                "status": "手动停止", "epoch": last["epoch"],
+                "planned_epochs": cfg.train["epochs"], "best_epoch": last["best_epoch"],
+                "termination_reason": "manual_stop", "manual_stop": True,
+                "training_complete": last["training_complete"],
+            }
+            write_json(root / cfg.report_dir / "progress.json", progress)
+            return model.eval(), {
+                **progress, "checkpoint": str(best_path),
+                "trained_through_epoch": last["epoch"],
+                "training_seconds": last["training_seconds"],
+                "baseline_hashes": baseline_hashes,
+                "split_signature": split_info["signature"],
+                "initial_model_sha256": initial_model_sha256,
+                "calibrated": False,
+            }
+
+        paused = pause_if_requested()
+        if paused is not None:
+            return paused
         payload = torch.load(best_path, map_location="cpu", weights_only=True)
         model.load_state_dict(payload["model_state"])
         export = {}
         if tracker is not None:
-            inference, payload, export = finish_swad_checkpoints(
-                tracker, model, payload, cfg, root, datasets, device
-            )
+            try:
+                inference, payload, export = finish_swad_checkpoints(
+                    tracker, model, payload, cfg, root, datasets, device,
+                    stop_controller=stop_controller,
+                )
+            except SystemExit as exc:
+                if exc.code != STOP_EXIT_CODE:
+                    raise
+                paused = pause_if_requested()
+                if paused is None:
+                    raise
+                return paused
             thresholds = payload["decision_thresholds"]
         else:
             inference = optimize_attention_inference(model)
             cal_values = attention_probabilities(inference, datasets["calibration"], cfg, device)
+            paused = pause_if_requested()
+            if paused is not None:
+                return paused
             thresholds, _ = balanced_thresholds(datasets["calibration"], cal_values, cfg)
             payload.update(
                 {
@@ -934,15 +998,24 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
             save_attention_best(payload, best_path)
         last = torch.load(last_path, map_location="cpu", weights_only=True)
         last["best_sha256"] = hashlib.sha256(best_path.read_bytes()).hexdigest()
+        if continue_only and last["training_complete"]:
+            last.update(manual_stop=False, termination_reason=(
+                "budget_completed" if last["epoch"] == cfg.train["epochs"] else "early_stopping"
+            ))
         if tracker is not None:
             last["export_best_sha256"] = hashlib.sha256(
                 (destination / "best.pt").read_bytes()
             ).hexdigest()
         _save_checkpoint(last, last_path)
+        paused = pause_if_requested()
+        if paused is not None:
+            return paused
     return inference, {
         "checkpoint": str(destination / "best.pt"),
         "best_epoch": payload["epoch"],
         "trained_through_epoch": last["epoch"],
+        "training_complete": last["training_complete"],
+        "manual_stop": False,
         "termination_reason": last.get("termination_reason", "budget_completed"),
         **({"early_stopping": last["early_stopping"]} if use_early_stopping else {}),
         "thresholds": thresholds,
@@ -957,14 +1030,18 @@ def train_attention(cfg, root, datasets, split_info, *, fresh=False):
     }
 
 
-def compare_attention(cfg, root, datasets, split_info, model, trained):
+def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_controller=None):
+    stop_controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root)
+    stop_controller.require_running()
     device = select_device(cfg.device)
     selected = trained.get("selected_kind", "attention_asl")
     results = {selected: trained}
     values = {selected: attention_probabilities(model, datasets["test"], cfg, device)}
+    stop_controller.require_running()
     for name, candidate in trained.get("candidates", {}).items():
         if name == selected:
             continue
+        stop_controller.require_running()
         predictor = WeatherAttentionPredictor.from_checkpoint(
             candidate["checkpoint"], cfg, cfg.device
         )
@@ -972,6 +1049,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
         values[name] = attention_probabilities(predictor.model, datasets["test"], cfg, device)
         del predictor
     for name, reference in cfg.evaluation.get("attention_references", {}).items():
+        stop_controller.require_running()
         reference_cfg = load_weather_attention_config(root / reference["config"])
         predictor = WeatherAttentionPredictor.from_checkpoint(
             root / reference["checkpoint"], reference_cfg, cfg.device
@@ -987,23 +1065,25 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
         }
         values[name] = attention_probabilities(predictor.model, datasets["test"], cfg, device)
         del predictor
+    stop_controller.require_running()
     asl_cfg = load_weather_pyramid_config(root / cfg.evaluation["asl_config"])
     asl = WeatherPyramidPredictor.from_checkpoint(
         root / cfg.evaluation["asl_checkpoint"], asl_cfg, cfg.device
     )
     if asl_cfg.image_size != cfg.image_size:
         raise ValueError("ASL 对照输入尺寸与缓存不一致")
+    stop_controller.require_running()
     values["pyramid_asl"] = attention_probabilities(asl.model, datasets["test"], cfg, device)
-    shared, _ = balanced_thresholds(
-        datasets["calibration"],
-        attention_probabilities(asl.model, datasets["calibration"], cfg, device),
-        cfg,
-    )
+    stop_controller.require_running()
+    asl_calibration = attention_probabilities(asl.model, datasets["calibration"], cfg, device)
+    stop_controller.require_running()
+    shared, _ = balanced_thresholds(datasets["calibration"], asl_calibration, cfg)
     results["pyramid_asl"] = {
         "checkpoint": str(root / cfg.evaluation["asl_checkpoint"]),
         "thresholds": asl.thresholds,
         "shared_calibration_thresholds": shared,
     }
+    stop_controller.require_running()
     old_cfg = replace(load_weather_config(root / cfg.evaluation["old_config"]), device=cfg.device)
     old = WeatherPredictor.from_checkpoint(root / cfg.evaluation["old_checkpoint"], old_cfg)
     old_sets = {
@@ -1012,12 +1092,12 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
         )
         for name in ("calibration", "test")
     }
+    stop_controller.require_running()
     values["original"] = _old_probabilities(old, old_sets["test"], cfg.evaluation["batch_size"])
-    shared, _ = balanced_thresholds(
-        datasets["calibration"],
-        _old_probabilities(old, old_sets["calibration"], cfg.evaluation["batch_size"]),
-        cfg,
-    )
+    stop_controller.require_running()
+    old_calibration = _old_probabilities(old, old_sets["calibration"], cfg.evaluation["batch_size"])
+    stop_controller.require_running()
+    shared, _ = balanced_thresholds(datasets["calibration"], old_calibration, cfg)
     results["original"] = {
         "checkpoint": str(root / cfg.evaluation["old_checkpoint"]),
         "thresholds": old_cfg.decision_thresholds,
@@ -1038,6 +1118,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained):
             if current_hash != trained["baseline_hashes"][name]:
                 raise ValueError("训练期间对照权重被外部改变；不生成混合版本成绩")
             results[name]["sha256"] = current_hash
+    stop_controller.require_running()
     output = {
         "status": "完成",
         "trained_through_epoch": trained.get("trained_through_epoch", cfg.train["epochs"]),

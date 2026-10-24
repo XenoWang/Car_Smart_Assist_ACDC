@@ -27,6 +27,7 @@ from torch.utils.data import DataLoader, Dataset
 from car_smart_assist.config.weather import WeatherConfig, load_weather_config
 from car_smart_assist.data.detection import recording_group
 from car_smart_assist.data.preprocessing import load_invalid_entries
+from car_smart_assist.utils.stop import StopController
 from car_smart_assist.perception.visibility.dataset import read_rgb_image
 from car_smart_assist.perception.weather import (
     FEATURE_NAMES,
@@ -450,6 +451,9 @@ class WeatherTrainResult:
     val_count: int
     pixel_train_count: int
     pixel_val_count: int
+    manual_stop: bool = False
+    training_complete: bool = True
+    termination_reason: str = "budget_completed"
 
 
 def train_weather(
@@ -457,7 +461,22 @@ def train_weather(
     project_root: str | Path,
     *,
     resume: bool = True,
+    stop_controller: StopController | None = None,
+    continue_only: bool = False,
 ) -> WeatherTrainResult:
+    directory = (Path(project_root).resolve() / cfg.checkpoint).parent
+    controller = stop_controller or StopController(default_directory=directory)
+    controller.watch_directory(directory)
+    with controller:
+        controller.require_running()
+        if continue_only and (not resume or not (directory / "last.pt").is_file()):
+            raise ValueError("--continue 需要本输出目录的配对 last.pt")
+        return _train_weather(
+            cfg, project_root, resume=resume, stop_controller=controller, continue_only=continue_only
+        )
+
+
+def _train_weather(cfg, project_root, *, resume, stop_controller, continue_only=False) -> WeatherTrainResult:
     """用按场景分组的 ACDC 和 Pixel 数据训练天气与光照属性。"""
     root = Path(project_root).resolve()
     best_path = root / cfg.checkpoint
@@ -465,6 +484,9 @@ def train_weather(
     require_independent_weather_output(root, best_path.parent)
     if best_path == last_path:
         raise ValueError("旧 CNN 的 checkpoint 不能命名为 last.pt；best 与 last 必须分开")
+    stop_controller.require_running()
+    if not resume:
+        _archive_weather_checkpoints((best_path, last_path))
     if resume and best_path.exists() and not last_path.exists():
         raise ValueError(
             "旧 CNN 只有 best、缺少配对 last，不能完整恢复；请保留原件，"
@@ -574,8 +596,8 @@ def train_weather(
     best_metrics: dict[str, Any] = {}
     best_reference: dict[str, Any] = {}
     best_sha256 = None
-    if not resume:
-        _archive_weather_checkpoints((best_path, last_path))
+    completed_stage = False
+    stop_controller.require_running()
     if resume and last_path.exists():
         previous = torch.load(last_path, map_location="cpu", weights_only=True)
         previous_model_cfg = dict(previous.get("model_config", {}))
@@ -585,6 +607,17 @@ def train_weather(
         if previous.get("dataset_signatures") != signatures:
             raise ValueError("天气训练数据变化，不能沿用旧优化器状态；请使用 --fresh")
         _load_verified_weather_best(best_path, previous)
+        if continue_only:
+            required = ("model_state", "optimizer_state", "shuffle_state", "torch_rng", "cuda_rng")
+            if any(key not in previous for key in required) or any(
+                previous[key] is None for key in required if key != "cuda_rng"
+            ):
+                raise ValueError("--continue 缺少完整 RNG/随机状态或优化器恢复状态")
+            original_target = previous.get("planned_epochs")
+            if type(original_target) is not int or original_target < previous["epoch"]:
+                raise ValueError("旧 CNN 的 last 缺少有效原累计目标，拒绝推测 --continue 预算")
+            epochs = original_target
+            completed_stage = bool(previous.get("training_complete")) or previous["epoch"] == epochs
         best_reference = previous
         best_sha256 = previous["best_sha256"]
         model.load_state_dict(previous["model_state"])
@@ -595,8 +628,15 @@ def train_weather(
         wait = int(previous["wait"])
         best_metrics = previous["best_val_metrics"]
         generator.set_state(previous["shuffle_state"])
+        if "torch_rng" in previous:
+            torch.set_rng_state(previous["torch_rng"])
+            if device.type == "cuda" and previous.get("cuda_rng") is not None:
+                torch.cuda.set_rng_state(previous["cuda_rng"], device)
 
-    for epoch in range(start_epoch + 1, epochs + 1):
+    remaining = () if completed_stage else range(start_epoch + 1, epochs + 1)
+    for epoch in remaining:
+        if stop_controller.requested:
+            break
         model.train()
         for images, cues, labels in train_loader:
             images = images.to(device, non_blocking=True)
@@ -658,17 +698,41 @@ def train_weather(
             },
             "optimizer_state": optimizer.state_dict(),
             "epoch": epoch,
+            "planned_epochs": epochs,
             "best_epoch": best_epoch,
             "best_val_loss": best_loss,
             "best_val_metrics": best_metrics,
             "wait": wait,
             "shuffle_state": generator.get_state(),
+            "torch_rng": torch.get_rng_state(),
+            "cuda_rng": torch.cuda.get_rng_state(device) if device.type == "cuda" else None,
+            "training_complete": epoch == epochs or wait >= patience,
+            "termination_reason": "budget_completed" if epoch == epochs else (
+                "early_stopping" if wait >= patience else None
+            ),
+            "manual_stop": False,
             "dataset_signatures": signatures,
             "best_sha256": best_sha256,
         }
         _save_checkpoint(best_reference, last_path)
-        if wait >= patience:
+        if stop_controller.requested or wait >= patience:
             break
+    def pause_if_requested():
+        if not stop_controller.requested:
+            return None
+        if not best_reference:
+            stop_controller.require_running()
+        best_reference.update(termination_reason="manual_stop", manual_stop=True)
+        _save_checkpoint(best_reference, last_path)
+        return WeatherTrainResult(
+            best_epoch, best_loss, best_metrics, best_path, str(device),
+            len(train_set), len(val_set), len(pixel_train), len(pixel_val),
+            True, best_reference.get("training_complete", start_epoch >= epochs), "manual_stop",
+        )
+
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     if best_epoch == 0:
         raise ValueError("未找到可用的天气属性模型 best 检查点")
     best_checkpoint = _load_verified_weather_best(best_path, best_reference)
@@ -687,6 +751,9 @@ def train_weather(
         cfg.attributes,
         cfg.decision_thresholds,
     )
+    paused = pause_if_requested()
+    if paused is not None:
+        return paused
     return WeatherTrainResult(
         best_epoch,
         best_loss,
@@ -697,4 +764,7 @@ def train_weather(
         len(val_set),
         len(pixel_train),
         len(pixel_val),
+        False, True, (
+            "budget_completed" if start_epoch == epochs else "early_stopping"
+        ) if completed_stage else (best_reference.get("termination_reason") or "budget_completed"),
     )
