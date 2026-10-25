@@ -13,7 +13,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Sequence
 
 import numpy as np
@@ -794,6 +794,15 @@ def _check_detection_jsons(
                            or row[k] <= 0 for k in ("width", "height"))
                 ):
                     raise ValueError("image 缺少有效 id/file_name/width/height")
+                file_name = row["file_name"]
+                relative = PurePosixPath(file_name.replace("\\", "/"))
+                windows = PureWindowsPath(file_name)
+                if (
+                    not file_name.strip() or not relative.parts or "\x00" in file_name
+                    or relative.is_absolute() or windows.drive or windows.root
+                    or ".." in relative.parts
+                ):
+                    raise ValueError("image.file_name 必须是无父级或绝对锚点的非空相对路径")
             for row in data["annotations"]:
                 if (
                     not isinstance(row, dict)

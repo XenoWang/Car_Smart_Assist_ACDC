@@ -181,6 +181,8 @@ class InferencePipeline:
             if checkpoint is not None
             else root / tcfg.get("checkpoint_dir", "artifacts/checkpoints/visibility") / "best.pt"
         )
+        if checkpoint is not None and not ckpt.is_absolute():
+            ckpt = root / ckpt
 
         scorer: VisibilityScorer | None = None
         if ckpt.exists():

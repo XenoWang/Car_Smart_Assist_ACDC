@@ -201,7 +201,7 @@ MUSIQ（ICCV 2021）有多尺度质量建模与官方推理实现，但通用主
 | `model_report.md` | 2026-10-19 默认 YOLO 后处理指标、2026-10-18 独立重训候选 |
 | `AI_Skills/PRD/PRD_V0_0_2.md` §4、§9–13 | 历史候选指标、已有研究方向及尚未选择状态 |
 | `AI_Skills/PRD/PRD_V0_0_3.md`；`AI_Skills/Pitfall/ThingsShouldBeAvoided.md` | 已修问题、未知标签、分组、后处理、重建反向及测试边界 |
-| `AI_Skills/Reports/{LOCAL_OPTIMIZATIONS_20261022,OPTIMIZATION_ROADMAP_20261022,TRAIN800_PAUSED_20261023}.md` | 已实施未测速／仅规划／暂停任务的区分 |
+| `AI_Skills/Reports/Optimization/{LOCAL_OPTIMIZATIONS_20261022,OPTIMIZATION_ROADMAP_20261022}.md`、`AI_Skills/Reports/Training/TRAIN800_PAUSED_20261023.md` | 已实施未测速／仅规划／暂停任务的区分 |
 
 `artifacts/reports/visibility/evaluation.md` 是历史报告，仍有“ACDC 没有看不清帧”等旧说明；本次不沿用这些断言，不把该旧报告的清晰图或合成成绩当作真实驾驶可用性真值。该文字口径问题已有项目审查记录，本轮不重复修文件或新增 bug。
 

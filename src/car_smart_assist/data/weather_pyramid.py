@@ -7,7 +7,9 @@ import io
 import itertools
 import json
 import logging
+import os
 import random
+import tempfile
 from collections import Counter, defaultdict
 from contextlib import ExitStack
 from pathlib import Path
@@ -123,6 +125,11 @@ def split_pyramid_samples(
             f"acdc:{sample.stratum.split(':')[-1]}" if sample.path is not None else "pixel_accurate"
         )
         domains[domain][sample.group].append(sample)
+    acdc_count = sum(sample.path is not None for sample in samples)
+    if acdc_count == 0:
+        raise ValueError(
+            f"天气四分需要 ACDC 样本；ACDC=0，pixel_accurate={len(samples)}，total={len(samples)}"
+        )
     fractions = [ratios[n] for n in names]
     assignments = {}
     pixel_groups = domains.pop("pixel_accurate")
@@ -182,8 +189,24 @@ def _duplicate_recording_links(samples, cache_dir):
     signature = _sample_signature(records, (0, 0))
     output = cache_dir / f"file_hashes_{signature[:16]}.json"
     cache_dir.mkdir(parents=True, exist_ok=True)
-    if output.exists():
-        return json.loads(output.read_text(encoding="utf-8"))["cross_recording_links"]
+    try:
+        cached = json.loads(output.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        cached = None
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        cached = None
+    valid_groups = {sample.group for sample in records}
+    if (
+        isinstance(cached, dict) and cached.get("signature") == signature
+        and isinstance(cached.get("cross_recording_links"), list)
+        and all(
+            isinstance(link, list) and len(link) >= 2
+            and all(type(group) is str and group and group in valid_groups for group in link)
+            and len(set(link)) == len(link)
+            for link in cached["cross_recording_links"]
+        )
+    ):
+        return cached["cross_recording_links"]
     groups = defaultdict(set)
     for index, sample in enumerate(records):
         digest = hashlib.sha256()
@@ -194,9 +217,23 @@ def _duplicate_recording_links(samples, cache_dir):
         if (index + 1) % 1000 == 0:
             logger.info("天气文件重复检查 %d/%d", index + 1, len(records))
     links = sorted(sorted(group) for group in groups.values() if len(group) > 1)
-    output.write_text(
-        json.dumps({"signature": signature, "cross_recording_links": links}), encoding="utf-8"
-    )
+    content = json.dumps({"signature": signature, "cross_recording_links": links}).encode("utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix=output.name + ".", suffix=".tmp", dir=cache_dir, delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if temporary.read_bytes() != content:
+            raise OSError(f"天气重复检查缓存临时文件回读不一致：{temporary}")
+        temporary.replace(output)
+        temporary = None
+        if output.read_bytes() != content:
+            raise OSError(f"天气重复检查缓存最终回读不一致：{output}")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return links
 
 

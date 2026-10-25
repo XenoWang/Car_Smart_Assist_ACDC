@@ -389,7 +389,7 @@ def _joint_config():
         "image_mode": "copy",
         "additional_class": {"name": "obstacle"},
         "obstacle_train_id": 2,
-        "valid_roi_ids": [0],
+        "valid_roi_ids": [1, 2],
     }
 
 
@@ -405,7 +405,7 @@ def _write_laf_fixture(root):
         for path in (image, mask, instances):
             path.parent.mkdir(parents=True, exist_ok=True)
         Image.new("RGB", (4, 4), (20 + index, 30, 40)).save(image)
-        Image.fromarray(np.zeros((4, 4), dtype=np.uint8)).save(mask)
+        Image.fromarray(np.ones((4, 4), dtype=np.uint8)).save(mask)
         Image.fromarray(np.zeros((4, 4), dtype=np.uint16)).save(instances)
     (root / "data").mkdir(exist_ok=True)
     (root / "data/cleaning.json").write_text(json.dumps({"invalid": []}), encoding="utf-8")
