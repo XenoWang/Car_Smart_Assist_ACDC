@@ -11,10 +11,11 @@ import os
 import random
 import re
 import shutil
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import numpy as np
@@ -260,6 +261,11 @@ def stratified_group_split(
                 row = tuple(rng.choices(range(4), weights=target, k=len(groups)))
                 if len(set(row)) == 4:
                     assignments.append(row)
+            if not assignments:
+                row = list(range(4))
+                row.extend(rng.choices(range(4), weights=target, k=len(groups) - 4))
+                rng.shuffle(row)
+                assignments.append(tuple(row))
         rng.shuffle(assignments)
         assignment_array = np.asarray(assignments, dtype=np.int8)
         selectors = assignment_array[:, :, None] == np.arange(4)
@@ -371,8 +377,38 @@ def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict
 
 def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     output = (project_root / cfg["output_root"]).resolve()
-    if not output.is_relative_to((project_root / "data/processed").resolve()):
+    processed_root = (project_root / "data/processed").resolve()
+    if output == processed_root or not output.is_relative_to(processed_root):
         raise ValueError("Detection export must be under data/processed")
+    official = json.loads(
+        (project_root / cfg["acdc_root"] / cfg["official_test_index"]).read_text(encoding="utf-8")
+    )
+    if (
+        not isinstance(official, dict) or not isinstance(official.get("images"), list)
+        or official.get("annotations", []) != []
+    ):
+        raise ValueError("Official inference-only index must contain images and no annotations")
+    rgb_root = (project_root / cfg["acdc_root"] / "rgb_anon").resolve()
+    official_paths = []
+    seen_official = set()
+    for row in official["images"]:
+        file_name = row.get("file_name") if isinstance(row, dict) else None
+        if not isinstance(file_name, str) or not file_name.strip() or "\x00" in file_name:
+            raise ValueError("Official inference image file_name must be a nonempty relative path")
+        relative = PurePosixPath(file_name.replace("\\", "/"))
+        windows = PureWindowsPath(file_name)
+        if (
+            not relative.parts or relative.is_absolute() or windows.drive or windows.root
+            or ".." in relative.parts
+        ):
+            raise ValueError(f"Invalid official inference image path: {file_name}")
+        path = (rgb_root / str(relative)).resolve()
+        if not path.is_relative_to(rgb_root) or not path.is_file():
+            raise ValueError(f"Official inference image missing or outside rgb_anon: {file_name}")
+        if path in seen_official:
+            raise ValueError(f"Duplicate official inference image: {file_name}")
+        seen_official.add(path)
+        official_paths.append(path)
     records, source_hashes, annotation_counts = read_detection_annotations(project_root, cfg)
     logging.info("Checking %d labeled RGB images with shared integrity checks", len(records))
     eligible, excluded = [], []
@@ -408,17 +444,8 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
         ],
     }
     signature = hashlib.sha256(json.dumps(fingerprint_data, sort_keys=True).encode()).hexdigest()
-    previous = output / "manifest.json"
-    if (
-        previous.exists()
-        and json.loads(previous.read_text(encoding="utf-8"))["signature"] != signature
-    ):
-        raise ValueError(
-            "Prepared dataset differs; use a new output_root rather than overwriting a fixed split"
-        )
-    output.mkdir(parents=True, exist_ok=True)
     exported = []
-    materialization = Counter()
+    split_lists = {}
     split_stats = {}
     names = {index: row["name"] for index, row in enumerate(cfg["classes"])}
     for split, rows in partitions.items():
@@ -430,17 +457,6 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
             label_relative = (PurePosixPath("labels") / split / row.relative_path).with_suffix(
                 ".txt"
             )
-            materialization[
-                _materialize_image(
-                    row.source, output / str(image_relative), cfg["image_mode"], row.sha256
-                )
-            ] += 1
-            label_path = output / str(label_relative)
-            label_path.parent.mkdir(parents=True, exist_ok=True)
-            text = _label_text(row.labels)
-            if label_path.exists() and label_path.read_text(encoding="utf-8") != text:
-                raise ValueError(f"Existing YOLO label differs: {label_path}")
-            label_path.write_text(text, encoding="utf-8")
             image_list.append("./" + str(image_relative))
             weather[row.condition] += 1
             objects.update(names[int(box[0])] for box in row.labels)
@@ -458,7 +474,7 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
                     "boxes": row.labels,
                 }
             )
-        (output / f"{split}.txt").write_text("\n".join(image_list) + "\n", encoding="utf-8")
+        split_lists[f"{split}.txt"] = "\n".join(image_list) + "\n"
         split_stats[split] = {
             "images": len(rows),
             "groups": len({row.group for row in rows}),
@@ -474,22 +490,6 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
         "test": "test.txt",
         "names": names,
     }
-    (output / "data.yaml").write_text(yaml.safe_dump(dataset, sort_keys=False), encoding="utf-8")
-    (output / "calibration.yaml").write_text(
-        yaml.safe_dump({**dataset, "val": "calibration.txt"}, sort_keys=False), encoding="utf-8"
-    )
-    official = json.loads(
-        (project_root / cfg["acdc_root"] / cfg["official_test_index"]).read_text(encoding="utf-8")
-    )
-    official_paths = [
-        (project_root / cfg["acdc_root"] / "rgb_anon" / row["file_name"]).resolve()
-        for row in official["images"]
-    ]
-    if official.get("annotations") or not all(path.is_file() for path in official_paths):
-        raise ValueError("Official inference-only index unexpectedly has GT or missing images")
-    (output / "official_inference.txt").write_text(
-        "\n".join(path.as_posix() for path in official_paths) + "\n", encoding="utf-8"
-    )
     manifest = {
         "format_version": 1,
         "signature": signature,
@@ -502,26 +502,82 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
         "excluded": excluded,
         "official_inference_only_count": len(official_paths),
     }
-    (output / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    (output / "split.json").write_text(
-        json.dumps(
-            {
-                "seed": cfg["seed"],
-                "signature": signature,
-                "splits": {
-                    split: [row.relative_path for row in rows] for split, rows in partitions.items()
-                },
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-    (output / "deferred_samples.json").write_text(
-        json.dumps(excluded, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
-    validated = validate_detection_export(output)
+    split_document = {
+        "seed": cfg["seed"],
+        "signature": signature,
+        "splits": {
+            split: [row.relative_path for row in rows] for split, rows in partitions.items()
+        },
+    }
+    documents = {
+        "manifest.json": json.dumps(manifest, ensure_ascii=False, indent=2),
+        "split.json": json.dumps(split_document, indent=2),
+        "deferred_samples.json": json.dumps(excluded, ensure_ascii=False, indent=2),
+    }
+    yaml_documents = {
+        "data.yaml": dataset,
+        "calibration.yaml": {**dataset, "val": "calibration.txt"},
+    }
+    official_text = "\n".join(path.as_posix() for path in official_paths) + "\n"
+
+    def validate_current(directory):
+        for name, expected in documents.items():
+            if json.loads((directory / name).read_text(encoding="utf-8")) != json.loads(expected):
+                raise ValueError(f"Prepared metadata differs from current inputs: {name}")
+        for name, expected in yaml_documents.items():
+            if yaml.safe_load((directory / name).read_text(encoding="utf-8")) != expected:
+                raise ValueError(f"Prepared dataset YAML differs: {name}")
+        if (directory / "official_inference.txt").read_text(encoding="utf-8") != official_text:
+            raise ValueError("Prepared official inference list differs from the current index")
+        return validate_detection_export(directory, verify_hashes=True)
+
+    materialization = Counter()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        try:
+            validated = validate_current(output)
+        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+            raise ValueError(
+                f"Existing detection export is incomplete or differs from current inputs: {exc}; "
+                "use a new output_root rather than overwriting existing content"
+            ) from exc
+        materialization["existing"] = len(eligible)
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent))
+        staging_identity = staging.stat()
+        try:
+            for split, rows in partitions.items():
+                for row in rows:
+                    image_relative = PurePosixPath("images") / split / row.relative_path
+                    label_relative = (PurePosixPath("labels") / split / row.relative_path).with_suffix(".txt")
+                    materialization[
+                        _materialize_image(
+                            row.source, staging / str(image_relative), cfg["image_mode"], row.sha256
+                        )
+                    ] += 1
+                    label_path = staging / str(label_relative)
+                    label_path.parent.mkdir(parents=True, exist_ok=True)
+                    label_path.write_text(_label_text(row.labels), encoding="utf-8")
+            for name, content in {**split_lists, **documents, "official_inference.txt": official_text}.items():
+                (staging / name).write_text(content, encoding="utf-8")
+            for name, document in yaml_documents.items():
+                (staging / name).write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+            validated = validate_current(staging)
+            if output.exists():
+                if not output.is_dir() or any(output.iterdir()):
+                    raise ValueError("Detection output appeared during preparation; use a new output_root")
+                output.rmdir()
+            staging.rename(output)
+        finally:
+            if staging.exists() or staging.is_symlink():
+                current = staging.lstat()
+                if (
+                    staging.is_symlink() or staging.resolve() != staging
+                    or staging == processed_root or not staging.is_relative_to(processed_root)
+                    or (current.st_dev, current.st_ino) != (staging_identity.st_dev, staging_identity.st_ino)
+                ):
+                    raise RuntimeError(f"Refusing cleanup of changed or unsafe staging directory: {staging}")
+                shutil.rmtree(staging)
     summary = {
         "dataset": "ACDC instance detection",
         "seed": cfg["seed"],

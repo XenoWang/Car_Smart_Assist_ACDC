@@ -1,4 +1,4 @@
-"""Regression evidence for the V0.0.3 addendum and October 23 review."""
+"""数据准备、训练恢复、评估与停止控制的安全回归测试。"""
 from __future__ import annotations
 
 import copy
@@ -25,7 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def load(relative):
     path = ROOT / relative
-    spec = importlib.util.spec_from_file_location("prd003_" + path.stem, path)
+    spec = importlib.util.spec_from_file_location("pipeline_safety_" + path.stem, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -137,7 +137,8 @@ def test_visibility_evaluation_rejects_wrong_reference_identity_before_scoring(t
         signature = None
     scorer = SimpleNamespace(input_size=(16, 16), split_signature=signature,
                              score_arrays=lambda *_: pytest.fail("scoring before identity check"))
-    with pytest.raises(ValueError, match="身份不一致"):
+    message = "检查点缺少 split_signature" if change == "missing" else "身份不一致"
+    with pytest.raises(module.SplitIdentityError, match=message):
         module.eval_fit_quality(scorer, [], paths, cfg, None, 1)
 
 

@@ -19,6 +19,7 @@ from car_smart_assist.data.detection import (
     normalize_box,
     validate_detection_export,
 )
+from car_smart_assist.data.preprocessing import load_invalid_entries
 
 
 def sha256(path: Path) -> str:
@@ -86,6 +87,15 @@ def split_development_locations(rows, ratios, seed):
 
 
 def prepare_joint_detection(root: Path, cfg: dict) -> dict:
+    if type(cfg.get("obstacle_train_id")) is not int or cfg["obstacle_train_id"] != 2:
+        raise ValueError("Lost & Found obstacle_train_id must be the integer 2")
+    roi_ids = cfg.get("valid_roi_ids")
+    if (
+        not isinstance(roi_ids, list) or not roi_ids
+        or any(type(value) is not int or value not in (1, 2) for value in roi_ids)
+        or len(set(roi_ids)) != len(roi_ids)
+    ):
+        raise ValueError("Lost & Found valid_roi_ids must be a nonempty unique integer list drawn from 1/2")
     if cfg["group_strategy"] != "location":
         raise ValueError("Joint Lost & Found export requires location grouping")
     if not np.isclose(sum(cfg["source_weights"].values()), 1) or any(
@@ -100,6 +110,10 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
     base_path = root / cfg["acdc_manifest"]
     base = json.loads(base_path.read_text(encoding="utf-8"))
     validate_detection_export(base_path.parent, verify_hashes=True)
+    acdc_sources = {
+        "acdc/" + row["source_relative"]: base_path.parent / row["image"]
+        for row in base["images"]
+    }
     if base["seed"] != cfg["seed"]:
         raise ValueError("Joint and ACDC split seeds differ")
     output = (root / cfg["output_root"]).resolve()
@@ -119,8 +133,10 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         for row in base["images"]
     ]
     dataset = (root / cfg["lost_and_found_root"]).resolve()
-    cleaning = json.loads((root / cfg["cleaning_manifest"]).read_text(encoding="utf-8"))
-    invalid = {Path(path).resolve() for path in cleaning["invalid"]}
+    cleaning_path = root / cfg["cleaning_manifest"]
+    if not cleaning_path.is_file():
+        raise FileNotFoundError(f"Cleaning manifest does not exist: {cleaning_path}")
+    invalid = load_invalid_entries(cleaning_path, root)
     deferred = []
     candidates = []
     for image in sorted((dataset / "leftImg8bit").rglob("*_leftImg8bit.png")):
@@ -131,7 +147,7 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         prefix = relative.name.removesuffix("_leftImg8bit.png")
         mask = dataset / "gtCoarse" / relative.parent / (prefix + "_gtCoarse_labelTrainIds.png")
         instances = mask.with_name(prefix + "_gtCoarse_instanceIds.png")
-        if any(path.resolve() in invalid for path in (image, mask, instances)):
+        if any(str(path.resolve()) in invalid for path in (image, mask, instances)):
             deferred.append(str(relative))
             continue
         if not mask.is_file() or not instances.is_file():
@@ -193,7 +209,8 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
     for row in rows:
         image = Path("images") / row["split"] / row["source_relative"]
         label = (Path("labels") / row["split"] / row["source_relative"]).with_suffix(".txt")
-        _materialize_image(Path(row["source"]), output / image, cfg["image_mode"], row["sha256"])
+        source = acdc_sources[row["source_relative"]] if row["dataset"] == "acdc" else Path(row["source"])
+        _materialize_image(source, output / image, cfg["image_mode"], row["sha256"])
         text = _label_text(row["boxes"])
         destination = output / label
         destination.parent.mkdir(parents=True, exist_ok=True)

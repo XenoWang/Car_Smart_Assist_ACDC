@@ -50,18 +50,18 @@ def main(argv=None, *, stop_controller=None):
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     root = Path(__file__).resolve().parents[1]
-    cfg = load_weather_attention_config(root / args.config)
-    if args.total_epochs is not None:
-        cfg = replace(cfg, train={**cfg.train, "epochs": args.total_epochs})
-        validate_weather_attention_config(cfg)
-    if not args.stop:
-        try:
+    try:
+        cfg = load_weather_attention_config(root / args.config)
+        if args.total_epochs is not None:
+            cfg = replace(cfg, train={**cfg.train, "epochs": args.total_epochs})
+            validate_weather_attention_config(cfg)
+        if not args.stop:
             require_independent_weather_reports(cfg, root)
             if not args.preflight:
                 require_independent_weather_output(root, root / cfg.checkpoint_root)
-        except ValueError as exc:
-            print(f"天气注意力训练未开始：{exc}", file=sys.stderr)
-            return 2
+    except ValueError as exc:
+        print(f"天气注意力训练未开始：{exc}", file=sys.stderr)
+        return 2
     with (stop_controller or StopController(args.stop_file, default_directory=root / cfg.checkpoint_root)) as controller, ExitStack() as locks:
         if args.stop:
             controller.request_stop_file()
@@ -109,7 +109,6 @@ def main(argv=None, *, stop_controller=None):
                 report = compare_attention(
                     cfg, root, datasets, info, trained_model, trained, stop_controller=controller
                 )
-                controller.require_running()
                 print(
                     json.dumps(
                         {
@@ -120,6 +119,7 @@ def main(argv=None, *, stop_controller=None):
                         ensure_ascii=False,
                     )
                 )
+                return 0
         except Timeout:
             print("已有天气注意力任务运行中，请读取 progress.json", file=sys.stderr)
             return 2

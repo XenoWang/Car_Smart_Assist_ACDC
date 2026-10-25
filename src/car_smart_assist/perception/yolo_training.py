@@ -146,8 +146,8 @@ def attach_training_state_callbacks(
             "ema": trainer.ema.ema.state_dict(),
             "ema_updates": trainer.ema.updates,
             "torch_rng": torch.get_rng_state(),
-            "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            "cuda_device_ids": _cuda_device_ids() if torch.cuda.is_available() else [],
+            "cuda_rng": torch.cuda.get_rng_state_all() if trainer.device.type == "cuda" else [],
+            "cuda_device_ids": _cuda_device_ids() if trainer.device.type == "cuda" else [],
         }
         path = trainer.wdir / "last_training_state.pt"
         temporary = path.with_suffix(".tmp")

@@ -91,6 +91,7 @@ def trainer(tmp_path):
         start_epoch=1,
         last=last,
         wdir=tmp_path,
+        device=torch.device("cpu"),
     )
 
 

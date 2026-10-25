@@ -30,6 +30,10 @@ from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+class SplitIdentityError(ValueError):
+    """检查点无法证明与当前评估参考分区匹配。"""
+
+
 
 # 数据读取
 
@@ -128,8 +132,10 @@ def eval_fit_quality(
     signature = reference_split_signature(
         ref_paths, acdc_root, scorer.input_size, groups, tr_idx, val_idx, ca_idx, te_idx
     )
-    if not scorer.split_signature or scorer.split_signature != signature:
-        raise ValueError("检查点与评估参考图/四分身份不一致；请使用训练时匹配的数据及配置")
+    if not scorer.split_signature:
+        raise SplitIdentityError("检查点缺少 split_signature，无法验证四分身份；请使用带训练分区身份的检查点")
+    if scorer.split_signature != signature:
+        raise SplitIdentityError("检查点与评估参考图/四分身份不一致；请使用训练时匹配的数据及配置")
     rng = np.random.default_rng(int(dcfg.get("split_seed", 42)))
 
     def probe(idx: np.ndarray):
@@ -460,7 +466,7 @@ def main() -> int:
         ckpt,
         device=resolve_device(device),
         cfg=cfg.get("model", {}),
-        scoring_cfg=cfg.get("scoring", {}),
+        scoring_cfg=cfg.get("scoring"),
     )
     # 检查点决定模型有效尺寸，参考图与真实恶劣图必须沿用同一解码口径。
     size = scorer.input_size
@@ -502,7 +508,11 @@ def main() -> int:
     }
 
     # 重建质量与判档指标分别报告；实际使用的判据由 thresholds 记录。
-    report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
+    try:
+        report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
+    except SplitIdentityError as exc:
+        logger.error("评估已拒绝: %s", exc)
+        return 2
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)
     report["real_adverse"] = eval_real_adverse(
         scorer, gate, acdc_root, size, n, 0,

@@ -202,7 +202,7 @@ def evaluate_run(
 def main() -> int:
     ap = argparse.ArgumentParser(description="能见度门控消融实验")
     ap.add_argument("--config", default="configs/model/visibility.yaml")
-    ap.add_argument("--only", nargs="*", default=None, help="只跑指定 tag")
+    ap.add_argument("--only", nargs="+", default=None, help="只跑指定 tag")
     ap.add_argument("--list", action="store_true", help="只列出预设")
     ap.add_argument("--epochs", type=int, default=None, help="覆盖训练轮数（调试用）")
     ap.add_argument("--force", action="store_true", help="忽略已有结果，全部重跑")
@@ -332,14 +332,53 @@ def main() -> int:
 
         state_path = out_dir / "training_progress.json"
         suite_identity = {p["tag"]: sig for p, _, _, _, sig in prepared}
-        if args.continue_training:
+        if args.continue_training or (args.only is not None and state_path.is_file()):
             if not state_path.is_file():
                 logger.error("--continue 缺少原组进度，不能推测缺失 last 是未开始")
                 return 2
             suite = json.loads(state_path.read_text(encoding="utf-8"))
-            if suite.get("identity") != suite_identity:
-                logger.error("原消融配置或数据身份已改变")
+            if (
+                not isinstance(suite, dict) or not isinstance(suite.get("identity"), dict)
+                or not isinstance(suite.get("groups"), dict)
+            ):
+                logger.error("原消融组进度缺少有效 identity/groups，拒绝覆盖")
                 return 2
+            if args.continue_training:
+                matches = (
+                    all(suite["identity"].get(tag) == sig for tag, sig in suite_identity.items())
+                    if args.only is not None else suite["identity"] == suite_identity
+                )
+                if (
+                    args.only is None and suite["identity"]
+                    and set(suite["identity"]) < set(suite_identity)
+                ):
+                    matches = (
+                        set(suite["groups"]) == set(suite["identity"])
+                        and all(suite_identity[tag] == sig for tag, sig in suite["identity"].items())
+                    )
+                    if matches:
+                        missing = {
+                            tag: sig for tag, sig in suite_identity.items()
+                            if tag not in suite["identity"]
+                        }
+                        for preset, cfg, *_ in prepared:
+                            tag = preset["tag"]
+                            if tag not in missing:
+                                continue
+                            directory = root / cfg["train"]["checkpoint_dir"]
+                            if tag in results or any(
+                                (directory / name).exists() for name in ("last.pt", "best.pt")
+                            ):
+                                logger.error("%s 未记录进度但已有结果或检查点，拒绝推测未开始", tag)
+                                return 2
+                        suite["identity"].update(missing)
+                        suite["groups"].update({tag: {"status": "pending"} for tag in missing})
+                if not matches:
+                    logger.error("原消融配置、数据身份或组进度已改变")
+                    return 2
+            else:
+                suite["identity"].update(suite_identity)
+                suite["groups"].update({p["tag"]: {"status": "pending"} for p in presets})
         else:
             suite = {"identity": suite_identity,
                      "groups": {p["tag"]: {"status": "pending"} for p in presets}}
@@ -354,14 +393,12 @@ def main() -> int:
             temporary.write_text(json.dumps(suite, ensure_ascii=False, indent=2), encoding="utf-8")
             temporary.replace(state_path)
 
-        for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
-            controller.require_running()
-            tag = preset["tag"]
-            directory = root / cfg["train"]["checkpoint_dir"]
-            row = suite["groups"].get(tag, {})
-            group_continue = args.continue_training and row.get("status") != "pending"
-            if args.continue_training:
-                if row.get("status") not in {"pending", "running", "paused", "completed"}:
+        if args.continue_training:
+            for preset, cfg, *_ in prepared:
+                tag = preset["tag"]
+                directory = root / cfg["train"]["checkpoint_dir"]
+                row = suite["groups"].get(tag, {})
+                if not isinstance(row, dict) or row.get("status") not in {"pending", "running", "paused", "completed"}:
                     logger.error("%s 的原组进度缺失或无效", tag)
                     return 2
                 if row.get("status") == "pending":
@@ -378,6 +415,13 @@ def main() -> int:
                     ):
                         logger.error("%s 已完成结果或配对检查点已改变", tag)
                         return 2
+
+        for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
+            controller.require_running()
+            tag = preset["tag"]
+            directory = root / cfg["train"]["checkpoint_dir"]
+            row = suite["groups"].get(tag, {})
+            group_continue = args.continue_training and row.get("status") != "pending"
             if tag in results and not (args.force or args.fresh):
                 if not args.continue_training and all(
                     (directory / item).is_file() for item in ("last.pt", "best.pt")
@@ -412,7 +456,7 @@ def main() -> int:
                 ckpt,
                 device=resolve_device(str(cfg.get("device", "auto"))),
                 cfg=cfg.get("model", {}),
-                scoring_cfg=cfg.get("scoring", {}),
+                scoring_cfg=cfg.get("scoring"),
             )
             if scorer.input_size != inputs["size"]:
                 raise ValueError("有效检查点尺寸与已记录的消融评估尺寸不一致，拒绝发布结果")

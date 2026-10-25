@@ -704,7 +704,10 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
         "pretrained_sha256": hashlib.sha256(weights.read_bytes()).hexdigest(),
         "baseline_hashes": baseline_hashes,
     }
-    cuda_devices = [device.index or torch.cuda.current_device()] if device.type == "cuda" else []
+    cuda_devices = (
+        [device.index if device.index is not None else torch.cuda.current_device()]
+        if device.type == "cuda" else []
+    )
     with torch.random.fork_rng(devices=cuda_devices):
         torch.manual_seed(cfg.data["seed"])
         model = WeatherAttention(cfg, weights).to(device)
@@ -1030,7 +1033,7 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
             save_attention_best(payload, best_path)
         last = torch.load(last_path, map_location="cpu", weights_only=True)
         last["best_sha256"] = hashlib.sha256(best_path.read_bytes()).hexdigest()
-        if continue_only and last["training_complete"]:
+        if last["training_complete"]:
             last.update(manual_stop=False, termination_reason=(
                 "budget_completed" if last["epoch"] == cfg.train["epochs"] else "early_stopping"
             ))
