@@ -5,7 +5,7 @@
 [![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)](#环境要求)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.8%20%7C%20CUDA%2012.9-EE4C2C?logo=pytorch&logoColor=white)](#环境要求)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![Star this repo](https://img.shields.io/badge/%E2%AD%90%20Star%20this%20repo-yellow?style=for-the-badge&logo=github)](https://github.com/XenoWang/Car_Smart_Assist_ACDC)
+[![Star this repo](https://img.shields.io/badge/Star%20this%20repo-yellow?logo=github&logoColor=white)](https://github.com/XenoWang/Car_Smart_Assist_ACDC)
 
 Car Smart Assist 从单帧道路图像出发，先判断画面是否足以支撑感知，再识别雾、雨、雪、夜间等环境属性，检测交通目标与道路杂物，最后输出风险等级、司机提示和接管请求。
 
