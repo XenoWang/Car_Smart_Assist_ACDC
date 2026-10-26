@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 import torch
 
@@ -59,6 +61,42 @@ def test_ineligible_crowded_class_cannot_use_the_nms_quantity_budget():
     assert output.shape == (1, 6)
     assert output[0, 4].item() == pytest.approx(0.4)
     assert output[0, 5].item() == 1
+
+
+def test_nms_hand_calculated_overlap_classes_order_and_max_det():
+    # Independent geometry oracle: identical 10x10 boxes have IoU=1; separated
+    # boxes have IoU=0. Same-class suppresses, class-aware keeps other classes,
+    # agnostic suppresses cross-class duplicates, and max_det keeps top scores.
+    rows = [
+        [20, 20, 10, 10, 0.90, 0.10],
+        [20, 20, 10, 10, 0.80, 0.10],
+        [20, 20, 10, 10, 0.10, 0.85],
+        [50, 20, 10, 10, 0.70, 0.10],
+        [80, 20, 10, 10, 0.10, 0.95],
+    ]
+    predictions = _raw(rows)
+
+    def run(*, agnostic, max_det):
+        return postprocess_detection(
+            predictions, nc=2, mode=YOLO_LOCKED_MODE, confidence=0.1,
+            class_thresholds={"car": 0.1, "truck": 0.1},
+            names=["car", "truck"], iou=0.5, max_det=max_det,
+            agnostic=agnostic,
+        )[0]
+
+    class_aware = run(agnostic=False, max_det=10)
+    assert class_aware[:, 4].tolist() == pytest.approx([0.95, 0.90, 0.85, 0.70])
+    assert class_aware[:, 5].tolist() == [1.0, 0.0, 1.0, 0.0]
+    assert class_aware[:, :4].tolist() == [
+        [75.0, 15.0, 85.0, 25.0], [15.0, 15.0, 25.0, 25.0],
+        [15.0, 15.0, 25.0, 25.0], [45.0, 15.0, 55.0, 25.0],
+    ]
+
+    agnostic = run(agnostic=True, max_det=10)
+    assert agnostic[:, 4].tolist() == pytest.approx([0.95, 0.90, 0.70])
+    assert agnostic[:, 5].tolist() == [1.0, 0.0, 0.0]
+    top_two = run(agnostic=False, max_det=2)
+    assert top_two[:, 4].tolist() == pytest.approx([0.95, 0.90])
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -158,33 +196,72 @@ def test_raw_scores_and_thresholds_reject_invalid_numeric_values(invalid):
 
 
 def test_calibration_path_versions_and_legacy_identity_fails_closed(tmp_path):
-    cfg = {"calibration_file": "reports/calibration.json", "inference": {}}
+    cfg = {
+        "calibration_file": "reports/calibration.json",
+        "inference": {"imgsz": 640, "iou": 0.5, "max_det": 10},
+    }
     path = calibration_path(tmp_path, cfg)
-    assert path.parent.name == "best_class_threshold_v1"
-    legacy = tmp_path / "reports" / "calibration.json"
-    legacy.parent.mkdir(parents=True)
-    legacy.write_text('{"confidence_threshold": 0.5}', encoding="utf-8")
-    with pytest.raises((OSError, ValueError, KeyError)):
+    assert path == tmp_path / "reports" / "best_class_threshold_v1" / "calibration.json"
+    assert calibration_path(
+        tmp_path, cfg, "isolated-run/detection"
+    ) == tmp_path / "isolated-run" / "detection" / "best_class_threshold_v1" / "calibration.json"
+    # 旧格式校准文件必须位于带版本号的真实路径上，才会被 load_calibration 读到；
+    # 否则加载器先因文件缺失报 OSError，旧的“身份缺失”拒绝逻辑根本没有被验证。
+    path.parent.mkdir(parents=True)
+    path.write_text('{"confidence_threshold": 0.5}', encoding="utf-8")
+    checkpoint = tmp_path / "weights.pt"
+    checkpoint.write_bytes(b"fixture weights")
+    with pytest.raises(ValueError, match="identity/settings changed or format is obsolete"):
         load_calibration(
-            tmp_path, cfg, ["car"], checkpoint=tmp_path / "missing.pt",
+            tmp_path, cfg, ["car"], checkpoint=checkpoint,
             manifest={"classes": ["car"], "signature": "fixture"},
         )
 
 
 def test_calibration_identity_binds_checkpoint_dataset_and_postprocess(tmp_path):
     checkpoint = tmp_path / "weights.pt"
-    checkpoint.write_bytes(b"fixture weights")
+    checkpoint_bytes = b"known checkpoint bytes\x00v1"
+    checkpoint.write_bytes(checkpoint_bytes)
     cfg = {
         "checkpoint": "weights.pt", "data": "data.yaml",
         "inference": {"imgsz": 640, "iou": 0.5, "max_det": 10},
     }
-    manifest = {"classes": ["car", "truck"], "signature": "fixture-data"}
+    manifest = {"classes": ["car", "truck"], "signature": "dataset-sha256-4c1"}
     identity = calibration_identity(tmp_path, cfg, ["car", "truck"], checkpoint, manifest)
-    assert identity["class_selection"] == "original_best_class_only"
-    assert identity["threshold_comparison"] == ">="
-    assert identity["postprocess_version"] == "best_class_threshold_v1"
-    with pytest.raises(ValueError, match="identity/settings changed"):
-        validate_calibration({"schema_version": 1}, identity, ["car", "truck"])
+    expected = {
+        "schema_version": 2,
+        "postprocess_version": "best_class_threshold_v1",
+        "mode": "locked",
+        "calibration_selection_mode": "proposal_sweep",
+        "ap_mode": "ap_sweep",
+        "sweep_confidence": 0.001,
+        "checkpoint_sha256": hashlib.sha256(checkpoint_bytes).hexdigest(),
+        "dataset_signature": "dataset-sha256-4c1",
+        "classes": [{"id": 0, "name": "car"}, {"id": 1, "name": "truck"}],
+        "imgsz": 640,
+        "nms_iou": 0.5,
+        "max_det": 10,
+        "max_nms": 30000,
+        "max_wh": 7680,
+        "agnostic_nms": False,
+        "class_selection": "original_best_class_only",
+        "threshold_comparison": ">=",
+    }
+    assert set(identity) == set(expected)
+    for key, value in expected.items():
+        assert identity[key] == value
+    for key, wrong in (
+        ("checkpoint_sha256", "0" * 64),
+        ("dataset_signature", "other-dataset"),
+        ("classes", [{"id": 0, "name": "truck"}, {"id": 1, "name": "car"}]),
+        ("imgsz", 320),
+        ("nms_iou", 0.6),
+        ("max_det", 11),
+    ):
+        tampered = dict(expected)
+        tampered[key] = wrong
+        with pytest.raises(ValueError, match="identity/settings changed"):
+            validate_calibration(tampered, expected, ["car", "truck"])
 
 
 @pytest.mark.parametrize("requested,expected", [

@@ -72,8 +72,11 @@ def model_checkpoints(work, name):
 def checkpoint_records(work, stage):
     if stage["name"] == "weather-preflight":
         return {}
+    paths = model_checkpoints(work, stage["name"])
+    if stage["name"] == "visibility":
+        paths["transaction_journal"] = paths["last"].parent / ".visibility_checkpoint_transaction/journal.json"
     return {key: {"path": str(path), "sha256": digest(path) if path.is_file() else None}
-            for key, path in model_checkpoints(work, stage["name"]).items()}
+            for key, path in paths.items()}
 
 
 def source_identity():
@@ -133,7 +136,7 @@ def require_terminal_children(state):
                 raise ValueError("Previous child terminal state is unconfirmed; preserve the run for manual inspection")
 
 
-def verify_identity(state):
+def verify_identity(state, work):
     require_terminal_children(state)
     if state.get("format_version") != 1:
         raise ValueError("Unsupported pipeline state")
@@ -143,6 +146,17 @@ def verify_identity(state):
         if not Path(path).is_file() or digest(path) != expected:
             raise ValueError(f"Training config changed/missing; continue refused: {path}")
     for stage in state["stages"]:
+        if stage["name"] == "visibility":
+            journal = model_checkpoints(work, "visibility")["last"].parent / ".visibility_checkpoint_transaction/journal.json"
+            record = stage.get("checkpoints", {}).get("transaction_journal")
+            if journal.is_symlink() or journal.resolve() != journal:
+                raise ValueError("Visibility transaction journal must remain inside the run directory")
+            if journal.exists() and (not journal.is_file() or journal.stat().st_nlink != 1):
+                raise ValueError("Visibility transaction journal must be a regular non-linked file")
+            if record is None and journal.exists():
+                raise ValueError("Unrecorded visibility checkpoint transaction; continue refused")
+            if record is not None and Path(record["path"]) != journal:
+                raise ValueError("Recorded visibility transaction path differs from this run")
         for record in stage.get("checkpoints", {}).values():
             path, expected = Path(record["path"]), record["sha256"]
             if (digest(path) if path.is_file() else None) != expected:
@@ -157,17 +171,29 @@ def execute(work, state, controller):
             state.update(status="PAUSED", termination_reason="manual_stop")
             save_state(work, state)
             return STOP_EXIT_CODE
-        verify_identity(state)
+        verify_identity(state, work)
+        if controller.requested:
+            state.update(status="PAUSED", termination_reason="manual_stop")
+            save_state(work, state)
+            return STOP_EXIT_CODE
         command = list(stage["command"])
         if stage["name"] != "weather-preflight" and stage["attempts"]:
             records = stage.get("checkpoints", {})
+            expected_records = set(model_checkpoints(work, stage["name"]))
+            if stage["name"] == "visibility":
+                expected_records.add("transaction_journal")
             if records.get("last", {}).get("sha256") is not None:
                 command.append("--continue")
-            elif stage["status"] == "PAUSED" and records and all(
+            elif stage["name"] == "visibility" and records.get("transaction_journal", {}).get("sha256") is not None:
+                # The child alone recovers this recorded transaction while holding run.lock.
+                command.append("--continue")
+            elif stage["status"] in {"PAUSED", "FAILED"} and (
+                records.keys() == expected_records
+            ) and all(
                 record["sha256"] is None for record in records.values()
             ):
-                # Exit75 before the first complete epoch has no saved progress to restore.
-                # The isolated output is still empty: restart this untouched step, not the queue.
+                # A terminal pause/failure before any tracked artifact has no saved progress.
+                # Restart only this untouched step; partial artifact sets remain refused.
                 pass
             else:
                 raise ValueError(f"No paired last checkpoint for unfinished step: {stage['name']}")
@@ -217,7 +243,10 @@ def execute(work, state, controller):
             stage["status"] = "FAILED"
             state.update(status="FAILED", termination_reason=f"child_exit_{code}")
         else:
-            if any(record["sha256"] is None for record in stage["checkpoints"].values()):
+            if stage["name"] != "weather-preflight" and any(
+                stage["checkpoints"][key]["sha256"] is None
+                for key in model_checkpoints(work, stage["name"])
+            ):
                 stage["status"] = "FAILED"
                 state.update(status="FAILED", termination_reason="missing_checkpoint")
                 save_state(work, state)
@@ -261,36 +290,60 @@ def main(argv=None):
     if not work.resolve().is_relative_to(directory) or work.is_symlink():
         raise ValueError("Pipeline current directory must remain inside its run directory")
     with FileLock(str(directory / "pipeline.lock"), timeout=0):
+        marker_paths = [controller.path]
         if options.continue_run:
             for name in ("weather", "visibility", "detection"):
-                controller.watch_directory(model_checkpoints(work, name)["last"].parent)
-        # Clear the previous run's markers before handling this invocation's stops.
-        controller.resume()
+                checkpoint_directory = model_checkpoints(work, name)["last"].parent
+                controller.watch_directory(checkpoint_directory)
+                marker_paths.append(checkpoint_directory / "STOP")
+
+        def marker_identity(path):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return None
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+        previous_markers = {path: marker_identity(path) for path in marker_paths}
+        signal_received = False
         with controller:
             def request_stop(_signum, _frame):
+                nonlocal signal_received
+                signal_received = True
                 controller.request_stop_file()
             for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
                 signum = getattr(signal, name, None)
                 if signum is not None:
                     signal.signal(signum, request_stop)
+            state = None
+            path = work / "state.json"
+            if work.exists():
+                if not path.is_file():
+                    raise ValueError("Existing current directory has no pipeline state; preserve it for inspection")
+                state = json.loads(path.read_text(encoding="utf-8"))
+                require_terminal_children(state)
+                if options.continue_run:
+                    verify_identity(state, work)
+            elif options.continue_run:
+                raise ValueError("No saved training queue; use --fresh explicitly to start one")
+            # Refused checks never remove STOP. Distinguish this invocation's signals
+            # and changed markers from stale requests before clearing the old markers.
+            if signal_received or any(
+                marker_identity(path) != previous for path, previous in previous_markers.items()
+            ):
+                controller.request()
+            else:
+                controller.resume()
+                if signal_received:
+                    controller.request_stop_file()
             if options.fresh:
                 if work.exists():
-                    if not (work / "state.json").is_file():
-                        raise ValueError("Existing current directory has no pipeline state; refusing to archive unrelated files")
-                    previous = json.loads((work / "state.json").read_text(encoding="utf-8"))
-                    require_terminal_children(previous)
                     controller.require_running()
                     archived = directory / "history" / timestamp()
                     archived.parent.mkdir(parents=True, exist_ok=True)
                     os.replace(work, archived)
                 controller.require_running()
                 state = prepare(work, options)
-            else:
-                path = work / "state.json"
-                if not path.is_file():
-                    raise ValueError("No saved training queue; use --fresh explicitly to start one")
-                state = json.loads(path.read_text(encoding="utf-8"))
-                verify_identity(state)
             print(f"Training queue: {work / 'state.json'}; STOP: {controller.path}", flush=True)
             return execute(work, state, controller)
 

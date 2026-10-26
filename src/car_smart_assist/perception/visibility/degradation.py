@@ -77,6 +77,8 @@ def add_occlusion(img: np.ndarray, severity: float, rng: np.random.Generator,
 def add_blur(img: np.ndarray, severity: float, rng: np.random.Generator,
              kernel_max: int = 41) -> tuple[np.ndarray, DegradationSpec]:
     """模糊模拟：高斯模糊。用可分离卷积实现，不引入 scipy 依赖。"""
+    if severity == 0:
+        return img.copy(), DegradationSpec("blur", severity, {"sigma": 0.0})
     sigma = 0.5 + (kernel_max / 6.0 - 0.5) * severity
     radius = int(max(1, round(sigma * 3)))
     x = np.arange(-radius, radius + 1, dtype=np.float32)

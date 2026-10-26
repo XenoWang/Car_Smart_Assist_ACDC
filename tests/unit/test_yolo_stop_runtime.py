@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 
@@ -55,16 +56,25 @@ def _write_tiny_detection_dataset(root):
 def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved_target(
     tmp_path, monkeypatch
 ):
+    vendor_environment = ("CUDA_VISIBLE_DEVICES", "CUBLAS_WORKSPACE_CONFIG", "PYTHONHASHSEED")
+    previous_environment = {key: os.environ.get(key) for key in vendor_environment}
     # Configure project-local settings before importing Ultralytics.
     from car_smart_assist.perception.detection_yolo import configure_yolo_environment
 
     monkeypatch.setenv("YOLO_CONFIG_DIR", str(tmp_path / "artifacts/ultralytics_settings"))
     configure_yolo_environment(tmp_path)
+    # Entry snapshots are the independent state oracle; cleanup that restores only
+    # thread count would leave Python/NumPy/Torch RNG or deterministic flags changed.
+    # Preserve live CUDA RNG before the availability stub and any manual_seed path.
+    previous_cuda_rng = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     previous_threads = torch.get_num_threads()
     previous_rng = torch.get_rng_state()
     previous_python_rng, previous_numpy_rng = random.getstate(), np.random.get_state()
     previous_deterministic = torch.are_deterministic_algorithms_enabled()
+    previous_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    previous_cudnn_benchmark = torch.backends.cudnn.benchmark
+    previous_cudnn_deterministic = torch.backends.cudnn.deterministic
     torch.set_num_threads(1)
     try:
         import ultralytics
@@ -271,4 +281,38 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         assert completed_state["checkpoint_sha256"] == hashlib.sha256(last.read_bytes()).hexdigest()
         assert completed_state["best_checkpoint_sha256"] == hashlib.sha256(best.read_bytes()).hexdigest()
     finally:
-        torch.set_num_threads(previous_threads)
+        try:
+            random.setstate(previous_python_rng)
+            np.random.set_state(previous_numpy_rng)
+            torch.set_rng_state(previous_rng)
+            if previous_cuda_rng is not None:
+                torch.cuda.set_rng_state_all(previous_cuda_rng)
+            torch.use_deterministic_algorithms(previous_deterministic, warn_only=previous_warn_only)
+            torch.backends.cudnn.benchmark = previous_cudnn_benchmark
+            torch.backends.cudnn.deterministic = previous_cudnn_deterministic
+            torch.set_num_threads(previous_threads)
+        finally:
+            for key, value in previous_environment.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+    assert random.getstate() == previous_python_rng
+    restored_numpy_rng = np.random.get_state()
+    assert restored_numpy_rng[0] == previous_numpy_rng[0]
+    np.testing.assert_array_equal(restored_numpy_rng[1], previous_numpy_rng[1])
+    assert restored_numpy_rng[2:] == previous_numpy_rng[2:]
+    assert torch.equal(torch.get_rng_state(), previous_rng)
+    assert torch.get_num_threads() == previous_threads
+    assert torch.are_deterministic_algorithms_enabled() is previous_deterministic
+    assert torch.is_deterministic_algorithms_warn_only_enabled() is previous_warn_only
+    assert torch.backends.cudnn.benchmark is previous_cudnn_benchmark
+    assert torch.backends.cudnn.deterministic is previous_cudnn_deterministic
+    assert {key: os.environ.get(key) for key in vendor_environment} == previous_environment
+    if previous_cuda_rng is not None:
+        restored_cuda_rng = torch.cuda.get_rng_state_all()
+        assert len(restored_cuda_rng) == len(previous_cuda_rng)
+        assert all(
+            torch.equal(actual, expected)
+            for actual, expected in zip(restored_cuda_rng, previous_cuda_rng, strict=True)
+        )

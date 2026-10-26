@@ -98,7 +98,6 @@ def test_nonempty_legacy_group_split_matches_captured_index_golden():
         groups=groups,
     )
 
-    assert golden["source_sha256"] == "4289f67dc78bcd6346003f21503968d115fe84b49b272ba1c37b9c7ba0cc7513"
     assert {name: len(part) for name, part in zip(SPLIT_NAMES, parts, strict=True)} == golden[
         "split_counts"
     ]

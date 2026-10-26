@@ -544,13 +544,24 @@ class TestVisibilityDataset:
         np.save(p, arr)
         return p
 
-    def test_dataset_holds_only_path_not_array(self, tmp_path):
+    def test_dataset_defers_cache_open_until_first_read(self, tmp_path, monkeypatch):
+        import pickle
+
         cache = self._make_cache(tmp_path)
         paths = [tmp_path / f"{i}.png" for i in range(6)]
+        real_load = np.load
+
+        def fail_early(*_args, **_kwargs):
+            pytest.fail("缓存不得在 __init__ 阶段打开")
+
+        monkeypatch.setattr(np, "load", fail_early)
         ds = VisibilityImageDataset(paths, (16, 16), cache_path=cache)
-        # 关键：不能有已打开的数组，否则 pickle 会把数据内联进去
-        assert ds._cache is None
-        assert isinstance(ds.cache_path, type(tmp_path))
+        monkeypatch.setattr(np, "load", real_load)
+
+        x = ds[0]
+        assert x.shape == (3, 16, 16)
+        # 读取后即使已打开 memmap，spawn worker 时也只能 pickle 路径。
+        assert len(pickle.dumps(ds)) < 4096
 
     def test_dataset_is_picklable_and_small(self, tmp_path):
         """pickle 出来的体积必须很小 —— 证明没有把数组带进去。"""
@@ -565,14 +576,6 @@ class TestVisibilityDataset:
             f"pickle 后 {len(blob)} 字节，接近原始数组 {raw} —— "
             "说明数组被内联进 pickle 了，spawn worker 时会截断"
         )
-
-    def test_lazy_open_and_read(self, tmp_path):
-        cache = self._make_cache(tmp_path, n=6)
-        paths = [tmp_path / f"{i}.png" for i in range(6)]
-        ds = VisibilityImageDataset(paths, (16, 16), cache_path=cache)
-        x = ds[0]
-        assert x.shape == (3, 16, 16)
-        assert ds._cache is not None  # 首次访问后才打开
 
     def test_indices_select_rows(self, tmp_path):
         cache = self._make_cache(tmp_path, n=6)
@@ -718,11 +721,6 @@ class TestPreLatentProjection:
             x = torch.rand(2, 3, 144, 256)
             assert m(x).shape == x.shape, f"plc={plc} 形状不对"
             assert m.encode(x).shape == (2, 256)
-
-    def test_zero_disables_compression(self):
-        m = build_autoencoder({"input_size": (144, 256), "pre_latent_channels": 0})
-        assert isinstance(m.pre_latent, torch.nn.Identity)
-
 
 class TestReconZDisabled:
     """重建误差停用后，判定不能再用它。

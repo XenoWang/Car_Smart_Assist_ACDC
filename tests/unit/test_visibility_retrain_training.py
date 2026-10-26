@@ -42,8 +42,10 @@ def _config(tmp_path, *, epochs=5, seed=42, patience=2, min_delta=1e-5):
     }
 
 
-def _trainer_with_controlled_validation(tmp_path, monkeypatch, losses, *, epochs=5):
-    trainer = VisibilityTrainer(_config(tmp_path, epochs=epochs), project_root=tmp_path, resume="none")
+def _trainer_with_controlled_validation(tmp_path, monkeypatch, losses, *, epochs=5, resume="none"):
+    trainer = VisibilityTrainer(
+        _config(tmp_path, epochs=epochs), project_root=tmp_path, resume=resume
+    )
     samples = torch.linspace(0, 1, 4 * 3 * 32 * 32).reshape(4, 3, 32, 32)
     class TensorRows:
         def __len__(self):
@@ -268,17 +270,19 @@ class _TrainingInterrupted(RuntimeError):
 def _interrupt_after_saved_last(monkeypatch, epoch):
     import car_smart_assist.perception.visibility.trainer as training
 
-    original = training._atomic_save
+    original = training._publish_checkpoint_transaction
     interrupted = False
 
-    def save_then_interrupt(payload, path):
+    def publish_then_interrupt(directory, updates):
         nonlocal interrupted
-        original(payload, path)
-        if path.name == "last.pt" and payload["epoch"] == epoch and not interrupted:
+        result = original(directory, updates)
+        payload = updates.get("last.pt")
+        if payload is not None and payload["epoch"] == epoch and not interrupted:
             interrupted = True
             raise _TrainingInterrupted(f"simulated interruption after epoch {epoch} last save")
+        return result
 
-    monkeypatch.setattr(training, "_atomic_save", save_then_interrupt)
+    monkeypatch.setattr(training, "_publish_checkpoint_transaction", publish_then_interrupt)
     return lambda: interrupted
 
 
@@ -392,10 +396,9 @@ def test_early_stopped_resume_extends_from_current_lr_and_optimizer_state(
 
     monkeypatch.setattr(torch.optim.AdamW, "step", record_step)
     resumed = _trainer_with_controlled_validation(
-        tmp_path, monkeypatch, [0.9, 0.8, 0.7, 0.6], epochs=6
+        tmp_path, monkeypatch, [0.9, 0.8, 0.7, 0.6], epochs=6, resume=checkpoint
     )
     resumed.cfg["train"]["early_stopping"]["patience"] = 10
-    resumed.resume_path = checkpoint
     history = resumed.fit()
 
     assert history.termination_reason == "budget_completed"
@@ -427,11 +430,10 @@ def test_interrupted_extra_budget_segment_does_not_add_extra_epochs_again(
 
     def configured_resume(losses):
         resumed = _trainer_with_controlled_validation(
-            tmp_path, monkeypatch, losses, epochs=10
+            tmp_path, monkeypatch, losses, epochs=10, resume=checkpoint
         )
         resumed.cfg["train"]["resume_extra_epochs"] = 4
         resumed.cfg["train"]["early_stopping"]["patience"] = 10
-        resumed.resume_path = checkpoint
         return resumed
 
     interrupted_at_four = configured_resume([0.9, 0.8])
@@ -482,10 +484,9 @@ def test_no_improvement_resume_restores_original_best_state_and_metrics(tmp_path
     original_best_loss = original_best["best_val_loss"]
 
     resumed = _trainer_with_controlled_validation(
-        tmp_path, monkeypatch, [1.1, 1.1, 1.1, 1.1], epochs=6
+        tmp_path, monkeypatch, [1.1, 1.1, 1.1, 1.1], epochs=6, resume=checkpoint
     )
     resumed.cfg["train"]["early_stopping"]["enabled"] = False
-    resumed.resume_path = checkpoint
     history = resumed.fit()
 
     final_best = torch.load(

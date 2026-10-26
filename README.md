@@ -33,7 +33,7 @@ Car Smart Assist 从单帧道路图像出发，先判断画面是否足以支撑
 | **目标检测** | YOLO11n 检测 car、truck、bus、motorcycle、bicycle、person、rider、train 八类交通目标，并输出道路杂物候选 |
 | **风险与接管** | 规则引擎综合目标、天气风险倍率、置信度与可用的距离 / 方向信息；证据缺失时保守请求接管 |
 | **可解释输出** | JSON 中包含风险证据、天气概率、检测可用性、跳过阶段与分阶段耗时；提示文案带越权措辞检查 |
-| **工程能力** | 固定随机种子、CPU/CUDA 自动选择、批量推理、训练检查点恢复、坏帧逐帧隔离、980+ 自动化测试 |
+| **工程能力** | 固定随机种子、CPU/CUDA 自动选择、批量推理、训练检查点恢复、坏帧逐帧隔离、自动化单元与集成测试 |
 
 ## 系统架构
 
@@ -185,12 +185,12 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 ### 数据清洗
 
 ```powershell
-.venv\Scripts\python.exe scripts\clean_data.py --dataset acdc
-.venv\Scripts\python.exe scripts\clean_data.py --dataset pixel_accurate_benchmark
+.venv\Scripts\python.exe scripts\clean_data.py --only acdc
+.venv\Scripts\python.exe scripts\clean_data.py --only pixel_accurate_benchmark
 .venv\Scripts\python.exe scripts\clean_data.py --config configs/data/cleaning_lost_and_found.yaml
 ```
 
-清洗只报告损坏文件，不修改或删除原始数据。
+清洗生成数据可用性清单与报告，不修改或删除原始数据。
 
 ### 三个模型
 
@@ -198,11 +198,13 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 
 ```powershell
 # 训练前检查数据、权重与显存
-.venv\Scripts\python.exe -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_a.yaml --preflight
+.venv\Scripts\python.exe -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_train.yaml --preflight
 
 # 训练
-.venv\Scripts\python.exe -u -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_a.yaml
+.venv\Scripts\python.exe -u -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_train.yaml
 ```
+
+训练使用 `weather_attention_train.yaml`，检查点和报告保存到独立实验目录；推理通过 `weather_default.yaml` 选择天气模型及权重。
 
 #### 能见度自编码器
 
@@ -229,14 +231,16 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 
 ```powershell
 # 天气：训练预算完成后重复训练命令，会重新导出评估结果
-.venv\Scripts\python.exe -u -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_a.yaml
+.venv\Scripts\python.exe -u -X utf8 scripts\train_weather_attention.py --config configs/model/weather_attention_train.yaml
 
-# 能见度
-.venv\Scripts\python.exe scripts\evaluate_visibility.py --config configs/model/visibility.yaml
+# 能见度：将检查点路径替换为实际训练产物
+.venv\Scripts\python.exe scripts\evaluate_visibility.py --config configs/model/visibility.yaml --checkpoint "<能见度检查点路径>"
 
 # 检测（在 test 划分上评估）
 .venv\Scripts\python.exe scripts\evaluate_detection.py --config configs/model/yolo_detection.yaml --split test
 ```
+
+能见度评估的检查点必须与训练数据清单和划分配置匹配；使用 `--checkpoint` 指定要评估的权重。
 
 端到端性能量测：
 

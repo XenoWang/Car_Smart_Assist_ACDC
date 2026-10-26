@@ -202,7 +202,10 @@ def test_fix_p3_02_weather_main_early_compare_stop_and_pipeline_boundary(tmp_pat
             return 0
     monkeypatch.setattr(pipeline, "save_state", lambda *_: None)
     monkeypatch.setattr(pipeline, "verify_identity", lambda *_: calls.append("identity"))
-    monkeypatch.setattr(pipeline, "checkpoint_records", lambda *_: {"last": {"sha256": "synthetic"}})
+    monkeypatch.setattr(pipeline, "checkpoint_records", lambda *_: {
+        "best": {"sha256": "synthetic-best"},
+        "last": {"sha256": "synthetic-last"},
+    })
     monkeypatch.setattr(pipeline, "subprocess", SimpleNamespace(Popen=lambda *_a, **_k: calls.append("spawn") or Child(), DEVNULL=object()))
     assert pipeline.execute(work, state, controller) == pipeline.STOP_EXIT_CODE
     assert calls.count("spawn") == 1
@@ -228,11 +231,9 @@ def test_fix_p3_03_cpu_yolo_state_saves_no_cuda_and_restores_without_gpu(tmp_pat
     )
     callbacks["on_model_save"](saved)
     state_path = tmp_path / "last_training_state.pt"
-    disk_oracle = torch.load(state_path, map_location="cpu", weights_only=True)
     resume_state = torch.load(state_path, map_location="cpu", weights_only=True)
-    assert disk_oracle["cuda_rng"] == resume_state["cuda_rng"] == []
-    assert disk_oracle["cuda_device_ids"] == resume_state["cuda_device_ids"] == []
-    assert disk_oracle["checkpoint_sha256"] == resume_state["checkpoint_sha256"]
+    assert resume_state["cuda_rng"] == []
+    assert resume_state["cuda_device_ids"] == []
 
     # Construct CPU optimizer state before simulating an available CUDA runtime.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
@@ -243,8 +244,8 @@ def test_fix_p3_03_cpu_yolo_state_saves_no_cuda_and_restores_without_gpu(tmp_pat
         training_segment=helper.TRAINING_SEGMENT,
     )
     callbacks["on_train_start"](restored)
-    assert torch.equal(restored.model.weight, disk_oracle["model"]["weight"])
-    assert restored._project_best_checkpoint_sha256 == disk_oracle["best_checkpoint_sha256"]
+    assert torch.equal(restored.model.weight, resume_state["model"]["weight"])
+    assert restored._project_best_checkpoint_sha256 == resume_state["best_checkpoint_sha256"]
 
 
 def test_fix_p3_04_split_identity_errors_are_distinct_and_match_still_scores(tmp_path, monkeypatch):
@@ -259,8 +260,11 @@ def test_fix_p3_04_split_identity_errors_are_distinct_and_match_still_scores(tmp
         path.write_bytes(b"synthetic")
     refs = [np.zeros((4, 4, 3), dtype=np.uint8) for _ in paths]
     cfg = {"split_by_sequence": False}
-    gate = SimpleNamespace(judge_many=lambda scores: ["ok" for _ in scores])
-    monkeypatch.setattr(module, "summarize", lambda _values: {"blind": 0.0})
+    gate = SimpleNamespace(
+        judge_many=lambda scores: [
+            SimpleNamespace(level=SimpleNamespace(value="blind")) for _ in scores
+        ]
+    )
 
     for signature, phrase in ((None, "缺少 split_signature"), ("stale", "身份不一致")):
         scorer = SimpleNamespace(input_size=(4, 4), split_signature=signature,
@@ -274,7 +278,7 @@ def test_fix_p3_04_split_identity_errors_are_distinct_and_match_still_scores(tmp
         score_arrays=lambda *_: calls.append(1) or [SimpleNamespace(recon_mean=1.0, information=0.5)],
     )
     result = module.eval_fit_quality(scorer, refs, paths, cfg, gate, 1)
-    assert result["test_false_positive_rate"] == 0.0 and len(calls) == 4
+    assert result["test_false_positive_rate"] == 1.0 and len(calls) == 4
 
 
 def test_fix_p3_04_cli_returns_two_without_traceback_or_report_on_missing_identity(tmp_path, monkeypatch, capsys):

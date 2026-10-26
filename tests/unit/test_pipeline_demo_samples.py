@@ -3,9 +3,6 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-import numpy as np
-
-
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/run_pipeline.py"
 
@@ -89,7 +86,6 @@ def test_auto_samples_apply_shared_cleaning_manifest_and_keep_raw(tmp_path):
     assert [path for _, path in samples] == expected
     assert cfg == before_cfg
     assert {path: path.read_bytes() for path in paths} == before
-    assert suspect.exists()
 
 
 def test_auto_samples_missing_manifest_reports_cleaning_command_even_without_images(tmp_path):

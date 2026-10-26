@@ -57,8 +57,12 @@ def test_visibility_scoring_accepts_a_valid_override():
                                       "edge_density": 1.0, "hf_ratio": 0.0},
                         "power": -1.0, "feature_floor": 0.1},
     }
-    score = information_score(InformationFeatures(0.2, 2.0, 0.3, 0.4), scoring_cfg=scoring)
-    assert np.isfinite(score) and 0.0 <= score <= 1.0
+    scoring["aggregation"]["weights"]["entropy"] = 2.0
+    features = InformationFeatures(0.2, 0.4, 0.8, 1.0)
+    score = information_score(features, scoring_cfg=scoring)
+    # 归一化特征为 0.2/0.4/0.8/1.0，权重为 1/2/1/0：
+    # M_-1 = ( (5 + 2*2.5 + 1.25) / 4 )^-1 = 16/45。
+    assert score == pytest.approx(16 / 45)
 
 
 def test_rect_pad_joint_roi_uses_actual_intermediate_image_size(monkeypatch):

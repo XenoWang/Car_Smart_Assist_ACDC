@@ -419,4 +419,6 @@ def test_individual_stop_action_never_starts_model_or_reads_dataset(
     monkeypatch.setattr(module, guard_name, lambda *_a, **_k: pytest.fail("stop performed training/data work"))
     assert module.main() == 0
     assert (output / "STOP").is_file()
-    assert not (output / "history").exists()
+    # train_detection 归档到 <project>/<name>/history；output 已下钻到 weights，
+    # 因此要回到 run 目录检查，否则断言永远看不到归档产物。
+    assert not (output.parent / "history").exists()

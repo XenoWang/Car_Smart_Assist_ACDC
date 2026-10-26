@@ -467,8 +467,8 @@ def test_continue_stop_during_identity_check_is_preserved(tmp_path, monkeypatch,
     stop = root / run_dir / "STOP"
     verify = pipeline.verify_identity
 
-    def request_during_verify(state):
-        verify(state)
+    def request_during_verify(state, work):
+        verify(state, work)
         if request_kind == "file":
             stop.touch()
         else:

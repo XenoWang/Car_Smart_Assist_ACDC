@@ -103,8 +103,17 @@ def test_empty_detection_export_fails_before_writing(tmp_path, monkeypatch):
     from car_smart_assist.data import detection
 
     monkeypatch.setattr(detection, "read_detection_annotations", lambda *_: ([], {}, {}))
+    official_index = tmp_path / "data/raw/acdc/gt_detection/instancesonly_test_image_info.json"
+    official_index.parent.mkdir(parents=True)
+    official_index.write_text(json.dumps({"images": [], "annotations": []}), encoding="utf-8")
+    cfg = {
+        "acdc_root": "data/raw/acdc",
+        "official_test_index": "gt_detection/instancesonly_test_image_info.json",
+        "output_root": "data/processed/new",
+        "integrity_workers": 1,
+    }
     with pytest.raises(ValueError, match="No eligible"):
-        detection.prepare_detection_data(tmp_path, {"output_root": "data/processed/new", "integrity_workers": 1})
+        detection.prepare_detection_data(tmp_path, cfg)
     assert not (tmp_path / "data/processed/new").exists()
 
 
@@ -461,7 +470,6 @@ def test_plain_attention_result_preserves_non_swad_consumer_contract(tmp_path, m
     _, trained = training.train_attention(cfg, tmp_path, datasets, split, fresh=True)
     assert "selected_kind" not in trained and "swad" not in trained
     assert trained["best_epoch"] == trained["selected_epoch"] == 1
-    assert trained.get("selected_kind", "attention_asl") == "attention_asl"
 
 
 def test_swad_export_epoch_kept_separate_from_single_point_best(tmp_path, monkeypatch):

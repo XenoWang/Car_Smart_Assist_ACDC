@@ -17,7 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
 
 from car_smart_assist.perception.visibility import VisibilityTrainer  # noqa: E402
-from car_smart_assist.perception.visibility.trainer import archive_visibility_checkpoints  # noqa: E402
+from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
+    archive_visibility_checkpoints,
+    recover_visibility_checkpoint_transaction,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -87,6 +90,17 @@ def main() -> int:
         if args.fresh or args.continue_training:
             controller.resume()
         controller.require_running()
+        try:
+            if args.fresh:
+                archive_visibility_checkpoints(
+                    directory,
+                    root / cfg.get("report", {}).get("output_dir", "artifacts/reports/visibility") / "train_history.json",
+                )
+            else:
+                recover_visibility_checkpoint_transaction(directory)
+        except (OSError, ValueError) as exc:
+            logging.getLogger(__name__).error("无法处理检查点保存事务，请保留现场及 history 归档：%s", exc)
+            return 2
         resume = "none" if args.fresh else (
             directory / "last.pt" if args.continue_training else args.resume
         )
@@ -95,11 +109,6 @@ def main() -> int:
             return 2
 
         try:
-            if args.fresh:
-                archive_visibility_checkpoints(
-                    directory,
-                    root / cfg.get("report", {}).get("output_dir", "artifacts/reports/visibility") / "train_history.json",
-                )
             trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
         except (ValueError, RuntimeError) as exc:
             logging.getLogger(__name__).error("无法初始化训练设备或检查点：%s", exc)

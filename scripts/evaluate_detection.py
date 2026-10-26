@@ -89,12 +89,15 @@ def main() -> int:
                 raise ValueError("--imgsz is positive and only available for val comparisons")
             cfg["inference"]["imgsz"] = args.imgsz
         checkpoint = root / (args.checkpoint or cfg["checkpoint"])
+        calibration_file = calibration_path(root, cfg, args.output_dir)
+        if args.split == "calibration" and checkpoint.resolve() != (root / cfg["checkpoint"]).resolve():
+            if args.output_dir is None or calibration_file.resolve() == calibration_path(root, cfg).resolve():
+                raise ValueError("A non-default checkpoint requires an independent --output-dir for calibration")
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Trained weights missing: {checkpoint}")
         data = root / cfg["data"]
         validate_detection_export(data.parent, verify_hashes=True)
         manifest = json.loads((data.parent / "manifest.json").read_text(encoding="utf-8"))
-        calibration_file = calibration_path(root, cfg, args.output_dir)
         if args.split == "test" and not calibration_file.is_file():
             raise FileNotFoundError(
                 f"Current detection calibration missing; recalibrate first: {calibration_file}"

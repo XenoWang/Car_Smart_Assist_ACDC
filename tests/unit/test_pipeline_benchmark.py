@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +135,96 @@ def test_throughput_uses_total_frames_over_total_wall_and_distribution_counts():
     assert aggregate["wall_ms"]["p50"] == pytest.approx(15.0)
     assert aggregate["wall_ms"]["p95"] == pytest.approx(19.5)
     assert aggregate["wall_ms"]["unit"] == "ms"
+
+
+def test_fingerprint_detects_content_change_delete_creation_and_read_error(tmp_path, monkeypatch):
+    # Oracle is the fixture's original literal bytes hashed with stdlib SHA-256;
+    # a real successful public-schema frame/measurement must complete unless the
+    # file-change input alone is true (rejects an always-incomplete summary).
+    module = _module()
+    frame_record = {
+        "route_success": True,
+        "full_perception_success": True,
+        "blind": False,
+        "visibility_level": "visible",
+        "skipped": {},
+        "branches": {
+            "input": "available", "gate": "available", "weather": "available",
+            "object_detection": "available", "road_obstacle_detection": "available",
+            "advisory": "available",
+        },
+    }
+    measurement_record = {
+        "scope": "batch", "input_mode": "paths", "phase": "first_pass",
+        "iteration": 0, "requested_batch_size": 1, "actual_batch_size": 1,
+        "attempted_frame_count": 1, "route_success_frame_count": 1,
+        "full_perception_frame_count": 1, "blind_frame_count": 0,
+        "unavailable_frame_count": 0, "wall_ms": 2.0,
+        "attempted_throughput_fps": 500.0,
+    }
+    frames = [frame_record]
+    measurements = [measurement_record]
+    complete = module._summary(measurements, frames, 1.0, None, None, False)
+    assert complete["status"] == "complete"
+    assert complete["frame_observation_count"] == 1
+    changed_only = module._summary(measurements, frames, 1.0, None, None, True)
+    assert changed_only["status"] == "incomplete"
+    assert changed_only["frame_observation_count"] == 1
+
+    def changed_summary(flag):
+        return module._summary(measurements, frames, 1.0, None, None, flag)["status"]
+
+    source = tmp_path / "input.bin"
+    original_bytes = b"benchmark source v1\x00"
+    source.write_bytes(original_bytes)
+    baseline_stat = source.stat()
+    initial = {"size_bytes": len(original_bytes), "mtime_ns": baseline_stat.st_mtime_ns}
+    original_sha = hashlib.sha256(original_bytes).hexdigest()
+
+    unchanged = module._fingerprint(source, initial)
+    assert unchanged["sha256"] == original_sha
+    assert unchanged["changed_during_run"] is False
+
+    changed_bytes = b"benchmark source v2 has a different length"
+    source.write_bytes(changed_bytes)
+    changed = module._fingerprint(source, initial)
+    assert changed["sha256"] == hashlib.sha256(changed_bytes).hexdigest()
+    assert changed["changed_during_run"] is True
+    assert changed_summary(changed["changed_during_run"]) == "incomplete"
+
+    source.unlink()
+    deleted = module._fingerprint(source, initial)
+    assert deleted["exists"] is False
+    assert deleted["sha256"] is None
+    assert deleted["changed_during_run"] is True
+    assert changed_summary(deleted["changed_during_run"]) == "incomplete"
+
+    created = tmp_path / "new-input.bin"
+    new_bytes = b"created during benchmark"
+    created.write_bytes(new_bytes)
+    new_record = module._fingerprint(created, None)
+    assert new_record["exists"] is True
+    assert new_record["sha256"] == hashlib.sha256(new_bytes).hexdigest()
+    assert new_record["changed_during_run"] is True
+    assert changed_summary(new_record["changed_during_run"]) == "incomplete"
+
+    blocked = tmp_path / "unreadable.bin"
+    blocked.write_bytes(original_bytes)
+    blocked_stat = blocked.stat()
+    blocked_initial = {"size_bytes": len(original_bytes), "mtime_ns": blocked_stat.st_mtime_ns}
+    path_open = Path.open
+
+    def deny_target_read(path, *args, **kwargs):
+        if path == blocked and args == ("rb",):
+            raise OSError("synthetic fingerprint read denial")
+        return path_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", deny_target_read)
+    unreadable = module._fingerprint(blocked, blocked_initial)
+    assert unreadable["sha256"] is None
+    assert unreadable["error"] == "OSError: synthetic fingerprint read denial"
+    assert unreadable["changed_during_run"] is True
+    assert changed_summary(unreadable["changed_during_run"]) == "incomplete"
 
 
 def test_sync_uses_explicit_devices_without_environment_mutation(monkeypatch):

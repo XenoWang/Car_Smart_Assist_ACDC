@@ -119,6 +119,11 @@ def tiny_config():
 def write_data(root, cfg):
     import io
 
+    for key in ("acdc_cleaning_manifest", "pixel_cleaning_manifest"):
+        manifest = root / cfg.data[key]
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text('{"invalid": []}', encoding="utf-8")
+
     for condition_index, condition in enumerate(cfg.attributes):
         for group in range(4):
             folder = (
@@ -401,7 +406,9 @@ def test_training_checkpoint_predict_and_resume_matches_continuous(tmp_path, nam
     assert pyramid_model_config(cfg)["channels"] == [4, 8, 8, 8, 8]
 
 
-def test_full_comparison_uses_same_initialization_and_preserves_original(tmp_path):
+def test_full_comparison_uses_same_initialization_and_preserves_original(tmp_path, monkeypatch):
+    import car_smart_assist.perception.weather_pyramid_training as training
+
     cfg = tiny_config()
     write_data(tmp_path, cfg)
     legacy_path = Path(__file__).resolve().parents[2] / "configs/model/weather_classifier.yaml"
@@ -419,7 +426,39 @@ def test_full_comparison_uses_same_initialization_and_preserves_original(tmp_pat
         tmp_path / "old.pt",
     )
     original = (tmp_path / "old.pt").read_bytes()
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(cfg.data["seed"])
+        independently_seeded = WeatherPyramid(cfg)
+        expected_initial = {
+            key: value.detach().clone() for key, value in independently_seeded.state_dict().items()
+        }
+    captured_initial_states = {}
+    active_variant = {"name": None}
+    original_model = training.WeatherPyramid
+    original_train = training.train_pyramid_variant
+
+    def capture_constructed_model(model_cfg):
+        model = original_model(model_cfg)
+        captured_initial_states[active_variant["name"]] = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
+        return model
+
+    def capture_initial_state(cfg, root, datasets, split_info, name, **kwargs):
+        active_variant["name"] = name
+        try:
+            return original_train(cfg, root, datasets, split_info, name, **kwargs)
+        finally:
+            active_variant["name"] = None
+
+    monkeypatch.setattr(training, "WeatherPyramid", capture_constructed_model)
+    monkeypatch.setattr(training, "train_pyramid_variant", capture_initial_state)
     result = compare_pyramid_models(cfg, tmp_path, fresh=True)
+    assert captured_initial_states.keys() == {"focal", "asl"}
+    for name in ("focal", "asl"):
+        assert captured_initial_states[name].keys() == expected_initial.keys()
+        for key, expected in expected_initial.items():
+            torch.testing.assert_close(captured_initial_states[name][key], expected)
     assert (
         result["models"]["focal"]["initial_state_sha256"]
         == result["models"]["asl"]["initial_state_sha256"]

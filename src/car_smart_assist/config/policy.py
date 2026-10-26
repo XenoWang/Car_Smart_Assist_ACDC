@@ -99,6 +99,8 @@ class PolicyConfig:
                 or not set(weather_conditions) <= {"fog", "rain", "snow"}
             ):
                 raise ValueError("weather_handover_conditions 仅接受不重复的 fog/rain/snow")
+            if not set(weather_conditions) <= levels.keys():
+                raise ValueError("weather_handover_conditions 必须包含在天气风险等级和倍率的类别中")
             return cls(
                 distance_thresholds=MappingProxyType(distances),
                 weather_risk_multiplier=MappingProxyType(weather),

@@ -179,6 +179,57 @@ def test_thresholds_ignore_unknown_labels_and_reject_missing_class(cfg):
         balanced_thresholds(ds, values, cfg)
 
 
+def test_threshold_selection_uses_source_weights_and_ignores_unknowns(cfg):
+    ds = ToyDataset("calibration", cfg)
+    ds.targets = np.array(
+        [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [1, 0, 0, 1]],
+        dtype=np.float32,
+    )
+    ds.mask = np.ones_like(ds.targets)
+    ds.mask[3, 0] = 0
+    ds.samples = [
+        WeatherSample((1, 0, 0, 0), "a", "fog", path=Path("acdc-a.png")),
+        WeatherSample((0, 1, 0, 0), "b", "rain", path=Path("acdc-b.png")),
+        WeatherSample((0, 0, 1, 0), "c", "snow", archive_path=Path("pab.zip"), member="c.png"),
+        WeatherSample((1, 0, 0, 1), "unknown", "night", archive_path=Path("pab.zip"), member="u.png"),
+    ]
+    # fog 的已知样本为：ACDC 正例(.7,w=.5)、ACDC 负例(.6,w=.5)、
+    # PAB 负例(.8,w=1)；PAB 的 .99 标为 unknown，权重应为 0。
+    cfg = replace(
+        cfg,
+        evaluation={**cfg.evaluation, "threshold_steps": 3, "ap_selection_fraction": 0.5,
+                    "selection_weights": {name: 1.0 for name in cfg.attributes}},
+    )
+    probabilities = np.array(
+        [[0.7, 0.9, 0.1, 0.1], [0.6, 0.1, 0.8, 0.1],
+         [0.8, 0.1, 0.1, 0.9], [0.99, 0.8, 0.8, 0.8]],
+        dtype=np.float32,
+    )
+    thresholds, score = balanced_thresholds(ds, probabilities, cfg)
+    # 网格 .25/.5 都预测全部已知样本，F1=2*.5/(.5+2)=.4；.75 只选中负例。
+    # 最优平台中心 .375 到 .25/.5 等距，规则取较小阈值；AP 仅在正例排名处
+    # 累计：precision=.5/(1+.5)=1/3，recall 从 0 到 1，故 AP=1/3。
+    assert thresholds["fog"] == pytest.approx(0.25)
+    assert score["per_attribute"]["fog"]["source_balanced_max_f1"] == pytest.approx(0.4)
+    assert score["per_attribute"]["fog"]["source_balanced_ap"] == pytest.approx(1 / 3)
+
+
+def test_predictor_factory_does_not_alias_nested_caller_config(cfg, tmp_path):
+    path = tmp_path / "best.pt"
+    model = WeatherAttention(cfg).eval()
+    torch.save({
+        "format_version": 1,
+        "model_config": attention_model_config(cfg),
+        "model_state": model.state_dict(),
+        "calibration_signature": "synthetic",
+        "decision_thresholds": dict.fromkeys(cfg.attributes, 0.5),
+    }, path)
+    predictor = WeatherAttentionPredictor.from_checkpoint(path, cfg)
+    original = predictor.model.cfg.head["dimension"]
+    cfg.head["dimension"] = original + 2
+    assert predictor.model.cfg.head["dimension"] == original
+
+
 def test_schedule_uses_configured_horizon(cfg):
     assert learning_rate_factor(1, cfg) == 1
     assert learning_rate_factor(3, cfg) == pytest.approx(cfg.train["minimum_lr_ratio"])
@@ -222,11 +273,15 @@ def test_pipeline_selects_explicit_or_default_candidate(cfg, tmp_path, mode):
     path.write_text(yaml.safe_dump({"weather_attention": asdict(cfg)}), encoding="utf-8")
     checkpoint = tmp_path / cfg.checkpoint_root / "best.pt"
     checkpoint.parent.mkdir(parents=True)
+    initialized = WeatherAttention(cfg).eval()
+    with torch.no_grad():
+        for parameter in initialized.parameters():
+            parameter.zero_()
     torch.save(
         {
             "format_version": 1,
             "model_config": attention_model_config(cfg),
-            "model_state": WeatherAttention(cfg).state_dict(),
+            "model_state": initialized.state_dict(),
             "calibration_signature": "test-only",
             "decision_thresholds": dict.fromkeys(cfg.attributes, 0.5),
         },
@@ -250,7 +305,7 @@ def test_pipeline_selects_explicit_or_default_candidate(cfg, tmp_path, mode):
     if mode == "checkpoint_override":
         override = checkpoint.with_name("override.pt")
         payload = torch.load(checkpoint, weights_only=True)
-        payload["model_state"]["class_bias"].fill_(0.25)
+        payload["model_state"]["class_bias"].fill_(float(torch.log(torch.tensor(3.0))))
         torch.save(payload, override)
     pipeline = InferencePipeline.from_config(
         {},
@@ -263,10 +318,21 @@ def test_pipeline_selects_explicit_or_default_candidate(cfg, tmp_path, mode):
     assert isinstance(pipeline.weather_predictor, WeatherAttentionPredictor)
     assert pipeline.weather_predictor.device.type == "cpu"
     if override:
-        assert torch.equal(pipeline.weather_predictor.model.class_bias, torch.full((4,), 0.25))
+        assert torch.equal(
+            pipeline.weather_predictor.model.class_bias,
+            torch.full((4,), float(torch.log(torch.tensor(3.0)))),
+        )
     result = pipeline.run(np.full((80, 120, 3), 100, np.uint8))
     assert result.weather is not None
     assert set(result.weather.probabilities) == set(cfg.attributes)
+    if override:
+        baseline = InferencePipeline.from_config(
+            {}, project_root=tmp_path, require_visibility=False, device="cpu"
+        ).run(np.full((80, 120, 3), 100, np.uint8))
+        assert baseline.weather is not None
+        for attribute in cfg.attributes:
+            assert baseline.weather.probabilities[attribute] == pytest.approx(0.5, abs=1e-6)
+            assert result.weather.probabilities[attribute] == pytest.approx(0.75, abs=1e-6)
 
 
 @pytest.mark.parametrize(

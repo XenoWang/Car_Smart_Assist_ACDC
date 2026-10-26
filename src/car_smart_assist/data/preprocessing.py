@@ -664,7 +664,7 @@ def check_acdc(
                 if not mp.exists():
                     n_missing += 1
                     report.error(
-                        "acdc/mask_pairing", img,
+                        "acdc/mask_pairing", mp,
                         f"缺少标注变体 {suffix}（期望 {mp.name}）",
                     )
         report.mark_checked("acdc.annotated_images", n_paired)

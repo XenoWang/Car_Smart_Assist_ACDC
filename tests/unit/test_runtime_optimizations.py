@@ -83,9 +83,7 @@ def test_opened_dataset_remains_small_when_pickled(tmp_path):
     assert len(blob) == before
     assert len(blob) < pixels.nbytes * 0.05
     restored = pickle.loads(blob)
-    assert restored._cache is None
     torch.testing.assert_close(restored[1], expected)
-    assert dataset._cache is not None
 
 
 def test_pipeline_uses_checkpoint_size_and_scoring_fallback(tmp_path, monkeypatch):
@@ -118,6 +116,21 @@ def test_eval_loss_weights_tail_batch_and_rejects_empty():
     assert trainer._eval_loss(DataLoader(samples, batch_size=2)) == pytest.approx(6.0)
     with pytest.raises(ValueError, match="验证数据为空"):
         trainer._eval_loss(DataLoader(samples[:0], batch_size=2))
+
+
+def test_trainer_calibration_matches_known_zero_model_errors():
+    trainer = VisibilityTrainer.__new__(VisibilityTrainer)
+    trainer.device = torch.device("cpu")
+    trainer.model = torch.nn.Conv2d(3, 3, 1, bias=False)
+    torch.nn.init.zeros_(trainer.model.weight)
+    levels = torch.tensor([0.0, 0.5, 0.5, 1.0, 1.0])
+    samples = levels[:, None, None, None].expand(5, 3, 2, 2)
+    stats = trainer._calibrate(DataLoader(samples, batch_size=2))
+    # 恒零输出的逐图 MSE 为 [0, .25, .25, 1, 1]；均值 .5，总体方差 .175，
+    # 第95/99百分位都为 1，且跨三个 batch 合计五个样本。
+    assert stats.to_dict() == pytest.approx(
+        {"mean": 0.5, "std": 0.175**0.5, "p95": 1.0, "p99": 1.0, "n": 5}
+    )
 
 
 def test_short_training_saves_and_calibrates_best_once(tmp_path, monkeypatch):

@@ -96,6 +96,7 @@ def test_recognized_weather_has_baseline_notice(config, weather):
 def test_weather_is_only_handover_support_when_visibility_is_degraded(config):
     visible = evaluate_handover(scene(weather_attributes=("fog",)), config)
     assert not visible.should_takeover
+    assert not visible.unable_to_judge
 
     degraded = evaluate_handover(
         scene(weather_attributes=("fog",), visibility_level="degraded"), config
@@ -115,29 +116,6 @@ def test_weather_is_only_handover_support_when_visibility_is_degraded(config):
         scene(weather_attributes=("night",), visibility_level="degraded"), config
     )
     assert not night_only.should_takeover
-    disabled = load_policy_config({"weather_handover_enabled": False})
-    assert not evaluate_handover(
-        scene(weather_attributes=("fog",), visibility_level="degraded"), disabled
-    ).should_takeover
-
-
-def test_adverse_weather_only_supports_handover_with_degraded_visibility(config):
-    visible = evaluate_handover(scene(weather_attributes=("fog",)), config)
-    assert not visible.should_takeover
-    assert not visible.unable_to_judge
-
-    degraded = evaluate_handover(
-        scene(weather_attributes=("fog",), visibility_level="degraded"), config
-    )
-    assert degraded.should_takeover
-    assert not degraded.unable_to_judge
-    assert "weather_visibility_auxiliary_handover" in degraded.risk.triggered
-
-    night_only = evaluate_handover(
-        scene(weather_attributes=("night",), visibility_level="degraded"), config
-    )
-    assert not night_only.should_takeover
-
     disabled = load_policy_config({"weather_handover_enabled": False})
     assert not evaluate_handover(
         scene(weather_attributes=("fog",), visibility_level="degraded"), disabled
@@ -521,11 +499,15 @@ def test_config_can_be_imported_before_advisory():
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("distance", [0, 20, 40, 60, None])
-def test_generator_outputs_rules_and_valid_wording(distance):
+@pytest.mark.parametrize(
+    ("distance", "expected_risk"),
+    [(0, "critical"), (20, "warning"), (40, "notice"), (60, "none"), (None, "unknown")],
+)
+def test_generator_outputs_rules_and_valid_wording(distance, expected_risk):
     advisory = AdvisoryGenerator().generate(perception=scene(target(distance)))
     assert advisory.source == "policy"
-    assert advisory.policy_details["risk"]["risk_level"] == advisory.risk_level.value
+    assert advisory.risk_level.value == expected_risk
+    assert advisory.policy_details["risk"]["risk_level"] == expected_risk
     assert advisory.evidence and not check_wording(advisory.text)
     json.dumps(advisory.to_dict(), allow_nan=False)
 

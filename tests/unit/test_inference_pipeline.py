@@ -43,6 +43,7 @@ class StubScorer:
         self.information = information
         self.recon_z = recon_z
         self.seen_shapes: list[tuple[int, int]] = []
+        self.seen_channels: list[int] = []
         self.calls = 0
 
     def score_arrays(self, images, paths=None):
@@ -52,6 +53,7 @@ class StubScorer:
         out = []
         for i, im in enumerate(images):
             self.seen_shapes.append(im.shape[:2])
+            self.seen_channels.append(im.shape[2])
             out.append(
                 VisibilityScore(
                     path=f"<stub:{i}>",
@@ -103,9 +105,16 @@ class StubPredictor:
 
     def __init__(self) -> None:
         self.seen_shapes: list[tuple[int, int]] = []
+        self.seen_minmax: list[tuple[int, int]] = []
+        self.seen_markers: list[int] = []
+        self.seen_rgb: list[np.ndarray] = []
 
     def predict(self, image: np.ndarray) -> PerceptionResult:
         self.seen_shapes.append(image.shape[:2])
+        self.seen_minmax.append((int(image.min()), int(image.max())))
+        marker = int(image[0, 0, 0])
+        self.seen_markers.append(marker)
+        self.seen_rgb.append(image.copy())
         return PerceptionResult(visibility_level="visible", road_condition="fog")
 
 
@@ -248,6 +257,7 @@ class TestGateBlocksPerception:
         assert result.advisory.source == "fallback"
 
     def test_short_batch_scores_fail_closed_for_every_frame(self):
+        # PRD003 batch contract requires one result per input; this rejects [] as a vacuous all().
         predictor = StubPredictor()
         pipe = InferencePipeline(
             scorer=ShortScorer(),
@@ -255,6 +265,7 @@ class TestGateBlocksPerception:
             predictor=predictor,
         )
         results = pipe.run_batch([frame(), frame()])
+        assert len(results) == 2
         assert all("gate" in result.skipped for result in results)
         assert all(result.advisory.should_takeover for result in results)
         assert predictor.seen_shapes == []
@@ -321,7 +332,14 @@ class TestResolutionSeparation:
         assert scorer.seen_shapes == [(144, 256)]
         assert predictor.seen_shapes == [(1080, 1920)]
 
-    def test_already_correct_size_not_resized(self):
+    def test_already_correct_size_not_resized(self, monkeypatch):
+        import car_smart_assist.inference.pipeline as pipeline_module
+
+        def unexpected_resize(*_args, **_kwargs):
+            pytest.fail("already-correct input must not go through PIL resize")
+
+        # 尺寸相同时若仍走 resize，形状断言同样成立；直接禁掉 resize 才能验证早退分支。
+        monkeypatch.setattr(pipeline_module.Image, "fromarray", unexpected_resize)
         scorer = StubScorer(information=0.95)
         pipe = InferencePipeline(
             scorer=scorer, gate=VisibilityGate(GateThresholds(), require_calibration=False),
@@ -339,34 +357,94 @@ class TestResolutionSeparation:
 class TestInputHandling:
     @pytest.mark.parametrize("h,w", [(720, 1280), (144, 256)])
     def test_accepts_ndarray(self, h, w):
-        assert make_pipeline().run(frame(h, w)).advisory is not None
+        pipe = make_pipeline()
+        result = pipe.run(frame(h, w))
+        assert "input" not in result.skipped
+        assert pipe.scorer.seen_channels == [3]
 
     def test_accepts_pil(self):
-        assert make_pipeline().run(Image.fromarray(frame())).advisory is not None
+        pipe = make_pipeline()
+        result = pipe.run(Image.fromarray(frame()))
+        assert "input" not in result.skipped
+        assert pipe.scorer.seen_channels == [3]
 
     def test_accepts_path(self, tmp_path: Path):
         p = tmp_path / "a.png"
         Image.fromarray(frame()).save(p)
-        assert make_pipeline().run(p).advisory is not None
-        assert make_pipeline().run(str(p)).advisory is not None
+        for value in (p, str(p)):
+            pipe = make_pipeline()
+            result = pipe.run(value)
+            assert "input" not in result.skipped
+            assert pipe.scorer.seen_channels == [3]
 
     def test_grayscale_expanded_to_rgb(self):
-        gray = np.random.default_rng(0).integers(0, 256, (720, 1280), dtype=np.uint8)
-        assert make_pipeline().run(gray).advisory is not None
+        # RGB conversion oracle: grayscale byte g maps to literal [g,g,g], input remains unchanged.
+        gray = np.array([[0, 17], [128, 255]], dtype=np.uint8)
+        original = gray.copy()
+        predictor = StubPredictor()
+        pipe = make_pipeline(predictor=predictor)
+        result = pipe.run(gray)
+        assert "input" not in result.skipped
+        assert pipe.scorer.seen_channels == [3]
+        np.testing.assert_array_equal(gray, original)
+        np.testing.assert_array_equal(
+            predictor.seen_rgb[0], np.repeat(gray[:, :, None], 3, axis=2)
+        )
+        assert predictor.seen_markers == [0]
+        assert result.perception.road_condition == "fog"
+        assert predictor.seen_minmax == [(0, 255)]
 
     def test_rgba_drops_alpha(self):
-        rgba = np.random.default_rng(0).integers(0, 256, (720, 1280, 4), dtype=np.uint8)
-        assert make_pipeline().run(rgba).advisory is not None
+        # RGB oracle is the first three literal channels; changing alpha cannot affect them.
+        rgba = np.array([[[11, 22, 33, 0], [44, 55, 66, 255]]], dtype=np.uint8)
+        original = rgba.copy()
+        predictor = StubPredictor()
+        pipe = make_pipeline(predictor=predictor)
+        result = pipe.run(rgba)
+        assert "input" not in result.skipped
+        assert pipe.scorer.seen_channels == [3]
+        np.testing.assert_array_equal(rgba, original)
+        np.testing.assert_array_equal(predictor.seen_rgb[0], rgba[:, :, :3])
+        assert predictor.seen_markers == [11]
+        assert result.perception.road_condition == "fog"
+        assert predictor.seen_minmax == [(11, 66)]
 
     def test_float_input_clipped(self):
-        f = np.random.default_rng(0).random((720, 1280, 3)) * 255.0
-        assert make_pipeline().run(f).advisory is not None
+        f = np.random.default_rng(0).integers(-10, 300, (720, 1280, 3)).astype(np.float32)
+        predictor = StubPredictor()
+        pipe = make_pipeline(predictor=predictor)
+        result = pipe.run(f)
+        assert "input" not in result.skipped
+        # 感知阶段拿到的是原图，能观察到裁剪后的 0..255 范围。
+        assert predictor.seen_minmax == [(0, 255)]
 
     def test_batch_preserves_order_and_count(self):
-        pipe = make_pipeline(information=0.95)
-        results = pipe.run_batch([frame(720, 1280) for _ in range(3)])
+        # Distinct shapes/pixel labels are independent observable order oracles (PRD003 batch contract).
+        class OrderedPredictor(StubPredictor):
+            def predict(self, image):
+                result = super().predict(image)
+                result.road_condition = {17: "fog", 83: "rain", 201: "snow"}[int(image[0, 0, 0])]
+                return result
+
+        predictor = OrderedPredictor()
+        pipe = make_pipeline(information=0.95, predictor=predictor)
+        inputs = [
+            np.full((2, 3, 3), 17, dtype=np.uint8),
+            np.full((4, 1, 3), 83, dtype=np.uint8),
+            np.full((1, 5, 3), 201, dtype=np.uint8),
+        ]
+        originals = [image.copy() for image in inputs]
+        results = pipe.run_batch(inputs)
         assert len(results) == 3
+        assert all("input" not in result.skipped for result in results)
         assert all(isinstance(r, PipelineResult) for r in results)
+        assert predictor.seen_shapes == [(2, 3), (4, 1), (1, 5)]
+        assert predictor.seen_markers == [17, 83, 201]
+        assert [r.perception.road_condition for r in results] == [
+            "fog", "rain", "snow"
+        ]
+        for actual, original in zip(inputs, originals, strict=True):
+            np.testing.assert_array_equal(actual, original)
 
 
 

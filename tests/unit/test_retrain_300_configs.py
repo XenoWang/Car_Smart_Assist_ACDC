@@ -30,8 +30,8 @@ def test_weather_retrain_config_uses_a85_recipe_with_fresh_isolated_outputs():
 
 def test_legacy_weather_config_keeps_early_stopping_disabled_by_default():
     cfg = load_weather_attention_config(ROOT / "configs/model/weather_attention_a.yaml")
-    stopping = cfg.train.get("early_stopping", {"enabled": False})
-    assert stopping.get("enabled", False) is False
+    # 配置未声明早停时，加载器不得自行注入或启用早停。
+    assert "early_stopping" not in cfg.train
 
 
 def test_visibility_retrain_config_has_fixed_four_way_split_and_isolated_report():

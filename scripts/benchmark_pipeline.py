@@ -113,6 +113,8 @@ def _fingerprint(path: Path, initial: dict[str, int] | None) -> dict[str, Any]:
 
 def _artifact_paths(args: argparse.Namespace, visibility: dict, yaml: Any) -> dict[str, Path]:
     """Record the existing pipeline routes without substituting a different route."""
+    from car_smart_assist.perception.yolo_postprocess import calibration_path
+
     paths = {
         "benchmark_script": Path(__file__).resolve(),
         "visibility_config": _path(args.config),
@@ -152,6 +154,7 @@ def _artifact_paths(args: argparse.Namespace, visibility: dict, yaml: Any) -> di
             for key in ("checkpoint", "calibration_file"):
                 if raw.get(key):
                     paths[f"{name}_{key}_candidate"] = _path(raw[key])
+            paths[f"{name}_calibration"] = calibration_path(ROOT, raw)
     return {key: path.resolve() for key, path in paths.items()}
 
 

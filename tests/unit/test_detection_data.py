@@ -34,6 +34,9 @@ def test_gopro_chapters_are_one_recording_group():
     assert recording_group("GOPR0475", "recording_family") == recording_group(
         "GP020475", "recording_family"
     )
+    assert recording_group("GOPR0475", "recording_family") != recording_group(
+        "GOPR0476", "recording_family"
+    )
     assert recording_group("GOPR0475", "sequence") != recording_group("GP020475", "sequence")
 
 

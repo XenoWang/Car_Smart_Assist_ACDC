@@ -512,6 +512,13 @@ def main() -> int:
         report["fit_quality"] = eval_fit_quality(scorer, refs, ref_paths, dcfg, gate, n)
     except SplitIdentityError as exc:
         logger.error("评估已拒绝: %s", exc)
+        logger.error(
+            "请用 --checkpoint 显式指定与配置/参考图四分身份匹配的权重；"
+            "当前默认配置的匹配权重示例（不会自动加载）：\n"
+            r".\.venv\Scripts\python.exe -X utf8 scripts\evaluate_visibility.py "
+            r"--config configs/model/visibility.yaml "
+            r"--checkpoint artifacts/checkpoints/retrain_300_20261017/visibility/best.pt"
+        )
         return 2
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)
     report["real_adverse"] = eval_real_adverse(

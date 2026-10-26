@@ -1,5 +1,6 @@
 """部分标注不能把没标出的类别或区域当作背景来训练。"""
 
+import math
 from types import SimpleNamespace
 
 import numpy as np
@@ -61,6 +62,26 @@ def test_unannotated_class_and_roi_gradients_are_zero():
     assert gradient[1, 0, 2] > 0 and gradient[1, 2, 2] < 0
 
 
+def test_masked_weighted_bce_matches_hand_value_and_gradient():
+    predictions = torch.tensor(
+        [[[0.0, math.log(3.0)], [2.0, -2.0]]], requires_grad=True
+    )
+    targets = torch.tensor([[[1.0, 0.0], [0.0, 0.0]]])
+    loss = MaskedClassificationLoss()
+    loss.valid = torch.tensor([[[True, False], [False, False]]])
+    loss.weights = torch.tensor([[[2.0]]])
+    actual = loss(predictions, targets)
+    # unreduced BCE保留[batch,anchor,class]；已监督项分别为2ln2和2ln4，
+    # 第二anchor被mask。逐元素合同与独立总和都检查，不能误作类维已求和。
+    expected = torch.tensor([[[2 * math.log(2), 2 * math.log(4)], [0.0, 0.0]]])
+    torch.testing.assert_close(actual, expected)
+    assert actual.sum().item() == pytest.approx(2 * math.log(8))
+    actual.sum().backward()
+    gradient = predictions.grad
+    # dBCE/dlogit=sigmoid(logit)-target；加权后分别为 -1、1.5，屏蔽位置为 0。
+    torch.testing.assert_close(gradient, torch.tensor([[[-1.0, 1.5], [0.0, 0.0]]]))
+
+
 def test_old_output_rows_preserved_when_adding_class():
     def model(classes):
         head = SimpleNamespace(
@@ -78,10 +99,9 @@ def test_old_output_rows_preserved_when_adding_class():
 
 
 def test_validation_uses_deployment_single_class_selection():
-    from car_smart_assist.perception import joint_yolo_backend as backend
-    from car_smart_assist.perception.joint_yolo_backend import DeploymentValidator
+    from car_smart_assist.perception.joint_yolo_backend import JointValidator
 
-    validator = DeploymentValidator.__new__(DeploymentValidator)
+    validator = JointValidator.__new__(JointValidator)
     validator.args = SimpleNamespace(
         conf=0.001, iou=0.5, single_cls=False, agnostic_nms=False, max_det=10,
         task="detect",
@@ -91,7 +111,6 @@ def test_validation_uses_deployment_single_class_selection():
     predictions = torch.tensor([[[5.0], [5.0], [4.0], [4.0], [0.8], [0.7], [0.1]]])
     result = validator.postprocess(predictions)
     assert result[0]["cls"].tolist() == [0.0]
-    assert issubclass(backend.JointValidator, DeploymentValidator)
 
 
 def test_training_ap_validation_passes_shared_sweep_contract(monkeypatch):

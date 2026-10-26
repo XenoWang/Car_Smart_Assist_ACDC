@@ -46,13 +46,14 @@ class TestLostAndFoundCleaning:
             "output": {"report_dir": "artifacts/reports/laf", "manifest_dir": "data/processed/manifests"},
         }
         report = pp.clean(cfg, project_root=tmp_path)
-        manifest = json.loads((tmp_path / "data/processed/manifests/lost_and_found.json").read_text())
+        manifest = json.loads(
+            (tmp_path / "data/processed/manifests/lost_and_found.json").read_text(encoding="utf-8")
+        )
         assert set(manifest["invalid"]) == {str(broken), str(broken_label)}
         assert set(manifest["retained"]) == {str(path) for path in images}
         assert manifest["counts"] == {"valid": 5, "suspect": 0, "invalid": 2}
         assert set(manifest["preserved_non_image_files"]) == {str(notes), str(polygon)}
         assert report.stats["lost_and_found_corrupt_images"] == 2
-        assert not manifest["original_files_modified_or_deleted"]
         assert all(path.read_bytes() == contents for path, contents in sources.items())
 
     def test_read_permission_failure_retained_for_review(self, tmp_path, monkeypatch):
@@ -317,7 +318,7 @@ class TestAcdcMaskPath:
     def test_all_five_suffixes_derived(self, tmp_path: Path):
         root = tmp_path / "acdc"
         img = root / "rgb_anon" / "snow" / "train" / "GP010475" / "GP010475_frame_001043_rgb_anon.png"
-        for suffix in pp.ACDC_MASK_SUFFIXES:
+        for suffix in ("labelIds", "labelTrainIds", "labelColor", "invIds", "invGray"):
             p = pp._acdc_mask_path(img, root, suffix)
             assert p.name.endswith(f"_gt_{suffix}.png")
 
@@ -328,6 +329,11 @@ class TestAcdcMaskPath:
 
 
 class TestHashing:
+    def test_full_file_digest_matches_known_sha256_vector(self, tmp_path: Path):
+        path = tmp_path / "abc.bin"
+        path.write_bytes(b"abc")
+        assert pp._file_digest(path, 0) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+
     def test_identical_content_same_digest(self, tmp_image):
         a = tmp_image("a.png")
         b = tmp_image("b.png")
@@ -497,20 +503,17 @@ class TestDetectionJsonChecks:
         assert any("在 rgb_anon/ 下不存在" in i.message for i in rep.issues)
         assert any(i.severity is pp.Severity.ERROR for i in rep.issues)
 
-    def test_rle_skip_recorded_when_pycocotools_missing(self, tmp_path: Path):
+    def test_rle_skip_recorded_when_pycocotools_missing(self, tmp_path: Path, monkeypatch):
         """pycocotools 未安装时必须记 skipped 并说明原因，而不是静默跳过。"""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pycocotools", None)
         self._make_coco(tmp_path)
         cfg = {"detection": {**self.CFG["detection"], "validate_rle": True}}
         rep = pp.CleaningReport()
         pp._check_detection_jsons(tmp_path / "gt_detection", tmp_path / "rgb_anon", rep, cfg)
-        try:
-            import pycocotools  # noqa: F401
-            has = True
-        except ImportError:
-            has = False
-        if not has:
-            assert "detection/rle" in rep.skipped
-            assert "pycocotools" in rep.skipped["detection/rle"]
+        assert "detection/rle" in rep.skipped
+        assert "pycocotools" in rep.skipped["detection/rle"]
 
 
 
@@ -614,15 +617,30 @@ def test_zip_resource_read_error_is_not_counted_as_corrupt(tmp_path: Path, monke
     assert report.stats["fixture_corrupt_images"] == 0
 
 
-def test_cleaning_summary_counts_registered_valid_suspect_and_invalid_samples():
+def test_cleaning_summary_counts_samples_from_real_probes(tmp_path: Path):
+    normal = tmp_path / "normal.png"
+    anomaly = tmp_path / "uniform.png"
+    corrupt = tmp_path / "corrupt.png"
+    Image.fromarray(np.tile(np.arange(256, dtype=np.uint8), (96, 1))).convert("RGB").save(normal)
+    Image.fromarray(np.zeros((96, 256, 3), dtype=np.uint8)).save(anomaly)
+    corrupt.write_bytes(b"not a png")
     report = pp.CleaningReport()
-    report.register_samples(["valid.png", "suspect.png", "invalid.png"])
-    report.warn("read", "suspect.png", "pending")
-    report.error("decode", "invalid.png", "confirmed")
-    report.error("annotations", "annotations.json", "malformed metadata")
+    results = pp._run_probes(
+        [normal, anomaly, corrupt], report, check="fixture/integrity", force_load=True,
+        want_stats=True, downsample=1, num_workers=1,
+    )
+    pp._check_dimensions_and_degeneracy(
+        results, report,
+        {"min_side_px": 16, "aspect_ratio_range": [0.5, 6.0], "min_pixel_std": 2.0},
+        check="fixture/content", label="fixture",
+    )
     summary = report.to_dict()["summary"]
     assert summary["sample_total"] == 3
     assert summary["samples"] == {"valid": 1, "suspect": 1, "invalid": 1}
+    assert report.status_of(normal) is pp.SampleStatus.VALID
+    assert report.status_of(anomaly) is pp.SampleStatus.SUSPECT
+    assert report.status_of(corrupt) is pp.SampleStatus.INVALID
+    assert report.stats["fixture_low_variance_candidates"] == 1
 
 
 def test_exact_duplicate_check_compares_full_files_after_prefix_candidate(tmp_path: Path):

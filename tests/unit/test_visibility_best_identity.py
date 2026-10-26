@@ -66,7 +66,6 @@ def test_model_identity_binds_parameters_and_integer_buffers_not_metadata():
         "counter": torch.tensor([3], dtype=torch.int64),
     }
     first = _model_state_sha256(state)
-    assert _model_state_sha256(state) == first
 
     changed_weight = {key: value.clone() for key, value in state.items()}
     changed_weight["weight"][0] += 1
@@ -204,4 +203,5 @@ def test_format2_resume_is_rejected_while_legacy_weight_inference_remains_availa
     from car_smart_assist.perception.visibility.scorer import VisibilityScorer
 
     scorer = VisibilityScorer.from_checkpoint(checkpoint, cfg=payload["model_cfg"])
-    assert scorer is not None
+    assert scorer.input_size == tuple(payload["model_cfg"]["input_size"])
+    assert scorer.split_signature == payload.get("split_signature")

@@ -5,7 +5,10 @@ from __future__ import annotations
 import hashlib
 import itertools
 import json
+import os
 import random
+import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -98,6 +101,10 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         raise ValueError("Lost & Found valid_roi_ids must be a nonempty unique integer list drawn from 1/2")
     if cfg["group_strategy"] != "location":
         raise ValueError("Joint Lost & Found export requires location grouping")
+    for key in ("source_weights", "classification_loss_weights"):
+        weights = cfg.get(key)
+        if not isinstance(weights, dict) or set(weights) != {"acdc", "lost_and_found"}:
+            raise ValueError(f"{key} must contain exactly acdc and lost_and_found")
     if not np.isclose(sum(cfg["source_weights"].values()), 1) or any(
         not np.isfinite(value) or value <= 0 for value in cfg["source_weights"].values()
     ):
@@ -203,25 +210,14 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         ).encode()
     ).hexdigest()
     manifest_path = output / "manifest.json"
-    if manifest_path.exists() and json.loads(manifest_path.read_text())["signature"] != signature:
-        raise ValueError("Joint dataset changed; choose a new output_root")
-    output.mkdir(parents=True, exist_ok=True)
     for row in rows:
         image = Path("images") / row["split"] / row["source_relative"]
         label = (Path("labels") / row["split"] / row["source_relative"]).with_suffix(".txt")
-        source = acdc_sources[row["source_relative"]] if row["dataset"] == "acdc" else Path(row["source"])
-        _materialize_image(source, output / image, cfg["image_mode"], row["sha256"])
-        text = _label_text(row["boxes"])
-        destination = output / label
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_file() and destination.read_text() != text:
-            raise ValueError("Existing joint labels changed")
-        destination.write_text(text, encoding="utf-8")
         row.update(image=image.as_posix(), label=label.as_posix())
-    for split in ("train", "val", "calibration", "test"):
-        (output / f"{split}.txt").write_text(
-            "".join("./" + row["image"] + "\n" for row in rows if row["split"] == split)
-        )
+    split_lists = {
+        f"{split}.txt": "".join("./" + row["image"] + "\n" for row in rows if row["split"] == split)
+        for split in ("train", "val", "calibration", "test")
+    }
     manifest = {
         "format_version": 2,
         "signature": signature,
@@ -236,7 +232,7 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         "deferred_corrupt": deferred,
         "base_signature": base["signature"],
     }
-    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    manifest_text = json.dumps(manifest, indent=2)
     data = {
         "path": output.as_posix(),
         "train": "train.txt",
@@ -245,14 +241,69 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         "names": {i: item["name"] for i, item in enumerate(classes)},
         "joint_manifest": str(manifest_path),
     }
-    for name, value in (
-        ("data.yaml", data),
-        ("calibration.yaml", {**data, "val": "calibration.txt"}),
-    ):
-        (output / name).write_text(yaml.safe_dump(value), encoding="utf-8")
+    yaml_documents = {
+        "data.yaml": data,
+        "calibration.yaml": {**data, "val": "calibration.txt"},
+    }
+
+    def validate_current(directory):
+        if json.loads((directory / "manifest.json").read_text(encoding="utf-8")) != json.loads(manifest_text):
+            raise ValueError("Prepared joint metadata differs from current inputs")
+        for name, expected in yaml_documents.items():
+            if yaml.safe_load((directory / name).read_text(encoding="utf-8")) != expected:
+                raise ValueError(f"Prepared joint dataset YAML differs: {name}")
+        for name, expected in split_lists.items():
+            if (directory / name).read_text(encoding="utf-8") != expected:
+                raise ValueError(f"Prepared joint split list differs: {name}")
+        return validate_detection_export(directory, verify_hashes=True)
+
+    existing = output.exists() or output.is_symlink()
+    if existing:
+        try:
+            counts = validate_current(output)
+        except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
+            raise ValueError(
+                f"Existing joint export is incomplete or differs from current inputs: {exc}; "
+                "preserve it for inspection and choose a new output_root rather than overwriting it"
+            ) from exc
+    else:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.staging-", dir=output.parent))
+        staging_identity = staging.stat()
+        try:
+            for row in rows:
+                source = acdc_sources[row["source_relative"]] if row["dataset"] == "acdc" else Path(row["source"])
+                _materialize_image(source, staging / row["image"], cfg["image_mode"], row["sha256"])
+                label = staging / row["label"]
+                label.parent.mkdir(parents=True, exist_ok=True)
+                label.write_text(_label_text(row["boxes"]), encoding="utf-8")
+            for name, content in split_lists.items():
+                (staging / name).write_text(content, encoding="utf-8")
+            for name, document in yaml_documents.items():
+                (staging / name).write_text(yaml.safe_dump(document), encoding="utf-8")
+            temporary_manifest = staging / "manifest.json.pending"
+            with temporary_manifest.open("x", encoding="utf-8") as stream:
+                stream.write(manifest_text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_manifest, staging / "manifest.json")
+            counts = validate_current(staging)
+            if output.exists() or output.is_symlink():
+                raise ValueError("Joint output appeared during preparation; choose a new output_root")
+            staging.rename(output)
+        finally:
+            if staging.exists() or staging.is_symlink():
+                current = staging.lstat()
+                if (
+                    staging.is_symlink() or staging.resolve() != staging
+                    or staging.parent != output.parent or not staging.is_relative_to(output.parent)
+                    or (current.st_dev, current.st_ino) != (staging_identity.st_dev, staging_identity.st_ino)
+                ):
+                    raise RuntimeError(f"Refusing cleanup of changed or unsafe staging directory: {staging}")
+                shutil.rmtree(staging)
     summary = {
         "signature": signature,
-        "counts": validate_detection_export(output, verify_hashes=True),
+        "counts": counts,
         "sources": {
             source: {
                 split: {
@@ -272,7 +323,8 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         "classes": classes,
         "deferred_corrupt": deferred,
     }
-    report = root / cfg["report_root"]
-    report.mkdir(parents=True, exist_ok=True)
-    (report / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if not existing:
+        report = root / cfg["report_root"]
+        report.mkdir(parents=True, exist_ok=True)
+        (report / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary

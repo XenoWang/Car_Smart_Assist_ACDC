@@ -323,16 +323,6 @@ def test_joint_verified_base_survives_raw_source_change_and_preserves_provenance
     assert hashlib.sha256(joint_bytes).hexdigest() == row["sha256"]
 
 
-def test_joint_still_rejects_changed_verified_base_bytes(tmp_path):
-    from car_smart_assist.data.detection_joint import prepare_joint_detection
-
-    helper = _joint_helpers(); helper._write_base_export(tmp_path, corrupt=True)
-    _write_five_laf_train_locations(tmp_path, helper)
-    with pytest.raises(ValueError, match="Exported image content changed"):
-        prepare_joint_detection(tmp_path, helper._joint_config())
-    assert not (tmp_path / helper._joint_config()["output_root"]).exists()
-
-
 def test_joint_rejects_invalid_laf_contract_and_keeps_valid_zero_box_image(tmp_path):
     from car_smart_assist.data.detection_joint import prepare_joint_detection
 

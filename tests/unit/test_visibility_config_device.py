@@ -1,5 +1,6 @@
 """集中配置与 CUDA 自动选择的行为测试。"""
 
+import copy
 import logging
 
 import numpy as np
@@ -127,9 +128,23 @@ def test_actual_gpu_training_and_resume(tmp_path, monkeypatch, dtype):
         assert checkpoint["scaler_state"]
         assert checkpoint["optimizer_state"]["param_groups"][0]["lr"] > 0
         resumed = VisibilityTrainer(cfg, resume="auto")
+        captured_states = []
+        original_step = torch.amp.GradScaler.step
+        observe_resume_step = {"enabled": False}
+
+        def capture_first_resume_step(scaler, optimizer, *args, **kwargs):
+            if observe_resume_step["enabled"] and not captured_states:
+                captured_states.append(copy.deepcopy(scaler.state_dict()))
+            return original_step(scaler, optimizer, *args, **kwargs)
+
+        # Public GradScaler API plus the immutable disk checkpoint oracle rejects a pending-only
+        # implementation that never loads scaler state into the resumed scaler.
+        monkeypatch.setattr(torch.amp.GradScaler, "step", capture_first_resume_step)
+        observe_resume_step["enabled"] = True
         resumed.fit()
         assert resumed.scaler.is_enabled()
-        assert resumed._pending_scaler_state == checkpoint["scaler_state"]
+        assert len(captured_states) == 1
+        assert captured_states[0] == checkpoint["scaler_state"]
 
 
 def test_pipeline_rejects_unsupported_device_before_build_and_preserves_config(tmp_path):

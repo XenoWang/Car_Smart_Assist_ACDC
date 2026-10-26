@@ -7,9 +7,11 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import shutil
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -132,25 +134,274 @@ def _atomic_save(payload: dict[str, Any], path: Path) -> None:
     tmp.replace(path)
 
 
-def archive_visibility_checkpoints(directory: Path, report_path: Path | None = None) -> None:
+_TRANSACTION_DIRECTORY = ".visibility_checkpoint_transaction"
+_CHECKPOINT_NAMES = ("best.pt", "last.pt")
+_TRANSACTION_FILES = {
+    "owner.json", "journal.json", "journal.json.pending",
+    *_CHECKPOINT_NAMES,
+    *(name + ".tmp" for name in _CHECKPOINT_NAMES),
+    *(name + ".before" for name in _CHECKPOINT_NAMES),
+}
+
+
+def _checkpoint_file_sha256(path: Path) -> str | None:
+    if path.is_symlink() or path.resolve() != path:
+        raise ValueError(f"拒绝链接检查点或事务文件，保留原件：{path}")
+    if not path.exists():
+        return None
+    if not path.is_file() or path.stat().st_nlink != 1:
+        raise ValueError(f"检查点或事务文件必须是非链接普通文件：{path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_checkpoint_bytes(path: Path, payload: bytes) -> None:
+    with path.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if path.read_bytes() != payload:
+        raise OSError(f"事务写入回读不一致，保留证据：{path}")
+
+
+def _visibility_transaction_state(directory: Path):
+    directory = Path(os.path.abspath(directory))
+    if directory.is_symlink() or directory.resolve() != directory:
+        raise ValueError(f"检查点目录不能包含链接：{directory}")
+    transaction = directory / _TRANSACTION_DIRECTORY
+    if transaction.is_symlink() or transaction.resolve() != transaction:
+        raise ValueError(f"事务目录不能包含链接，保留证据：{transaction}")
+    if not transaction.exists():
+        return directory, transaction, {}, None
+    if not transaction.is_dir():
+        raise ValueError(f"事务路径不是目录，保留证据：{transaction}")
+    files = {path.name: path for path in transaction.iterdir()}
+    for name, path in files.items():
+        if name not in _TRANSACTION_FILES:
+            raise ValueError(f"事务目录含未知文件，保留证据：{path}")
+        _checkpoint_file_sha256(path)
+    owner = None
+    if "owner.json" in files:
+        try:
+            owner = json.loads(files["owner.json"].read_text(encoding="utf-8"))
+            if (
+                set(owner) != {"format_version", "transaction_id", "checkpoint_directory"}
+                or type(owner["format_version"]) is not int or owner["format_version"] != 1
+                or owner["checkpoint_directory"] != str(directory)
+                or not isinstance(owner["transaction_id"], str)
+                or len(owner["transaction_id"]) != 32
+                or any(char not in "0123456789abcdef" for char in owner["transaction_id"])
+            ):
+                raise ValueError("ownership 标记无效")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ValueError(f"事务目录归属无法确认，保留原件：{transaction}") from exc
+    return directory, transaction, files, owner
+
+
+def recover_visibility_checkpoint_transaction(directory: Path) -> bool:
+    """持有 run.lock 时核验并前滚未来保存的事务，不猜测历史混合 pair。"""
+    directory, transaction, files, owner = _visibility_transaction_state(directory)
+    if not transaction.exists():
+        return False
+    if not files:
+        transaction.rmdir()
+        return False
+    if "journal.json" not in files:
+        if owner is None:
+            raise ValueError(f"无 journal 且无法确认事务归属，保留原件：{transaction}")
+        archive_visibility_checkpoints(directory, transaction_only=True)
+        return False
+    journal_bytes = files["journal.json"].read_bytes()
+    try:
+        journal = json.loads(journal_bytes)
+        if (
+            set(journal) != {"format_version", "transaction_id", "checkpoint_directory",
+                             "before_sha256", "after_sha256", "updates"}
+            or type(journal["format_version"]) is not int or journal["format_version"] != 1
+            or journal["checkpoint_directory"] != str(directory)
+            or not isinstance(journal["transaction_id"], str)
+            or len(journal["transaction_id"]) != 32
+            or any(char not in "0123456789abcdef" for char in journal["transaction_id"])
+            or (owner is not None and owner["transaction_id"] != journal["transaction_id"])
+        ):
+            raise ValueError("事务身份无效")
+        before, after, updates = journal["before_sha256"], journal["after_sha256"], journal["updates"]
+        if (
+            not isinstance(before, dict) or set(before) != set(_CHECKPOINT_NAMES)
+            or not isinstance(after, dict) or set(after) != set(_CHECKPOINT_NAMES)
+            or not isinstance(updates, dict) or not updates or not set(updates) <= set(_CHECKPOINT_NAMES)
+        ):
+            raise ValueError("事务目标无效")
+        for value in (*before.values(), *after.values()):
+            if value is not None and (
+                not isinstance(value, str) or len(value) != 64
+                or any(char not in "0123456789abcdef" for char in value)
+            ):
+                raise ValueError("事务摘要无效")
+        expected_files = {"owner.json", "journal.json"}
+        for name in _CHECKPOINT_NAMES:
+            if name not in updates:
+                if before[name] != after[name]:
+                    raise ValueError("未更新目标的摘要改变")
+                continue
+            record = updates[name]
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"candidate", "candidate_sha256", "backup", "backup_sha256"}
+                or record["candidate"] != name or record["candidate_sha256"] != after[name]
+                or after[name] is None or record["backup_sha256"] != before[name]
+                or record["backup"] != (name + ".before" if before[name] is not None else None)
+            ):
+                raise ValueError("事务候选或备份记录无效")
+            expected_files.add(name)
+            if record["backup"] is not None:
+                expected_files.add(name + ".before")
+        if not files.keys() <= expected_files:
+            raise ValueError("事务含不属于该 journal 的文件")
+    except (ValueError, TypeError, KeyError) as exc:
+        raise ValueError(f"保存事务 journal 无效，保留原件：{transaction}") from exc
+
+    current = {name: _checkpoint_file_sha256(directory / name) for name in _CHECKPOINT_NAMES}
+    if any(current[name] not in (before[name], after[name]) for name in _CHECKPOINT_NAMES):
+        raise ValueError(f"正式检查点丢失或摘要不属于事务，拒绝恢复：{transaction}")
+    all_after = current == after
+    if owner is None and not all_after:
+        raise ValueError(f"未完成事务缺少 ownership 标记，保留原件：{transaction}")
+    # 先核验整对和全部待发布候选，不能先修 best 再发现 last 无法发布。
+    for name, record in updates.items():
+        candidate = _checkpoint_file_sha256(transaction / name)
+        if candidate is not None and candidate != after[name]:
+            raise ValueError(f"事务候选摘要不匹配：{transaction / name}")
+        if current[name] != after[name] and candidate is None:
+            raise ValueError(f"事务待发布候选缺失：{transaction / name}")
+        if record["backup"] is not None:
+            backup = _checkpoint_file_sha256(transaction / (name + ".before"))
+            if backup is not None and backup != before[name]:
+                raise ValueError(f"事务旧文件备份摘要不匹配：{transaction / (name + '.before')}")
+            if not all_after and backup is None:
+                raise ValueError(f"未完成事务缺少旧文件备份：{transaction / (name + '.before')}")
+    for name in _CHECKPOINT_NAMES:
+        if name not in updates:
+            continue
+        observed = _checkpoint_file_sha256(directory / name)
+        if observed not in (before[name], after[name]):
+            raise ValueError(f"发布前正式检查点改变，保留事务：{directory / name}")
+        if observed != after[name]:
+            candidate = transaction / name
+            if _checkpoint_file_sha256(candidate) != after[name]:
+                raise ValueError(f"发布前候选改变，保留事务：{candidate}")
+            os.replace(candidate, directory / name)
+            if _checkpoint_file_sha256(directory / name) != after[name]:
+                raise OSError(f"发布检查点回读不一致，保留事务：{directory / name}")
+    if {name: _checkpoint_file_sha256(directory / name) for name in _CHECKPOINT_NAMES} != after:
+        raise ValueError(f"事务发布后整对摘要不匹配，保留证据：{transaction}")
+    _, _, remaining, _ = _visibility_transaction_state(directory)
+    if not remaining.keys() <= expected_files or remaining["journal.json"].read_bytes() != journal_bytes:
+        raise ValueError(f"清理前事务内容改变，保留证据：{transaction}")
+    for name, path in remaining.items():
+        if name not in {"owner.json", "journal.json"}:
+            path.unlink()
+    (transaction / "owner.json").unlink(missing_ok=True)
+    (transaction / "journal.json").unlink()
+    transaction.rmdir()
+    return True
+
+
+def _publish_checkpoint_transaction(directory: Path, updates: dict[str, dict[str, Any]]) -> None:
+    """备份与候选全部持久化后登记事务，再按 best→last 发布。调用者持 run.lock。"""
+    if not updates or not set(updates) <= set(_CHECKPOINT_NAMES):
+        raise ValueError("AE 保存事务只允许更新 best.pt/last.pt")
+    recover_visibility_checkpoint_transaction(directory)
+    directory, transaction, _, _ = _visibility_transaction_state(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    before = {name: _checkpoint_file_sha256(directory / name) for name in _CHECKPOINT_NAMES}
+    transaction.mkdir()
+    owner = {"format_version": 1, "transaction_id": uuid.uuid4().hex,
+             "checkpoint_directory": str(directory)}
+    _write_checkpoint_bytes(transaction / "owner.json", json.dumps(owner, indent=2).encode("utf-8"))
+    for name in _CHECKPOINT_NAMES:
+        if name in updates and before[name] is not None:
+            original = (directory / name).read_bytes()
+            if hashlib.sha256(original).hexdigest() != before[name]:
+                raise ValueError(f"备份前正式检查点改变：{directory / name}")
+            _write_checkpoint_bytes(transaction / (name + ".before"), original)
+    after = dict(before)
+    records = {}
+    for name in _CHECKPOINT_NAMES:
+        if name not in updates:
+            continue
+        candidate = transaction / name
+        _atomic_save(updates[name], candidate)
+        original = candidate.read_bytes()
+        with candidate.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
+        if candidate.read_bytes() != original:
+            raise OSError(f"候选检查点回读不一致：{candidate}")
+        after[name] = hashlib.sha256(original).hexdigest()
+        records[name] = {"candidate": name, "candidate_sha256": after[name],
+                         "backup": name + ".before" if before[name] is not None else None,
+                         "backup_sha256": before[name]}
+    if {name: _checkpoint_file_sha256(directory / name) for name in _CHECKPOINT_NAMES} != before:
+        raise ValueError(f"准备事务期间正式检查点改变，保留证据：{transaction}")
+    journal = {**owner, "before_sha256": before, "after_sha256": after, "updates": records}
+    journal_bytes = json.dumps(journal, indent=2).encode("utf-8")
+    pending = transaction / "journal.json.pending"
+    _write_checkpoint_bytes(pending, journal_bytes)
+    os.replace(pending, transaction / "journal.json")
+    if (transaction / "journal.json").read_bytes() != journal_bytes:
+        raise OSError(f"事务 journal 发布回读不一致：{transaction}")
+    recover_visibility_checkpoint_transaction(directory)
+
+
+def archive_visibility_checkpoints(
+    directory: Path, report_path: Path | None = None, *, transaction_only: bool = False
+) -> None:
     """Preserve explicit-fresh artifacts before model initialization."""
-    paths = [directory / "last.pt", directory / "best.pt"]
-    if report_path is not None:
+    directory, transaction, transaction_files, owner = _visibility_transaction_state(directory)
+    if transaction.exists() and not transaction_files:
+        transaction.rmdir()
+    if transaction.exists() and owner is None:
+        raise ValueError(f"无法确认残事务归属，拒绝归档或删除：{transaction}")
+    paths = [] if transaction_only else [directory / "last.pt", directory / "best.pt"]
+    if report_path is not None and not transaction_only:
+        report_path = Path(os.path.abspath(report_path))
         paths.append(report_path)
+    paths.extend(transaction_files.values())
+    for path in paths:
+        _checkpoint_file_sha256(path)
     existing = {path: path.read_bytes() for path in paths if path.is_file()}
     if not existing:
         return
-    archive = directory / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    history = directory / "history"
+    if history.is_symlink() or history.resolve() != history:
+        raise ValueError(f"归档目录不能包含链接：{history}")
+    archive = history / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     archive.mkdir(parents=True)
     for path, original in existing.items():
-        target = archive / path.name
+        target = archive / (_TRANSACTION_DIRECTORY if path.parent == transaction else "") / path.name
+        target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
+        with target.open("r+b") as stream:
+            stream.flush()
+            os.fsync(stream.fileno())
         if target.read_bytes() != original or path.read_bytes() != original:
             raise OSError(f"检查点归档回读不一致：{path}")
     if any(path.read_bytes() != original for path, original in existing.items()):
         raise OSError("归档期间旧训练产物改变，保留原件并停止")
-    for path in existing:
+    # 归档全部回读一致后才删原件；事务标记仍留到最后。
+    ordered = sorted(existing, key=lambda path: (
+        path.parent == transaction,
+        2 if path.name == "journal.json" else 1 if path.name == "owner.json" else 0,
+        str(path),
+    ))
+    for path in ordered:
         path.unlink()
+    if transaction.exists():
+        transaction.rmdir()
 
 
 def apply_config_overrides(cfg: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
@@ -227,7 +478,16 @@ class VisibilityTrainer:
         self.ckpt_dir = self.root / tcfg.get(
             "checkpoint_dir", "artifacts/checkpoints/visibility"
         )
-        self.resume_path = resolve_resume_spec(resume, self.ckpt_dir)
+        self._resume_spec = resume
+        automatic = resume is None or (isinstance(resume, str) and resume.lower() == "auto")
+        fresh = resume is False or (isinstance(resume, str) and resume.lower() == "none")
+        local = automatic or (not fresh and Path(os.path.abspath(resume)) in {
+            Path(os.path.abspath(self.ckpt_dir / name)) for name in _CHECKPOINT_NAMES
+        })
+        self._deferred_resume = not fresh and local and (
+            self.ckpt_dir / _TRANSACTION_DIRECTORY / "journal.json"
+        ).exists()
+        self.resume_path = None if self._deferred_resume else resolve_resume_spec(resume, self.ckpt_dir)
         self.history = TrainHistory()
         self.calibration: CalibrationStats | None = None
         self.scaler: torch.amp.GradScaler | None = None
@@ -239,7 +499,9 @@ class VisibilityTrainer:
         self._best_model_sha256: str | None = None
         # 由 _build_datasets 填入各数据分区的样本数
         self.split_stats: dict[str, int] = {}
+        self._initialize_model()
 
+    def _initialize_model(self) -> None:
         # 续训时模型结构必须与检查点一致，否则加载权重会报形状不匹配。
         # 先把检查点里的 model_cfg 读出来，以它为准构建模型。
         ckpt_model_cfg: dict[str, Any] | None = None
@@ -549,6 +811,20 @@ class VisibilityTrainer:
         self.ckpt_dir.mkdir(parents=True, exist_ok=True)
         with FileLock(str((self.ckpt_dir / "run.lock").resolve()), timeout=0, is_singleton=True), controller:
             controller.require_running()
+            if self._resume_spec is False or (
+                isinstance(self._resume_spec, str) and self._resume_spec.lower() == "none"
+            ):
+                archive_visibility_checkpoints(
+                    self.ckpt_dir,
+                    self.root / self.cfg.get("report", {}).get("output_dir", "artifacts/reports/visibility") / "train_history.json",
+                )
+            else:
+                recovered = recover_visibility_checkpoint_transaction(self.ckpt_dir)
+                previous = self.resume_path
+                self.resume_path = resolve_resume_spec(self._resume_spec, self.ckpt_dir)
+                if self._deferred_resume or recovered or self.resume_path != previous:
+                    self._initialize_model()
+                self._deferred_resume = False
             if continue_only and (
                 self.resume_path is None
                 or self.resume_path.resolve() != (self.ckpt_dir / "last.pt").resolve()
@@ -561,8 +837,6 @@ class VisibilityTrainer:
         tcfg = training_config(self.cfg.get("train", {}))
         dcfg = self.cfg.get("data", {})
         stop_controller.require_running()
-        if self.resume_path is None:
-            archive_visibility_checkpoints(self.ckpt_dir)
         # test 子集不在训练里构建 —— 只有评估脚本会用它
         train_ds, val_ds, calib_ds, _ = self._build_datasets()
 
@@ -773,9 +1047,9 @@ class VisibilityTrainer:
                 raise ValueError("尚无可核验的有限验证集best，拒绝保存伪最优检查点")
             # 先保存best，再保存引用其模型身份的last；不以当前轮补造旧best。
             payload = self._make_payload(epoch, opt, sched, val_loss)
-            if improved:
-                _atomic_save(payload, best_path)
-            _atomic_save(payload, last_path)
+            updates = {"best.pt": payload} if improved else {}
+            updates["last.pt"] = payload
+            _publish_checkpoint_transaction(self.ckpt_dir, updates)
 
             if epoch % 5 == 0 or epoch == start_epoch + 1:
                 logger.info(
@@ -806,7 +1080,7 @@ class VisibilityTrainer:
                 history=self.history.to_dict(), manual_stop=True,
                 termination_reason="manual_stop", training_complete=self.history.training_complete,
             )
-            _atomic_save(last, last_path)
+            _publish_checkpoint_transaction(self.ckpt_dir, {"last.pt": last})
             return True
 
         if pause_if_requested():
@@ -856,14 +1130,15 @@ class VisibilityTrainer:
             "termination_reason": self.history.termination_reason,
             "planned_epochs": self.history.planned_epochs,
         }
-        _atomic_save(best_payload, best_path)
+        updates = {"best.pt": best_payload}
         if completed_stage:
             last = torch.load(last_path, map_location="cpu", weights_only=False)
             last.update(
                 history=self.history.to_dict(), training_complete=True,
                 manual_stop=False, termination_reason=self.history.termination_reason,
             )
-            _atomic_save(last, last_path)
+            updates["last.pt"] = last
+        _publish_checkpoint_transaction(self.ckpt_dir, updates)
         pause_if_requested()
         logger.info("检查点已保存: %s（last: %s）", best_path, last_path)
         return self.history

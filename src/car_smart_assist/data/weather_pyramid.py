@@ -53,7 +53,22 @@ def known_mask(samples: list[WeatherSample]) -> np.ndarray:
 
 def collect_pyramid_samples(cfg: WeatherPyramidConfig, root: Path) -> list[WeatherSample]:
     data = cfg.data
-    invalid = load_invalid_entries(root / data["acdc_cleaning_manifest"], root)
+    invalid_by_source = {}
+    for source, key in (("acdc", "acdc_cleaning_manifest"), ("pixel_accurate", "pixel_cleaning_manifest")):
+        configured = data.get(key)
+        if configured is None:
+            invalid_by_source[source] = set()
+            continue
+        manifest = root / configured
+        if not manifest.is_file():
+            dataset = "acdc" if source == "acdc" else "pixel_accurate_benchmark"
+            raise FileNotFoundError(
+                f"清洗清单不存在：{manifest}。请先进行数据清洗。\n"
+                f"在项目根目录（{root}）运行：\n"
+                rf".\.venv\Scripts\python.exe -X utf8 scripts\clean_data.py --only {dataset} --corrupt-images-only"
+            )
+        invalid_by_source[source] = load_invalid_entries(manifest, root)
+    invalid = invalid_by_source["acdc"]
     records = [
         s
         for split in data["acdc_splits"]
@@ -77,7 +92,7 @@ def collect_pyramid_samples(cfg: WeatherPyramidConfig, root: Path) -> list[Weath
         root / data["pixel_zip"],
         cfg.attributes,
         4,
-        load_invalid_entries(root / data["pixel_cleaning_manifest"], root),
+        invalid_by_source["pixel_accurate"],
     )
     records.extend((*pixel_train, *pixel_val))
     if len({sample_identifier(s) for s in records}) != len(records):

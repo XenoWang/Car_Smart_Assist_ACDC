@@ -279,34 +279,6 @@ def test_pipeline_uses_weather_only_as_auxiliary_with_degraded_visibility():
     )
 
 
-def test_adverse_weather_and_degraded_visibility_jointly_request_handover():
-    class WeatherStub:
-        def predict(self, image):
-            return WeatherPrediction(
-                ("rain",),
-                {"fog": False, "rain": True, "snow": False, "night": False},
-                {"fog": 0.08, "rain": 0.9, "snow": 0.03, "night": 0.12},
-                dict.fromkeys(FEATURE_NAMES, 0.3),
-                "synthetic rain attribute",
-            )
-
-    class PerceptionStub:
-        def predict(self, image):
-            return PerceptionResult(object_detection_available=True)
-
-    pipeline = weather_pipeline(WeatherStub(), information=0.4)
-    pipeline.predictor = PerceptionStub()
-    result = pipeline.run(np.zeros((32, 48, 3), dtype=np.uint8))
-    assert result.visibility.level.value == "degraded"
-    assert result.weather_warning is not None
-    assert result.advisory.should_takeover is True
-    assert result.advisory.policy_details["unable_to_judge"] is False
-    assert (
-        "weather_visibility_auxiliary_handover"
-        in result.advisory.policy_details["risk"]["triggered"]
-    )
-
-
 def test_missing_perception_still_requests_takeover_independently_of_weather():
     class WeatherStub:
         def predict(self, image):
