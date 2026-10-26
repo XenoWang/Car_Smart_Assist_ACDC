@@ -19,6 +19,7 @@ from PIL import Image
 from car_smart_assist.data.detection import (
     _label_text,
     _materialize_image,
+    _publish_detection_staging,
     normalize_box,
     validate_detection_export,
 )
@@ -290,7 +291,7 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
             counts = validate_current(staging)
             if output.exists() or output.is_symlink():
                 raise ValueError("Joint output appeared during preparation; choose a new output_root")
-            staging.rename(output)
+            _publish_detection_staging(staging, output)
         finally:
             if staging.exists() or staging.is_symlink():
                 current = staging.lstat()

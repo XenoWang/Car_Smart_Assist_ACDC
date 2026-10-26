@@ -297,7 +297,11 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
         def get_model(self, cfg=None, weights=None, verbose=True):
             model = super().get_model(cfg, weights, verbose)
             manifest, _ = load_joint_index(self.data)
-            preserve_classification_outputs(weights, model, manifest["known_class_count"])
+            known_classes = manifest["known_class_count"]
+            preserve_classification_outputs(
+                weights, model, known_classes,
+                [item["name"] for item in manifest["classes"][:known_classes]],
+            )
             model.joint_detection = True
             model.joint_obstacle_class = manifest["known_class_count"]
             model.joint_foreground_exclusive = foreground_exclusive

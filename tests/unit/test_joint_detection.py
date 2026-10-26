@@ -87,11 +87,11 @@ def test_old_output_rows_preserved_when_adding_class():
         head = SimpleNamespace(
             nc=classes, cv3=[torch.nn.Sequential(torch.nn.Conv2d(4, classes, 1)) for _ in range(3)]
         )
-        return SimpleNamespace(model=[head])
+        return SimpleNamespace(model=[head], names={i: f"class_{i}" for i in range(classes)})
 
     old, new = model(2), model(3)
     new_rows = [layer[-1].weight[2].clone() for layer in new.model[-1].cv3]
-    assert preserve_classification_outputs(old, new, 2) == 3
+    assert preserve_classification_outputs(old, new, 2, ["class_0", "class_1"]) == 3
     for index, (a, b) in enumerate(zip(old.model[-1].cv3, new.model[-1].cv3, strict=True)):
         torch.testing.assert_close(a[-1].weight, b[-1].weight[:2])
         torch.testing.assert_close(a[-1].bias, b[-1].bias[:2])

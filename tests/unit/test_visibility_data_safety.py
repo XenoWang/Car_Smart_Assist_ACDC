@@ -110,8 +110,10 @@ def test_invalid_manifest_json_fails_clearly_instead_of_ignoring_filter(tmp_path
     _ref(tmp_path, "fog", "GOPR0001", 1)
     manifest = tmp_path / "broken.json"
     manifest.write_text("{invalid", encoding="utf-8")
-    with pytest.raises(json.JSONDecodeError):
+    with pytest.raises(ValueError, match="clean_data.py") as failure:
         list_ref_images(acdc_root, cleaning_manifest=manifest, project_root=tmp_path)
+    assert str(manifest) in str(failure.value)
+    assert isinstance(failure.value.__cause__, json.JSONDecodeError)
 
 
 def test_corrupt_sample_is_not_replaced_with_a_zero_image(tmp_path):

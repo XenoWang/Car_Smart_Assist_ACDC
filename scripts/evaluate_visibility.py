@@ -15,6 +15,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from car_smart_assist.config.visibility import validate_input_size  # noqa: E402
 from car_smart_assist.perception.visibility import (  # noqa: E402
     VisibilityGate,
     VisibilityScorer,
@@ -388,9 +389,15 @@ def write_report(report: dict[str, Any], out_dir: Path) -> None:
         "",
     ]
 
-    L += ["## 4. 合成退化（召回率与单调性）", ""]
+    L += [
+        "## 4. 合成退化（召回率与单调性）",
+        "",
+        "本节按本次固定的 severity 档位统计；召回率是描述统计，没有 90% 自动验收门禁。",
+        "硬阈值遮挡边界可能增加高频信息，信息量不保证随强度单调下降；保留实际非单调结果。",
+        "",
+    ]
     for kind, d in report["synthetic"].items():
-        mono = "✅ 单调递减" if d["information_monotonic_decreasing"] else "❌ **非单调，需排查**"
+        mono = "✅ 单调递减" if d["information_monotonic_decreasing"] else "⚠️ **非单调（保留实测结果）**"
         L += [
             f"### {kind}",
             "",
@@ -457,19 +464,26 @@ def main() -> int:
     ckpt = Path(args.checkpoint) if args.checkpoint else (
         root / cfg.get("train", {}).get("checkpoint_dir", "artifacts/checkpoints/visibility") / "best.pt"
     )
+    if not ckpt.is_absolute():
+        ckpt = root / ckpt
     if not ckpt.exists():
         logger.error("checkpoint 不存在: %s\n请先运行 scripts/train_visibility.py", ckpt)
         return 2
 
     device = args.device or str(cfg.get("device", "auto"))
-    scorer = VisibilityScorer.from_checkpoint(
-        ckpt,
-        device=resolve_device(device),
-        cfg=cfg.get("model", {}),
-        scoring_cfg=cfg.get("scoring"),
-    )
-    # 检查点决定模型有效尺寸，参考图与真实恶劣图必须沿用同一解码口径。
-    size = scorer.input_size
+    try:
+        scorer = VisibilityScorer.from_checkpoint(
+            ckpt,
+            device=resolve_device(device),
+            cfg=cfg.get("model", {}),
+            scoring_cfg=cfg.get("scoring"),
+        )
+        # 检查点决定模型有效尺寸，参考图与真实恶劣图必须沿用同一解码口径。
+        size = scorer.input_size
+        validate_input_size(dcfg, size)
+    except (OSError, ValueError, RuntimeError) as exc:
+        logger.error("无法初始化能见度评估：%s", exc)
+        return 2
     gate = VisibilityGate.from_config(cfg)
     if scorer.calibration is None:
         logger.warning(

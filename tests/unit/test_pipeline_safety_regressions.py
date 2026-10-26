@@ -167,8 +167,11 @@ def test_preflight_cannot_overwrite_default_reports(tmp_path, monkeypatch, repor
     config.mkdir(parents=True)
     (config / "weather_default.yaml").write_text(yaml.safe_dump({"weather_default": {
         "config": "configs/model/deployed.yaml", "checkpoint": "weights/best.pt"}}), encoding="utf-8")
-    (config / "deployed.yaml").write_text(yaml.safe_dump({"weather_attention": {
-        "report_dir": "published", "report_file": "published/REPORT.md"}}), encoding="utf-8")
+    deployed = yaml.safe_load(
+        (ROOT / "configs/model/weather_attention_a.yaml").read_text(encoding="utf-8")
+    )
+    deployed["weather_attention"].update(report_dir="published", report_file="published/REPORT.md")
+    (config / "deployed.yaml").write_text(yaml.safe_dump(deployed), encoding="utf-8")
     cfg = SimpleNamespace(report_dir="published" if report_file.startswith("separate") else "separate",
                           report_file=report_file)
     monkeypatch.setattr(training, "select_device", lambda *_: pytest.fail("started preflight"))
@@ -435,6 +438,9 @@ def test_attention_comparison_stop_records_terminal_status_under_lock(tmp_path, 
     folder = tmp_path / "reports"
     folder.mkdir()
     profile = {"model_config": attention_model_config(cfg), "split_signature": "same",
+               "backbone_training": {"fine_tune_from": cfg.backbone["fine_tune_from"],
+                                     "freeze_epochs": cfg.backbone["freeze_epochs"],
+                                     "probe_epoch": cfg.backbone["freeze_epochs"] + 1},
                "batch_size": cfg.train["batch_size"], "channels_last": cfg.train["channels_last"],
                "swad": cfg.train.get("swad"), "l2_sp_coefficient": cfg.train.get("l2_sp", 0)}
     (folder / "preflight.json").write_text(json.dumps(profile), encoding="utf-8")

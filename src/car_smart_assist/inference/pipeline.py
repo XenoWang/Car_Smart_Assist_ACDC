@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
-from car_smart_assist.config.visibility import MODEL_DEFAULTS
+from car_smart_assist.config.visibility import MODEL_DEFAULTS, validate_input_size
 from car_smart_assist.config.weather import load_weather_config
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
@@ -206,6 +206,8 @@ class InferencePipeline:
             )
         else:
             logger.warning("未找到门控 checkpoint（%s），管线将不带能见度判断运行", ckpt)
+
+        validate_input_size(visibility_cfg.get("data", {}), size)
 
         weather_predictor = None
         default_route = root / "configs/model/weather_default.yaml"

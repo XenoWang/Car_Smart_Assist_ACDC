@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
@@ -45,6 +46,44 @@ def load_weather_attention_config(path: str | Path) -> WeatherAttentionConfig:
 
 
 def validate_weather_attention_config(cfg: WeatherAttentionConfig):
+    allowed_keys = {
+        "backbone": {
+            "name", "weights", "weights_file", "feature_indices", "feature_channels",
+            "feature_strides", "fine_tune_from", "freeze_epochs", "mean", "std", "metadata",
+        },
+        "head": {"dimension", "heads", "expansion", "dropout", "metadata"},
+        "data": {
+            "acdc_root", "acdc_splits", "include_normal_references", "acdc_cleaning_manifest",
+            "pixel_zip", "pixel_cleaning_manifest", "cache_dir", "split_ratios", "seed", "metadata",
+        },
+        "train": {
+            "epochs", "batch_size", "backbone_learning_rate", "learning_rate", "weight_decay",
+            "warmup_epochs", "minimum_lr_ratio", "gradient_clip", "amp", "channels_last",
+            "brightness_range", "contrast_range", "horizontal_flip_probability",
+            "source_sampling_weights", "schedule_epochs", "l2_sp", "early_stopping", "swad",
+            "continuation", "metadata",
+        },
+        "evaluation": {
+            "batch_size", "threshold_steps", "selection_weights", "ap_selection_fraction",
+            "benchmark_iterations", "benchmark_warmup", "cpu_threads", "old_config",
+            "old_checkpoint", "asl_config", "asl_checkpoint", "attention_references",
+            "summary_file", "summary_tag", "metadata",
+        },
+    }
+    for section, allowed in allowed_keys.items():
+        options = getattr(cfg, section)
+        if not isinstance(options, dict):
+            raise ValueError(f"{section} 必须为配置映射")
+        unknown = set(options) - allowed
+        if unknown:
+            raise ValueError(f"{section} 包含未知配置键：{', '.join(sorted(map(str, unknown)))}")
+        if "metadata" in options and not isinstance(options["metadata"], dict):
+            raise ValueError(f"{section}.metadata 必须为映射")
+    if (
+        not isinstance(cfg.device, str)
+        or re.fullmatch(r"(?:auto|cpu|cuda(?::[0-9]+)?|mps)", cfg.device) is None
+    ):
+        raise ValueError("device 必须是 auto/cpu/cuda/cuda:N/mps 非空字符串")
     if cfg.attributes != ("fog", "rain", "snow", "night"):
         raise ValueError("保持四个独立天气属性 fog/rain/snow/night")
     if len(cfg.image_size) != 2 or any(
@@ -251,11 +290,13 @@ def attention_model_config(cfg: WeatherAttentionConfig):
         "attributes": list(cfg.attributes),
         "image_size": list(cfg.image_size),
         "backbone": {
-            k: v
-            for k, v in cfg.backbone.items()
-            if k not in ("weights_file", "fine_tune_from", "freeze_epochs")
+            k: cfg.backbone[k]
+            for k in (
+                "name", "weights", "feature_indices", "feature_channels", "feature_strides",
+                "mean", "std",
+            )
         },
-        "head": cfg.head,
+        "head": {k: cfg.head[k] for k in ("dimension", "heads", "expansion", "dropout")},
         "preprocessing": "rgb-letterbox-bilinear-v1",
         "architecture": "mobilenet-three-scale-attribute-query-v1",
         "inference": "conv-bn-fold-v1",

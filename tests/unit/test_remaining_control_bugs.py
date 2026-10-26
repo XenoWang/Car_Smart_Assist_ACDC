@@ -144,6 +144,7 @@ def _weather_main_fixture(tmp_path, monkeypatch, *, compare):
     )
     (root / "reports/preflight.json").write_text(json.dumps({
         "model_config": {"synthetic": True}, "split_signature": "sig", "batch_size": 2,
+        "backbone_training": {"fine_tune_from": 0, "freeze_epochs": 0, "probe_epoch": 1},
         "channels_last": False, "swad": {"enabled": False}, "l2_sp_coefficient": 0,
     }), encoding="utf-8")
     controller = _Controller(root / "STOP")

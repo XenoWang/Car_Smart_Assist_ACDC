@@ -62,10 +62,19 @@ class JointDetectionLoss:
             self.base.bce.valid = self.base.bce.weights = None
 
 
-def preserve_classification_outputs(source, target, known_classes):
+def preserve_classification_outputs(source, target, known_classes, expected_names):
     """源模型恰含known_classes类且通道兼容时复制其分类输出行；其他初始化来源返回0。"""
     if source is None or source.model[-1].nc != known_classes:
         return 0
+    names = getattr(source, "names", None)
+    if isinstance(names, dict):
+        names = [names.get(index) for index in range(known_classes)]
+    if (
+        not isinstance(names, (list, tuple))
+        or len(expected_names) != known_classes
+        or list(names) != list(expected_names)
+    ):
+        raise ValueError("Source classifier class names/order differ from the joint manifest")
     copied = 0
     with torch.no_grad():
         for old, new in zip(source.model[-1].cv3, target.model[-1].cv3, strict=True):

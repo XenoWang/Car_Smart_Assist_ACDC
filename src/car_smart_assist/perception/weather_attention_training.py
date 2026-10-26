@@ -436,14 +436,23 @@ def require_independent_weather_reports(cfg, root):
     """Preflight and training must preserve the deployed model's report artifacts."""
     import yaml
 
+    root = Path(root).resolve()
     route_path = root / "configs/model/weather_default.yaml"
-    if not route_path.is_file():
+    if not route_path.exists():
         return
-    route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
-    document = yaml.safe_load((root / route["config"]).read_text(encoding="utf-8"))
-    deployed = next(iter(document.values()))
-    protected_dir = deployed.get("report_dir")
-    protected_file = deployed.get("report_file")
+    try:
+        route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
+        if (
+            not isinstance(route, dict)
+            or set(route) != {"config", "checkpoint"}
+            or any(not isinstance(value, str) or not value.strip() for value in route.values())
+        ):
+            raise ValueError("需要 config 和 checkpoint 两条路径")
+        deployed = load_weather_attention_config(root / route["config"])
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"默认天气路由或配置无效，停止写入以保护部署报告：{exc}") from exc
+    protected_dir = deployed.report_dir
+    protected_file = deployed.report_file
     targets = [root / cfg.report_dir / name for name in ("preflight.json", "progress.json")]
     targets.append(root / cfg.report_file)
     for path in targets:
@@ -541,7 +550,8 @@ def preflight_attention(cfg, root, datasets, split_info):
         "parameters": sum(p.numel() for p in asl.model.parameters()),
         "forward_ms": benchmark_model(asl.model, image, cfg),
     }
-    model.set_training_epoch(cfg.backbone["freeze_epochs"] + 1)
+    probe_epoch = cfg.backbone["freeze_epochs"] + 1
+    model.set_training_epoch(probe_epoch)
     model.train()
     sample = batch_images(ds, indices, device, cfg)
     labels = torch.from_numpy(ds.targets[indices]).to(device)
@@ -607,6 +617,11 @@ def preflight_attention(cfg, root, datasets, split_info):
         ),
         "split_signature": split_info["signature"],
         "model_config": attention_model_config(cfg),
+        "backbone_training": {
+            "fine_tune_from": cfg.backbone["fine_tune_from"],
+            "freeze_epochs": cfg.backbone["freeze_epochs"],
+            "probe_epoch": probe_epoch,
+        },
         "batch_size": cfg.train["batch_size"],
         "channels_last": cfg.train["channels_last"],
         "training_started": False,
@@ -662,8 +677,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
         raise ValueError("追加训练输出必须使用独立目录，不能覆盖源检查点")
     stop_controller.require_running()
     if fresh:
-        existing = [
-            p
+        existing = {
+            p: Path(p.name)
             for p in dict.fromkeys(
                 (
                     best_path,
@@ -674,12 +689,24 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 )
             )
             if p.exists()
-        ]
+        }
+        report_dir = root / cfg.report_dir
+        for name in (
+            "comparison.json", "test_predictions.csv", "history.json", "progress.json", "REPORT.md",
+        ):
+            path = report_dir / name
+            if path.exists():
+                existing.setdefault(path, Path("reports") / name)
+        report_file = root / cfg.report_file
+        if report_file.exists():
+            existing.setdefault(report_file, Path("report_file") / report_file.name)
         if existing:
             folder = destination / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
             folder.mkdir(parents=True)
-            for p in existing:
-                shutil.copy2(p, folder / p.name)
+            for p, relative in existing.items():
+                archived = folder / relative
+                archived.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(p, archived)
             for p in existing:
                 p.unlink()
     baseline_hashes = {

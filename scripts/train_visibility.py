@@ -110,7 +110,7 @@ def main() -> int:
 
         try:
             trainer = VisibilityTrainer(cfg, project_root=root, resume=resume)
-        except (ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             logging.getLogger(__name__).error("无法初始化训练设备或检查点：%s", exc)
             return 2
         if trainer.resume_path is not None:
@@ -120,7 +120,7 @@ def main() -> int:
 
         try:
             history = trainer.fit(stop_controller=controller, continue_only=args.continue_training)
-        except (ValueError, RuntimeError) as exc:
+        except (OSError, ValueError, RuntimeError) as exc:
             logging.getLogger(__name__).error("无法继续训练：%s", exc)
             return 2
 

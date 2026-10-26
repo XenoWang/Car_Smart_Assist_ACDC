@@ -99,19 +99,6 @@ visibility:
   require_calibration: true
   degraded_confidence_multiplier: 0.6
 
-  degradation:
-    fog:
-      transmission_range: [0.05, 0.30]   # 透射率，越小雾越浓
-      atmospheric_light: 1.0
-    darkness:
-      gamma_range: [3.0, 6.0]
-      scale_range: [0.02, 0.10]
-    occlusion:
-      coverage_range: [0.75, 0.98]
-    blur:
-      kernel_range: [15, 41]
-    expected_recall: 0.90
-
   report:
     output_dir: artifacts/reports/visibility
     sample_per_condition: 200

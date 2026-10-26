@@ -12,6 +12,7 @@ from uuid import uuid4
 import numpy as np
 import torch
 from PIL import Image
+from filelock import FileLock
 from torch.utils.data import Dataset
 
 from car_smart_assist.config.visibility import AUGMENTATION_DEFAULTS, MODEL_DEFAULTS
@@ -41,7 +42,15 @@ def _exclude_invalid(
             r".\.venv\Scripts\python.exe -X utf8 scripts\clean_data.py --only acdc --corrupt-images-only"
         )
     invalid = load_invalid_entries(manifest_path, root)
-    return [path for path in paths if str(path.resolve()) not in invalid]
+    retained = [path for path in paths if str(path.resolve()) not in invalid]
+    if invalid and len(retained) == len(paths):
+        logger.warning(
+            "非空 invalid 清单没有匹配当前候选图片：%s。可能是本次图片均有效，"
+            "也可能是项目搬目录或换盘后绝对路径已失效；请核对并重新运行 "
+            "scripts/clean_data.py 生成清单，不会猜测旧根目录映射。",
+            manifest_path,
+        )
+    return retained
 
 
 def list_ref_images(
@@ -318,6 +327,13 @@ def ensure_cache(
     if cache_path is None:
         return None
     cp = Path(cache_path)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(cp.resolve()) + ".lock"):
+        return _ensure_cache_locked(paths, size, cp)
+
+
+def _ensure_cache_locked(paths: Sequence[Path], size: tuple[int, int], cp: Path) -> Path:
+    """在路径锁内完成身份检查、构建和发布，避免并发进程互相替换。"""
     paths = [Path(path) for path in paths]
     shape = (len(paths), *size, 3)
     identity = _cache_identity(paths, size)
@@ -350,8 +366,14 @@ def ensure_cache(
             ),
             encoding="utf-8",
         )
-        temporary.replace(cp)
-        temporary_manifest.replace(manifest)
+        try:
+            temporary.replace(cp)
+            temporary_manifest.replace(manifest)
+        except PermissionError as exc:
+            raise ValueError(
+                f"无法发布图像缓存：{cp}。缓存可能仍被其他训练进程或 DataLoader 映射，"
+                "也可能没有写权限；请结束占用进程、核对权限，或设置独立的 data.cache_path 后重试。"
+            ) from exc
     finally:
         temporary.unlink(missing_ok=True)
         temporary_manifest.unlink(missing_ok=True)

@@ -23,7 +23,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from filelock import FileLock
 
-from car_smart_assist.config.visibility import MODEL_DEFAULTS, training_config
+from car_smart_assist.config.visibility import (
+    MODEL_DEFAULTS,
+    training_config,
+    validate_input_size,
+)
 from car_smart_assist.perception.visibility.autoencoder import (
     build_autoencoder,
     reconstruction_mean,
@@ -36,6 +40,21 @@ from car_smart_assist.utils.stop import StopController
 logger = logging.getLogger(__name__)
 
 ResumeSpec = Literal["auto", "none"] | str | Path | None
+
+
+def _load_visibility_checkpoint(path: str | Path) -> dict[str, Any]:
+    """统一反序列化失败提示；中断与退出信号仍由调用方处理。"""
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        # torch.load 的损坏异常随序列化格式变化；不捕获 BaseException 中的中断。
+        raise ValueError(
+            f"无法读取能见度检查点：{path}；文件可能损坏或不兼容。"
+            "请保留原件并确认路径，使用可用的配对检查点或 --fresh 新开实验。"
+        ) from exc
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"能见度检查点格式无效：{path}；预期为状态字典，请检查权重来源")
+    return checkpoint
 
 
 @dataclass
@@ -506,7 +525,7 @@ class VisibilityTrainer:
         # 先把检查点里的 model_cfg 读出来，以它为准构建模型。
         ckpt_model_cfg: dict[str, Any] | None = None
         if self.resume_path is not None:
-            head = torch.load(self.resume_path, map_location="cpu", weights_only=False)
+            head = _load_visibility_checkpoint(self.resume_path)
             if int(head.get("format_version", 1)) < 2:
                 raise ValueError(
                     f"检查点 {self.resume_path} 使用旧的 train/calib/test 划分策略，"
@@ -538,6 +557,12 @@ class VisibilityTrainer:
         if ckpt_model_cfg:
             self.model_cfg = dict(ckpt_model_cfg)
 
+        # 未完成事务的恢复尚未决定有效结构，等待 fit 持锁恢复后再校验。
+        if not self._deferred_resume:
+            validate_input_size(
+                self.cfg.get("data", {}),
+                tuple(self.model_cfg.get("input_size", MODEL_DEFAULTS["input_size"])),
+            )
         self.model = build_autoencoder(self.model_cfg).to(self.device)
 
     # --- 数据 ---
@@ -697,7 +722,7 @@ class VisibilityTrainer:
                 f"历史best缺失：{path}。请使用保有匹配best的原训练目录；"
                 "不会把last或恢复后的第一轮当成历史best。"
             )
-        best = torch.load(path, map_location="cpu", weights_only=False)
+        best = _load_visibility_checkpoint(path)
         for key in ("split_signature", "seed", "model_cfg", "best_epoch", "best_val_loss"):
             if key not in reference or key not in best or best[key] != reference[key]:
                 raise ValueError(f"历史best与恢复记录的{key}不匹配：{path}，拒绝完整续训")
@@ -712,7 +737,7 @@ class VisibilityTrainer:
         """从检查点恢复全部状态，返回已完成的轮次。"""
         assert self.resume_path is not None
         # 用模型和优化器的 load_state_dict 迁移，避免完整检查点先占显存。
-        ckpt = torch.load(self.resume_path, map_location="cpu", weights_only=False)
+        ckpt = _load_visibility_checkpoint(self.resume_path)
         if require_full_state and any(
             ckpt.get(key) is None
             for key in ("optimizer_state", "scheduler_state", "scaler_state", "rng_state")
@@ -822,9 +847,10 @@ class VisibilityTrainer:
                 recovered = recover_visibility_checkpoint_transaction(self.ckpt_dir)
                 previous = self.resume_path
                 self.resume_path = resolve_resume_spec(self._resume_spec, self.ckpt_dir)
-                if self._deferred_resume or recovered or self.resume_path != previous:
-                    self._initialize_model()
+                reinitialize = self._deferred_resume or recovered or self.resume_path != previous
                 self._deferred_resume = False
+                if reinitialize:
+                    self._initialize_model()
             if continue_only and (
                 self.resume_path is None
                 or self.resume_path.resolve() != (self.ckpt_dir / "last.pt").resolve()
@@ -1075,7 +1101,7 @@ class VisibilityTrainer:
             self.history.termination_reason = "manual_stop"
             if not last_path.is_file():
                 stop_controller.require_running()
-            last = torch.load(last_path, map_location="cpu", weights_only=False)
+            last = _load_visibility_checkpoint(last_path)
             last.update(
                 history=self.history.to_dict(), manual_stop=True,
                 termination_reason="manual_stop", training_complete=self.history.training_complete,
@@ -1132,7 +1158,7 @@ class VisibilityTrainer:
         }
         updates = {"best.pt": best_payload}
         if completed_stage:
-            last = torch.load(last_path, map_location="cpu", weights_only=False)
+            last = _load_visibility_checkpoint(last_path)
             last.update(
                 history=self.history.to_dict(), training_complete=True,
                 manual_stop=False, termination_reason=self.history.termination_reason,

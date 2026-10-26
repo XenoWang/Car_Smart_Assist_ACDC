@@ -53,9 +53,9 @@ def add_occlusion(img: np.ndarray, severity: float, rng: np.random.Generator,
                   coverage_max: float = 0.98) -> tuple[np.ndarray, DegradationSpec]:
     """遮挡模拟：模拟镜头被泥污/雪覆盖。
 
-    用低频噪声生成一块不规则的覆盖区域，不贴矩形 ——
-    矩形遮挡会让「边缘密度」这类特征突然升高（遮挡边界本身就是强边缘），
-    给模型一个虚假的信号。低频噪声生成的覆盖没有这种人为边缘。
+    低频噪声确定不规则区域，再按覆盖率硬阈值二值化。
+    二值边界仍会引入高频和边缘，低强度遮挡的信息量可能高于清晰图，
+    因而本协议不保证信息量随强度单调下降。
     """
     h, w = img.shape[:2]
     coverage = float(np.clip(coverage_max * severity, 0.0, 1.0))

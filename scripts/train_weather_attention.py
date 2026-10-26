@@ -92,13 +92,18 @@ def main(argv=None, *, stop_controller=None):
                 profile = json.loads(profile_path.read_text(encoding="utf-8"))
                 if (
                     profile.get("model_config") != attention_model_config(cfg)
+                    or profile.get("backbone_training") != {
+                        "fine_tune_from": cfg.backbone["fine_tune_from"],
+                        "freeze_epochs": cfg.backbone["freeze_epochs"],
+                        "probe_epoch": cfg.backbone["freeze_epochs"] + 1,
+                    }
                     or profile["split_signature"] != info["signature"]
                     or profile["batch_size"] != cfg.train["batch_size"]
                     or profile["channels_last"] != cfg.train["channels_last"]
                     or profile.get("swad") != cfg.train.get("swad")
                     or profile.get("l2_sp_coefficient", 0) != cfg.train.get("l2_sp", 0)
                 ):
-                    raise ValueError("模型、批量或数据已改变，请重新运行 --preflight")
+                    raise ValueError("模型、微调配方、批量或数据已改变，请重新运行 --preflight")
                 trained_model, trained = train_attention(
                     cfg, root, datasets, info, fresh=args.fresh, stop_controller=controller,
                     continue_only=args.continue_training

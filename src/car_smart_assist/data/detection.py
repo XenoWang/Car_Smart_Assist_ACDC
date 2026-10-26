@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import tempfile
+import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -323,6 +324,30 @@ def _materialize_image(source: Path, destination: Path, mode: str, digest: str) 
     return "copy"
 
 
+def _publish_detection_staging(staging: Path, output: Path) -> None:
+    """Publish once, tolerating brief Windows locks without replacing another export."""
+    if staging.parent != output.parent:
+        raise ValueError("Detection staging and output must share a parent directory")
+    identity = staging.lstat()
+    for attempt in range(6):
+        if output.exists() or output.is_symlink():
+            raise ValueError("Detection output appeared during preparation; choose a new output_root")
+        current = staging.lstat()
+        if staging.is_symlink() or (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
+            raise ValueError("Detection staging identity changed; refusing publication")
+        try:
+            staging.rename(output)
+            return
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32, 33) or attempt == 5:
+                raise
+            logging.warning(
+                "Windows temporarily denied detection publication (error %s); retry %d/5",
+                exc.winerror, attempt + 1,
+            )
+            time.sleep(0.05 * 2 ** attempt)
+
+
 def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict[str, int]:
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
     groups: dict[str, str] = {}
@@ -567,7 +592,7 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
                 if not output.is_dir() or any(output.iterdir()):
                     raise ValueError("Detection output appeared during preparation; use a new output_root")
                 output.rmdir()
-            staging.rename(output)
+            _publish_detection_staging(staging, output)
         finally:
             if staging.exists() or staging.is_symlink():
                 current = staging.lstat()

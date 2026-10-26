@@ -7,6 +7,8 @@ import io
 import json
 import logging
 import math
+import os
+import tempfile
 import zipfile
 import zlib
 from collections import Counter, defaultdict
@@ -42,7 +44,12 @@ def load_invalid_entries(manifest_path: str | Path, project_root: str | Path) ->
     if not path.is_file():
         return set()
     root = Path(project_root)
-    entries = json.loads(path.read_text(encoding="utf-8"))["invalid"]
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))["invalid"]
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise ValueError(
+            f"清洗清单损坏: {path}；请重新运行 scripts/clean_data.py 生成清单"
+        ) from exc
     invalid = set()
     for entry in entries:
         source, separator, member = entry.partition("::")
@@ -51,6 +58,24 @@ def load_invalid_entries(manifest_path: str | Path, project_root: str | Path) ->
             source_path = root / source_path
         invalid.add(str(source_path.resolve()) + ("::" + member if separator else ""))
     return invalid
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    """在同目录完成持久写入后替换，失败时保留原文件。"""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class Severity(str, Enum):
@@ -197,9 +222,7 @@ class CleaningReport:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
 
-        (out / "report.json").write_text(
-            json.dumps(self.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _atomic_write_json(out / "report.json", self.to_dict())
 
         lines: list[str] = ["# 数据清洗报告", ""]
         lines += ["## 汇总", "", "| 严重度 | 数量 |", "|--------|------|"]
@@ -689,7 +712,8 @@ def check_acdc(
     # --- 3. 掩码有效性 ---
     if checks.get("acdc_mask_validity", True):
         mask_cfg = cfg.get("mask_validity", {})
-        ignore_index = int(mask_cfg.get("ignore_index", 255))
+        # 此处读取 Cityscapes labelIds，void=0；trainIds 的 ignore=255 不适用。
+        ignore_index = 0
         min_valid = float(mask_cfg.get("min_valid_pixel_ratio", 0.05))
         single_ratio = float(mask_cfg.get("single_class_ratio", 0.995))
         max_id = int(mask_cfg.get("max_class_id", 33))
@@ -1167,7 +1191,8 @@ def check_statistical_outliers(
 
 
 def _write_manifest(
-    report: CleaningReport, all_paths: Sequence[str | Path], out_dir: str | Path, name: str
+    report: CleaningReport, all_paths: Sequence[str | Path], out_dir: str | Path, name: str,
+    *, extra: dict[str, Any] | None = None,
 ) -> Path:
     """写出有效样本清单 —— 这是清洗的实际产物，数据集类据此过滤。"""
     out = Path(out_dir)
@@ -1184,8 +1209,9 @@ def _write_manifest(
         "suspect": suspect,
         "invalid": invalid,
     }
+    payload.update(extra or {})
     path = out / f"{name}.json"
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _atomic_write_json(path, payload)
     logger.info(
         "%s 清单已写出: valid=%d suspect=%d invalid=%d -> %s",
         name, len(valid), len(suspect), len(invalid), path,
@@ -1311,20 +1337,20 @@ def clean(
         )
         paths = check_lost_and_found(dataset_root, report, num_workers=workers)
         if paths:
-            manifest_path = _write_manifest(
+            image_paths = set(paths)
+            _write_manifest(
                 report, paths, root / out_cfg.get("manifest_dir", "data/processed/manifests"),
                 "lost_and_found",
+                extra={
+                    "policy": "corrupt_images_only",
+                    "retained": [str(path) for path in paths if report.status_of(path) is not SampleStatus.INVALID],
+                    "preserved_non_image_files": [
+                        str(path) for path in sorted(dataset_root.rglob("*"))
+                        if path.is_file() and path not in image_paths
+                    ],
+                    "original_files_modified_or_deleted": False,
+                },
             )
-            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            payload["policy"] = "corrupt_images_only"
-            payload["retained"] = [str(path) for path in paths if report.status_of(path) is not SampleStatus.INVALID]
-            image_paths = set(paths)
-            payload["preserved_non_image_files"] = [
-                str(path) for path in sorted(dataset_root.rglob("*"))
-                if path.is_file() and path not in image_paths
-            ]
-            payload["original_files_modified_or_deleted"] = False
-            manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     report.write(root / out_cfg.get("report_dir", "artifacts/reports/cleaning"), max_samp)
     return report

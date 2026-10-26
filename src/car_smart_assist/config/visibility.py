@@ -63,3 +63,18 @@ def training_config(overrides: dict) -> dict:
     }
     cfg["augmentation"] = deepcopy({**AUGMENTATION_DEFAULTS, **overrides.get("augmentation", {})})
     return cfg
+
+
+def validate_input_size(data_cfg: dict, effective_size: tuple[int, int]) -> None:
+    """显式的数据尺寸必须与配置或检查点决定的有效模型尺寸一致。"""
+    if "input_size" not in data_cfg:
+        return
+    declared = data_cfg["input_size"]
+    if (not isinstance(declared, (list, tuple)) or len(declared) != 2
+            or any(type(value) is not int or value <= 0 for value in declared)):
+        raise ValueError("data.input_size 必须是两个正整数 [H, W]")
+    if tuple(declared) != tuple(effective_size):
+        raise ValueError(
+            f"data.input_size={tuple(declared)} 与有效模型尺寸 {tuple(effective_size)} 不一致；"
+            "请与 model.input_size 对齐；恢复或评估时以检查点的 model_cfg 为准。"
+        )
