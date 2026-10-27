@@ -235,7 +235,7 @@ def test_direct_trainer_auto_recovers_pending_pair_before_continue(tmp_path, mon
     import car_smart_assist.perception.visibility.trainer as training
 
     helper = _load_helper(
-        "tests/unit/test_visibility_retrain_training.py", "prd004_auto_resume_fixture"
+        "tests/unit/test_visibility_retrain_training.py", "visibility_auto_resume_fixture"
     )
     first = helper._trainer_with_controlled_validation(tmp_path, monkeypatch, [1.0], epochs=1)
     first.fit()
@@ -343,7 +343,7 @@ def test_epoch_calibration_and_pause_saves_use_transaction_publisher(
     from car_smart_assist.utils.stop import StopController
 
     helper = _load_helper(
-        "tests/unit/test_visibility_retrain_training.py", "prd004_trainer_fixture"
+        "tests/unit/test_visibility_retrain_training.py", "visibility_trainer_fixture"
     )
     trainer = helper._trainer_with_controlled_validation(tmp_path, monkeypatch, [1.0], epochs=1)
     updates_seen = []

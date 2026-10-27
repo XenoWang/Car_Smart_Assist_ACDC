@@ -168,7 +168,10 @@ class InferencePipeline:
         """
         root = Path(project_root)
         if device is not None:
-            selected_device = select_device(str(device).strip().lower())
+            try:
+                selected_device = select_device(str(device).strip().lower())
+            except (TypeError, RuntimeError) as exc:
+                raise ValueError(f"设备无效：{device!r}；请使用 auto/cpu/cuda:N") from exc
             if selected_device.type == "cuda" and selected_device.index is None:
                 selected_device = torch.device("cuda", torch.cuda.current_device())
             device = "cpu" if selected_device.type == "cpu" else str(selected_device)
@@ -292,19 +295,23 @@ class InferencePipeline:
             if device is not None:
                 detection_cfg = {**detection_cfg, "device": device}
             if not detection_cfg.get("enabled_for_inference", True):
-                continue
+                predictor_unavailable_reason = f"目标检测路由已禁用：{detection_config_path}"
+                break
             detection_checkpoint = root / detection_cfg["checkpoint"]
-            if detection_checkpoint.is_file():
-                try:
-                    predictor = YoloDetectionPredictor.from_config(detection_cfg, root)
-                except Exception as exc:  # noqa: BLE001
-                    logger.exception("YOLO 目标检测未能接入")
-                    predictor_unavailable_reason = (
-                        f"目标检测不可用: {type(exc).__name__}: {exc}"
-                    )
-                    # 当前检测路由校验失败不能静默换成另一个模型绕过校准。
-                    break
-                logger.info("YOLO 目标检测已接入: %s", detection_checkpoint)
+            if not detection_checkpoint.is_file():
+                predictor_unavailable_reason = f"目标检测路由权重不存在：{detection_checkpoint}"
+                break
+            try:
+                predictor = YoloDetectionPredictor.from_config(detection_cfg, root)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("YOLO 目标检测未能接入")
+                predictor_unavailable_reason = (
+                    f"目标检测不可用: {type(exc).__name__}: {exc}"
+                )
+                # 当前检测路由失败不能静默换成另一个模型绕过校准。
+                break
+            logger.info("YOLO 目标检测已接入: %s", detection_checkpoint)
+            break
 
         return cls(
             scorer=scorer,
@@ -353,6 +360,10 @@ class InferencePipeline:
         self, images: Sequence[np.ndarray | Image.Image | str | Path]
     ) -> list[PipelineResult]:
         """批量推理。门控阶段真正批量执行；感知阶段按 predictor 的接口走。"""
+        if isinstance(images, np.ndarray) and images.ndim != 4:
+            raise ValueError("run_batch 的数组输入必须为 (N,H,W,C)；单张图像请使用 run(image)")
+        if isinstance(images, (str, Path, Image.Image)):
+            raise TypeError("run_batch 需要图像序列；单张图像请使用 run(image)")
         if len(images) == 0:
             return []
         results = [PipelineResult() for _ in images]
@@ -379,10 +390,12 @@ class InferencePipeline:
             for r in valid_results:
                 r.skipped["gate"] = f"门控运行失败: {type(exc).__name__}: {exc}"
         gate_ms = (time.perf_counter() - t0) * 1000.0
+        if self.scorer is not None:
+            for r in valid_results:
+                r.timings_ms["gate"] = gate_ms / max(len(arrays), 1)
         if verdicts:
             for r, v in zip(valid_results, verdicts, strict=True):
                 r.visibility = v
-                r.timings_ms["gate"] = gate_ms / max(len(arrays), 1)
         if self.scorer is None:
             for r in valid_results:
                 r.skipped["gate"] = "未接入能见度门控（scorer 为 None）"
@@ -434,6 +447,10 @@ class InferencePipeline:
                     perception.visibility_level = r.visibility.level.value
                     perception.visibility_confidence_multiplier = r.visibility.confidence_multiplier
                     perception.visibility_reasons = list(r.visibility.triggered)
+                elif self.scorer is None:
+                    # 调试模式保留感知证据，但不能让predictor自行声明能见度可靠。
+                    perception.visibility_level = "unknown"
+                    perception.visibility_reasons = ["未接入能见度门控"]
                 if r.weather is not None:
                     perception.weather_attributes = r.weather.attributes
                     perception.weather_probabilities = dict(r.weather.probabilities)
@@ -455,7 +472,7 @@ class InferencePipeline:
                 r.advisory = self.generator.from_unavailable(r.skipped["input"])
             elif r.blocked:
                 r.advisory = self.generator.generate(visibility=r.visibility)
-            elif "gate" in r.skipped:
+            elif "gate" in r.skipped and self.scorer is not None:
                 r.advisory = self.generator.from_unavailable(r.skipped["gate"])
             elif r.perception is None and "perception" in r.skipped:
                 r.advisory = self.generator.from_unavailable(r.skipped["perception"])

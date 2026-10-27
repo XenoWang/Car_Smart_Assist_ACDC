@@ -40,8 +40,8 @@ def load_weather_attention_config(path: str | Path) -> WeatherAttentionConfig:
             raw["report_file"],
         )
         validate_weather_attention_config(cfg)
-    except (KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
-        raise ValueError(f"天气注意力配置无效：{exc}") from exc
+    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"天气注意力配置无效（{path}）：{exc}") from exc
     return cfg
 
 

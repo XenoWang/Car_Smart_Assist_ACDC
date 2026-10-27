@@ -23,7 +23,7 @@ def _load(relative: str, name: str):
 
 
 def _prepare(tmp_path, monkeypatch):
-    helpers = _load("tests/unit/test_remaining_control_bugs.py", "rev02_existing_test_helpers")
+    helpers = _load("tests/unit/test_training_cli_and_resume_contracts.py", "ablation_resume_test_helpers")
     module, base, _ = helpers._minimal_ablation_setup(tmp_path, monkeypatch)
     fit_calls = []
 

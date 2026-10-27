@@ -63,19 +63,23 @@ def main() -> int:
         datefmt="%H:%M:%S",
     )
 
-    root = Path(__file__).resolve().parents[1]
-    cfg = yaml.safe_load((root / args.config).read_text(encoding="utf-8"))["visibility"]
+    try:
+        root = Path(__file__).resolve().parents[1]
+        cfg = yaml.safe_load((root / args.config).read_text(encoding="utf-8"))["visibility"]
 
-    pipe = InferencePipeline.from_config(
-        cfg, project_root=root, checkpoint=args.checkpoint, device=args.device,
-        weather_config=args.weather_config, weather_loss=args.weather_loss,
-        weather_checkpoint=args.weather_checkpoint,
-    )
+        pipe = InferencePipeline.from_config(
+            cfg, project_root=root, checkpoint=args.checkpoint, device=args.device,
+            weather_config=args.weather_config, weather_loss=args.weather_loss,
+            weather_checkpoint=args.weather_checkpoint,
+        )
 
-    if args.image:
-        samples = [(Path(p).name, Path(p)) for p in args.image]
-    else:
-        samples = build_samples(root, cfg)
+        if args.image:
+            samples = [(Path(p).name, Path(p)) for p in args.image]
+        else:
+            samples = build_samples(root, cfg)
+    except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
+        logging.error("无法启动推理：%s", exc)
+        return 2
 
     if args.synthetic:
         from car_smart_assist.perception.visibility import degrade
@@ -128,11 +132,13 @@ def main() -> int:
     gate_ms = t.get("gate")
     if gate_ms is not None:
         print(f"末帧门控内部诊断: {gate_ms:.1f}ms（批内均摊，非端到端性能量测）")
-    skipped = results[0].skipped
-    if skipped:
+    skipped_frames = [(name, result.skipped)
+                      for (name, _), result in zip(samples, results, strict=True) if result.skipped]
+    if skipped_frames:
         print("\n本次运行中被跳过的阶段（如实反映实现进度，不是异常）:")
-        for k, why in skipped.items():
-            print(f"  - {k}: {why}")
+        for name, skipped in skipped_frames:
+            for stage, reason in skipped.items():
+                print(f"  - {name} / {stage}: {reason}")
     print("\n提示文案措辞自检（不应有越权承诺）:")
     from car_smart_assist.advisory.prompt.templates import check_wording
 

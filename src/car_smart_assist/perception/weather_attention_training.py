@@ -35,6 +35,7 @@ from car_smart_assist.perception.weather_attention import (
     WeatherAttention,
     WeatherAttentionPredictor,
     ensure_pretrained_weights,
+    load_attention_checkpoint,
     optimize_attention_inference,
 )
 from car_smart_assist.perception.weather_continuation import load_continuation
@@ -463,6 +464,34 @@ def require_independent_weather_reports(cfg, root):
             raise ValueError("报告输出包含受保护的默认天气运行证据；请使用独立 report_dir/report_file")
 
 
+def require_attention_preflight(cfg, root, split_info):
+    """训练门禁共用于普通启动与 fresh 自动重新生成的预检证据。"""
+    profile_path = root / cfg.report_dir / "preflight.json"
+    if not profile_path.is_file():
+        raise ValueError("请先运行 --preflight 完成真实数据与效率检查")
+    try:
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"天气预检记录无法读取（{profile_path}）：{exc}") from exc
+    if not isinstance(profile, dict):
+        raise ValueError(f"天气预检记录须为映射：{profile_path}")
+    if (
+        profile.get("model_config") != attention_model_config(cfg)
+        or profile.get("backbone_training") != {
+            "fine_tune_from": cfg.backbone["fine_tune_from"],
+            "freeze_epochs": cfg.backbone["freeze_epochs"],
+            "probe_epoch": cfg.backbone["freeze_epochs"] + 1,
+        }
+        or profile.get("split_signature") != split_info["signature"]
+        or profile.get("batch_size") != cfg.train["batch_size"]
+        or profile.get("channels_last") != cfg.train["channels_last"]
+        or profile.get("swad") != cfg.train.get("swad")
+        or profile.get("l2_sp_coefficient", 0) != cfg.train.get("l2_sp", 0)
+    ):
+        raise ValueError("模型、微调配方、批量或数据已改变，请重新运行 --preflight")
+    return profile
+
+
 def preflight_attention(cfg, root, datasets, split_info):
     require_independent_weather_reports(cfg, root)
     device = select_device(cfg.device)
@@ -639,6 +668,20 @@ def preflight_attention(cfg, root, datasets, split_info):
     return result
 
 
+def load_attention_reference_metadata(path):
+    payload = load_attention_checkpoint(path)
+    if (
+        type(payload.get("epoch")) is not int
+        or payload["epoch"] < 1
+        or not isinstance(payload.get("selection"), dict)
+    ):
+        raise ValueError(
+            f"注意力参考检查点缺少有效 epoch/selection 元数据：{path}。"
+            "请提供包含训练轮次和选模记录的完整参考检查点，或移除该 attention_references 项。"
+        )
+    return {"epoch": payload["epoch"], "selection": payload["selection"]}
+
+
 def train_attention(cfg, root, datasets, split_info, *, fresh=False, stop_controller=None, continue_only=False):
     destination = Path(root).resolve() / cfg.checkpoint_root
     controller = stop_controller or StopController(default_directory=destination)
@@ -658,6 +701,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
     destination = root / cfg.checkpoint_root
     require_independent_weather_output(root, destination)
     require_independent_weather_reports(cfg, root)
+    for reference in cfg.evaluation.get("attention_references", {}).values():
+        load_attention_reference_metadata(root / reference["checkpoint"])
     swad_options = cfg.train.get("swad", {})
     use_swad = swad_options.get("enabled", False)
     stopping = cfg.train.get("early_stopping", {})
@@ -693,10 +738,15 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
         report_dir = root / cfg.report_dir
         for name in (
             "comparison.json", "test_predictions.csv", "history.json", "progress.json", "REPORT.md",
+            "preflight.json",
         ):
             path = report_dir / name
             if path.exists():
                 existing.setdefault(path, Path("reports") / name)
+        for pattern in ("preflight_old*.npy", "preflight_old*.json"):
+            for path in report_dir.glob(pattern):
+                if path.is_file():
+                    existing.setdefault(path, Path("reports") / path.name)
         report_file = root / cfg.report_file
         if report_file.exists():
             existing.setdefault(report_file, Path("report_file") / report_file.name)
@@ -709,6 +759,15 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 shutil.copy2(p, archived)
             for p in existing:
                 p.unlink()
+        stop_controller.require_running()
+        preflight_devices = (
+            [device.index if device.index is not None else torch.cuda.current_device()]
+            if device.type == "cuda" else []
+        )
+        with torch.random.fork_rng(devices=preflight_devices):
+            preflight_attention(cfg, root, datasets, split_info)
+        require_attention_preflight(cfg, root, split_info)
+        stop_controller.require_running()
     baseline_hashes = {
         name: hashlib.sha256((root / cfg.evaluation[key]).read_bytes()).hexdigest()
         for name, key in (("original", "old_checkpoint"), ("pyramid_asl", "asl_checkpoint"))
@@ -1119,7 +1178,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_c
         )
         if reference_cfg.image_size != cfg.image_size or reference_cfg.attributes != cfg.attributes:
             raise ValueError("注意力对照输入尺寸或属性不一致")
-        payload = torch.load(root / reference["checkpoint"], map_location="cpu", weights_only=True)
+        payload = load_attention_reference_metadata(root / reference["checkpoint"])
         results[name] = {
             "checkpoint": str(root / reference["checkpoint"]),
             "thresholds": predictor.thresholds,
@@ -1240,7 +1299,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_c
                             int(datasets["test"].mask[index, attr_index]),
                             float(probability[index, attr_index]),
                             threshold,
-                            int(probability[index, attr_index] >= threshold),
+                            int(float(probability[index, attr_index]) >= float(threshold)),
                         ]
                     )
     progress = {

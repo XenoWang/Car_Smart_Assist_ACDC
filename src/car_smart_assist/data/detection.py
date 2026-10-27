@@ -324,11 +324,24 @@ def _materialize_image(source: Path, destination: Path, mode: str, digest: str) 
     return "copy"
 
 
-def _publish_detection_staging(staging: Path, output: Path) -> None:
+def _empty_output_identity(output: Path):
+    if output.is_symlink() or getattr(output, "is_junction", lambda: False)():
+        raise ValueError("Detection output must be a real directory, not a symbolic link or junction")
+    if output.exists() and output.is_dir() and not any(output.iterdir()):
+        current = output.lstat()
+        return current.st_dev, current.st_ino, getattr(current, "st_birthtime_ns", None)
+    return None
+
+
+def _publish_detection_staging(staging: Path, output: Path, *, empty_identity=None) -> None:
     """Publish once, tolerating brief Windows locks without replacing another export."""
     if staging.parent != output.parent:
         raise ValueError("Detection staging and output must share a parent directory")
     identity = staging.lstat()
+    if empty_identity is not None:
+        from car_smart_assist.data.joint_paths import remove_original_empty_output
+
+        remove_original_empty_output(output, empty_identity)
     for attempt in range(6):
         if output.exists() or output.is_symlink():
             raise ValueError("Detection output appeared during preparation; choose a new output_root")
@@ -348,8 +361,14 @@ def _publish_detection_staging(staging: Path, output: Path) -> None:
             time.sleep(0.05 * 2 ** attempt)
 
 
-def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict[str, int]:
-    manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+def validate_detection_export(
+    output: Path, verify_hashes: bool = False, *, lost_and_found_root=None
+) -> dict[str, int]:
+    from car_smart_assist.data.joint_paths import resolve_joint_manifest
+
+    manifest = resolve_joint_manifest(
+        json.loads((output / "manifest.json").read_text(encoding="utf-8")), lost_and_found_root
+    )
     groups: dict[str, str] = {}
     hashes: dict[str, str] = {}
     files: set[str] = set()
@@ -382,15 +401,20 @@ def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict
                 raise ValueError("Joint annotation coverage changed")
             if any(int(box[0]) not in expected for box in row["boxes"]):
                 raise ValueError("Joint labels contain an unsupported class for this source")
-            if row.get("roi_mask"):
+            if row["dataset"] == "lost_and_found":
                 roi = Path(row["roi_mask"])
-                if not roi.is_file():
-                    raise FileNotFoundError(f"Missing obstacle ROI: {roi}")
-                if (
-                    verify_hashes
-                    and hashlib.sha256(roi.read_bytes()).hexdigest() != row["roi_sha256"]
-                ):
-                    raise ValueError("Joint ROI contents changed")
+                instances = roi.with_name(roi.name.removesuffix("_labelTrainIds.png") + "_instanceIds.png")
+                if not roi.name.endswith("_gtCoarse_labelTrainIds.png"):
+                    raise ValueError("Joint ROI does not follow the Lost & Found naming contract")
+                for path, key in ((roi, "roi_sha256"), (instances, "instance_sha256")):
+                    if not path.is_file():
+                        raise FileNotFoundError(f"Missing obstacle supervision: {path}; supply explicit current joint-data config after relocation")
+                    if verify_hashes and hashlib.sha256(path.read_bytes()).hexdigest() != row[key]:
+                        raise ValueError(f"Joint supervision contents changed: {path}")
+                if lost_and_found_root is not None:
+                    source = Path(row["source"])
+                    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != row["sha256"]:
+                        raise ValueError(f"Mapped joint source is missing or changed: {source}")
         expected_lists[split].append("./" + row["image"])
         counts[split] += 1
     for split, expected in expected_lists.items():
@@ -401,7 +425,11 @@ def validate_detection_export(output: Path, verify_hashes: bool = False) -> dict
 
 
 def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str, Any]:
-    output = (project_root / cfg["output_root"]).resolve()
+    requested_output = project_root / cfg["output_root"]
+    if requested_output.is_symlink() or getattr(requested_output, "is_junction", lambda: False)():
+        raise ValueError("Detection output must be a real directory, not a symbolic link or junction")
+    output = requested_output.resolve()
+    empty_identity = _empty_output_identity(output)
     processed_root = (project_root / "data/processed").resolve()
     if output == processed_root or not output.is_relative_to(processed_root):
         raise ValueError("Detection export must be under data/processed")
@@ -588,11 +616,7 @@ def prepare_detection_data(project_root: Path, cfg: dict[str, Any]) -> dict[str,
             for name, document in yaml_documents.items():
                 (staging / name).write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
             validated = validate_current(staging)
-            if output.exists():
-                if not output.is_dir() or any(output.iterdir()):
-                    raise ValueError("Detection output appeared during preparation; use a new output_root")
-                output.rmdir()
-            _publish_detection_staging(staging, output)
+            _publish_detection_staging(staging, output, empty_identity=empty_identity)
         finally:
             if staging.exists() or staging.is_symlink():
                 current = staging.lstat()

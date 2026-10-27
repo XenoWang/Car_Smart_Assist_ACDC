@@ -1,4 +1,4 @@
-"""PRD004 14/25/26: class identity, label ID space and crash-safe JSON publication."""
+"""Classifier identity, label ID space and atomic JSON publication."""
 
 import json
 from types import SimpleNamespace
@@ -66,7 +66,7 @@ def test_nine_class_initialization_does_not_enter_eight_class_copy():
 
 @pytest.mark.parametrize("value, invalid", [(0, True), (7, False), (255, True)])
 def test_label_ids_use_zero_void_and_raw_class_bounds(tmp_path, value, invalid):
-    # PRD25: labelIds void=0 and valid raw class IDs <=33; 255 is trainIds' ignore.
+    # labelIds void=0 and valid raw class IDs <=33; 255 is trainIds' ignore.
     image = tmp_path / "rgb_anon/fog/train/scene/frame_rgb_anon.png"
     mask = tmp_path / "gt/fog/train/scene/frame_gt_labelIds.png"
     image.parent.mkdir(parents=True)

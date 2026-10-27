@@ -56,7 +56,8 @@ def masked_metrics(labels, mask, values, attributes, thresholds):
     for index, name in enumerate(attributes):
         known = mask[:, index] > 0
         truth, probability = labels[known, index] > 0.5, values[known, index]
-        prediction = probability >= thresholds[name]
+        # 与部署中 Python float 概率/阈值的比较保持一致。
+        prediction = probability.astype(np.float64, copy=False) >= float(thresholds[name])
         tp, fp = int((truth & prediction).sum()), int((~truth & prediction).sum())
         fn, tn = int((truth & ~prediction).sum()), int((~truth & ~prediction).sum())
         both = bool(truth.any() and (~truth).any())
@@ -76,7 +77,9 @@ def masked_metrics(labels, mask, values, attributes, thresholds):
             "average_precision": float(average_precision_score(truth, probability))
             if both
             else None,
-            "unverified_positive_rate": float((values[~known, index] >= thresholds[name]).mean())
+            "unverified_positive_rate": float(
+                (values[~known, index].astype(np.float64, copy=False) >= float(thresholds[name])).mean()
+            )
             if (~known).any()
             else None,
         }

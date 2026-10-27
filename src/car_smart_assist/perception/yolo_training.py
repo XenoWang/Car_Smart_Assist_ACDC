@@ -237,7 +237,7 @@ def attach_training_state_callbacks(
     model.add_callback("on_train_end", finalize_state)
 
 
-def detection_trainer_for_resume(resume_state: dict | None, selection_contract: dict):
+def detection_trainer_for_resume(resume_state: dict | None, selection_contract: dict, *, validated_data=None):
     """等项目本地的 Ultralytics 设置初始化完成后再延迟导入。"""
     from ultralytics.data import build_yolo_dataset
     from ultralytics.models.yolo.detect import DetectionTrainer
@@ -313,6 +313,10 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
             super().check_resume(overrides)
             if self.resume:
                 self.args.epochs = overrides["epochs"]
+                if validated_data is not None:
+                    # Vendor resume reloads checkpoint args, including the obsolete
+                    # physical data path. Use only the data accepted for this run.
+                    self.args.data = str(validated_data)
 
         def resume_training(self, ckpt):
             if self.resume and ckpt is not None and ckpt.get("epoch", -1) < 0:

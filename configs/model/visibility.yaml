@@ -102,7 +102,5 @@ visibility:
   report:
     output_dir: artifacts/reports/visibility
     sample_per_condition: 200
-    export_gallery: true
-    gallery_size: 32
 
   device: auto

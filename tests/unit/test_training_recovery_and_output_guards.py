@@ -1,4 +1,4 @@
-"""Focused control and routing regressions for PRD V0.0.4."""
+"""Training recovery, stop handling and deployment output protection."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _load_helper(relative: str, name: str):
 
 def test_failed_stage_with_zero_checkpoints_restarts_only_that_stage(tmp_path, monkeypatch):
     pipeline_tests = _load_helper(
-        "tests/unit/test_training_pipeline_control.py", "prd004_pipeline_helpers"
+        "tests/unit/test_training_pipeline_control.py", "pipeline_recovery_helpers"
     )
     import scripts.train_pipeline as pipeline
 
@@ -60,7 +60,7 @@ def test_failed_stage_with_zero_checkpoints_restarts_only_that_stage(tmp_path, m
 
 def test_failed_detection_with_five_empty_records_restarts_detection_only(tmp_path, monkeypatch):
     pipeline_tests = _load_helper(
-        "tests/unit/test_training_pipeline_control.py", "prd004_detection_pipeline_helpers"
+        "tests/unit/test_training_pipeline_control.py", "detection_recovery_pipeline_helpers"
     )
     import scripts.train_pipeline as pipeline
 
@@ -299,7 +299,7 @@ def test_refusing_unconfirmed_old_child_preserves_stop_bytes_and_mtime(
     tmp_path, monkeypatch, action
 ):
     pipeline_tests = _load_helper(
-        "tests/unit/test_training_pipeline_control.py", "prd004_terminal_pipeline_helpers"
+        "tests/unit/test_training_pipeline_control.py", "terminal_state_pipeline_helpers"
     )
     import scripts.train_pipeline as pipeline
 

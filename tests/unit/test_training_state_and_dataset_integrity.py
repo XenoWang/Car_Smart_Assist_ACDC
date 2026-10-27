@@ -64,7 +64,7 @@ def test_attention_resume_restores_only_nonempty_real_scaler_state(
     tmp_path, monkeypatch, initial_scaler_enabled
 ):
     training, cfg, datasets, split, _ = _helper(
-        "tests/unit/test_training_stop_models.py", "p2_attention_fixture"
+        "tests/unit/test_training_stop_models.py", "attention_scaler_fixture"
     )._attention_setup(tmp_path, monkeypatch)
     real_scaler = torch.amp.GradScaler
     scaler_loads = []
@@ -107,7 +107,7 @@ def test_attention_resume_restores_only_nonempty_real_scaler_state(
 
 
 def _visibility_checkpoint(tmp_path, monkeypatch, *, epochs=1):
-    helper = _helper("tests/unit/test_visibility_retrain_training.py", "p2_visibility_fixture")
+    helper = _helper("tests/unit/test_visibility_retrain_training.py", "visibility_cuda_layout_fixture")
     trainer = helper._trainer_with_controlled_validation(
         tmp_path, monkeypatch, [1.0, 0.8][:epochs], epochs=epochs
     )
@@ -241,7 +241,7 @@ def test_visibility_matching_cuda_layout_restores_full_state_with_injected_ident
 
 
 def _tiny_visibility_trainer(tmp_path, monkeypatch, *, epochs=1):
-    helper = _helper("tests/unit/test_visibility_retrain_training.py", "p2_visibility_fit_fixture")
+    helper = _helper("tests/unit/test_visibility_retrain_training.py", "visibility_training_device_fixture")
     trainer = helper._trainer_with_controlled_validation(
         tmp_path, monkeypatch, [0.5] * epochs, epochs=epochs
     )
@@ -362,7 +362,7 @@ def _write_base_export(root, *, corrupt=False):
     manifest = {
         "seed": 7,
         "signature": "synthetic-base-signature",
-        "classes": [{"name": "car"}],
+        "classes": [{"source_id": 26, "name": "car"}],
         "images": [{
             "split": "train", "group": "base-group", "sha256": digest,
             "image": "images/train/frame.png", "label": "labels/train/frame.txt",
@@ -387,7 +387,7 @@ def _joint_config():
         "development_ratios": {"train": 0.7, "val": 0.15, "calibration": 0.15},
         "integrity_workers": 1,
         "image_mode": "copy",
-        "additional_class": {"name": "obstacle"},
+        "additional_class": {"source_id": "lost_and_found:obstacle", "name": "obstacle"},
         "obstacle_train_id": 2,
         "valid_roi_ids": [1, 2],
     }
@@ -429,9 +429,9 @@ def test_joint_prepare_hash_checks_base_and_final_and_is_idempotent(tmp_path, mo
     calls = []
     original_validate = joint.validate_detection_export
 
-    def record_hash_validation(output, verify_hashes=False):
+    def record_hash_validation(output, verify_hashes=False, **kwargs):
         calls.append(verify_hashes)
-        return original_validate(output, verify_hashes=verify_hashes)
+        return original_validate(output, verify_hashes=verify_hashes, **kwargs)
 
     monkeypatch.setattr(joint, "validate_detection_export", record_hash_validation)
     cfg = _joint_config()
@@ -449,7 +449,7 @@ def test_joint_prepare_hash_checks_base_and_final_and_is_idempotent(tmp_path, mo
 
 @pytest.mark.parametrize("request_kind", ["file", "signal"])
 def test_continue_stop_during_identity_check_is_preserved(tmp_path, monkeypatch, request_kind):
-    helpers = _helper("tests/unit/test_training_pipeline_control.py", "p2_pipeline_control_helpers")
+    helpers = _helper("tests/unit/test_training_pipeline_control.py", "pipeline_stop_identity_helpers")
     import scripts.train_pipeline as pipeline
 
     root = helpers._workspace(tmp_path, monkeypatch)
@@ -483,7 +483,7 @@ def test_continue_stop_during_identity_check_is_preserved(tmp_path, monkeypatch,
 def test_fresh_stop_during_archive_survives_and_prevents_child_start(
     tmp_path, monkeypatch, request_kind
 ):
-    helpers = _helper("tests/unit/test_training_pipeline_control.py", "p2_pipeline_archive_helpers")
+    helpers = _helper("tests/unit/test_training_pipeline_control.py", "pipeline_archive_stop_helpers")
     import scripts.train_pipeline as pipeline
 
     root = helpers._workspace(tmp_path, monkeypatch)

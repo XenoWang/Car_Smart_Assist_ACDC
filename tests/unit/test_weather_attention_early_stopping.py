@@ -142,6 +142,8 @@ def test_weather_best_and_early_stop_use_distinct_improvement_thresholds(
     monkeypatch.setattr(training, "balanced_thresholds", controlled_selection)
     monkeypatch.setattr(training, "model_report", lambda *_: None)
 
+    from _model_test_helpers import synthetic_attention_preflight
+    monkeypatch.setattr(training, "preflight_attention", synthetic_attention_preflight)
     model, result = train_attention(cfg, tmp_path, datasets, {"signature": "fixture"}, fresh=True)
     best = torch.load(tmp_path / "checkpoints/best.pt", map_location="cpu", weights_only=False)
     last = torch.load(tmp_path / "checkpoints/last.pt", map_location="cpu", weights_only=False)

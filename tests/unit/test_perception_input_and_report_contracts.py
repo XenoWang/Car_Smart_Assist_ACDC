@@ -125,7 +125,7 @@ def test_visibility_evaluation_uses_checkpoint_size_for_reference_images(tmp_pat
         "train": {"checkpoint_dir": "checkpoints"}, "model": {"input_size": [32, 32]},
         "scoring": {}, "report": {"sample_per_condition": 1},
     }}
-    monkeypatch.setattr(module.yaml, "safe_load", lambda _s: config)
+    monkeypatch.setattr(module, "load_visibility_config", lambda _p: config["visibility"])
     monkeypatch.setattr(sys, "argv", ["evaluate_visibility.py", "--checkpoint", str(checkpoint)])
     scorer = SimpleNamespace(input_size=(40, 80), scoring_cfg={}, calibration=None)
     monkeypatch.setattr(module.VisibilityScorer, "from_checkpoint", lambda *_a, **_k: scorer)

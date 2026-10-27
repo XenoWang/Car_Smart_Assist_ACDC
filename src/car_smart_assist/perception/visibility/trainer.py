@@ -20,6 +20,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import torch.nn as nn
+import yaml
 from torch.utils.data import DataLoader
 from filelock import FileLock
 
@@ -33,7 +34,10 @@ from car_smart_assist.perception.visibility.autoencoder import (
     reconstruction_mean,
 )
 from car_smart_assist.perception.visibility.dataset import VisibilityImageDataset
-from car_smart_assist.perception.visibility.scorer import CalibrationStats
+from car_smart_assist.perception.visibility.scorer import (
+    CalibrationStats,
+    _load_visibility_checkpoint,
+)
 
 from car_smart_assist.utils.stop import StopController
 
@@ -42,19 +46,53 @@ logger = logging.getLogger(__name__)
 ResumeSpec = Literal["auto", "none"] | str | Path | None
 
 
-def _load_visibility_checkpoint(path: str | Path) -> dict[str, Any]:
-    """统一反序列化失败提示；中断与退出信号仍由调用方处理。"""
+def load_visibility_config(path: str | Path) -> dict[str, Any]:
+    """读取 CLI 配置，并在输入边界拒绝无法使用的配置结构。"""
     try:
-        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    except Exception as exc:
-        # torch.load 的损坏异常随序列化格式变化；不捕获 BaseException 中的中断。
-        raise ValueError(
-            f"无法读取能见度检查点：{path}；文件可能损坏或不兼容。"
-            "请保留原件并确认路径，使用可用的配对检查点或 --fresh 新开实验。"
-        ) from exc
-    if not isinstance(checkpoint, dict):
-        raise ValueError(f"能见度检查点格式无效：{path}；预期为状态字典，请检查权重来源")
-    return checkpoint
+        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ValueError(f"无法读取能见度配置 {path}；请检查路径、UTF-8 编码及 YAML 格式：{exc}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"能见度配置 {path} 必须为 YAML 字典")
+    cfg = raw.get("visibility", raw)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"能见度配置 {path} 的 visibility 必须为字典")
+    sections = (
+        "data", "model", "train", "report", "scoring", "thresholds",
+        "train.early_stopping", "train.augmentation", "scoring.features",
+        "scoring.feature_scales", "scoring.aggregation", "scoring.aggregation.weights",
+        "scoring.reconstruction_error",
+    )
+    for section in sections:
+        node = cfg
+        for key in section.split("."):
+            node = node.get(key, {})
+        if not isinstance(node, dict):
+            raise ValueError(f"能见度配置 {path} 的 {section} 必须为字典")
+    for section, key in (
+        ("data", "acdc_root"), ("data", "project_root"), ("data", "cleaning_manifest"),
+        ("data", "cache_path"), ("train", "checkpoint_dir"), ("report", "output_dir"),
+    ):
+        values = cfg.get(section, {})
+        value = values.get(key)
+        optional = key in ("cleaning_manifest", "cache_path")
+        if key in values and not (optional and value is None) and not isinstance(value, (str, os.PathLike)):
+            raise ValueError(f"能见度配置 {path} 的 {section}.{key} 必须为路径字符串")
+    return cfg
+
+
+def validate_visibility_manifest(cleaning_manifest: str | Path | None, project_root: str | Path) -> None:
+    """先验证清洗清单结构，避免共享读取器将坏输入误报为程序异常。"""
+    if cleaning_manifest is None:
+        return
+    path = Path(project_root) / cleaning_manifest
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"无法读取清洗清单 {path}；请检查路径或重新运行 scripts/clean_data.py：{exc}") from exc
+    if (not isinstance(payload, dict) or not isinstance(payload.get("invalid"), list)
+            or any(not isinstance(entry, str) for entry in payload["invalid"])):
+        raise ValueError(f"清洗清单 {path} 的 invalid 必须为字符串列表；请重新运行 scripts/clean_data.py")
 
 
 @dataclass
@@ -123,7 +161,10 @@ def resolve_device(spec: str = "auto") -> torch.device:
             )
             return torch.device("cpu")
         spec = "cuda"
-    device = torch.device(spec)
+    try:
+        device = torch.device(spec)
+    except RuntimeError as exc:
+        raise ValueError(f"无效能见度设备 {spec!r}；请使用 auto、cpu 或 cuda[:编号]") from exc
     if device.type == "cuda":
         if not torch.cuda.is_available():
             raise ValueError("指定了 CUDA，但当前 .venv 的 PyTorch 无可用 CUDA GPU；请检查驱动和 PyTorch，或使用 device=auto/cpu")
@@ -442,13 +483,15 @@ def apply_config_overrides(cfg: dict[str, Any], overrides: dict[str, Any]) -> di
     return out
 
 
-def resolve_resume_spec(resume: ResumeSpec, ckpt_dir: Path) -> Path | None:
+def resolve_resume_spec(
+    resume: ResumeSpec, ckpt_dir: Path, project_root: str | Path = "."
+) -> Path | None:
     """决定从哪个检查点续训。
 
     Args:
         resume: 'auto' / None  -> 优先 last.pt，其次 best.pt；都不存在则返回 None
                 'none' / False -> 强制全新训练，返回 None
-                其他            -> 视为显式路径
+                其他            -> 视为显式路径，相对路径按 project_root 解析
     """
     if resume is None or (isinstance(resume, str) and resume.lower() == "auto"):
         for name in ("last.pt", "best.pt"):
@@ -459,6 +502,8 @@ def resolve_resume_spec(resume: ResumeSpec, ckpt_dir: Path) -> Path | None:
     if resume is False or (isinstance(resume, str) and resume.lower() == "none"):
         return None
     p = Path(resume)
+    if not p.is_absolute():
+        p = Path(project_root) / p
     if not p.exists():
         raise FileNotFoundError(f"指定的检查点不存在: {p}")
     return p
@@ -484,7 +529,7 @@ class VisibilityTrainer:
         if cfg.get("data", {}).get("split_mode", "fixed") == "random":
             raise ValueError("训练／校准不能重建随机分区；请设置 data.split_mode=fixed 以供恢复和评估复用")
         self.cfg = cfg
-        self.root = Path(project_root)
+        self.root = Path(project_root).resolve()
         self.device = resolve_device(str(cfg.get("device", "auto")))
         self.model_cfg = dict(cfg.get("model", {}))
         self.scoring_cfg = copy.deepcopy(cfg.get("scoring", {}))
@@ -497,16 +542,21 @@ class VisibilityTrainer:
         self.ckpt_dir = self.root / tcfg.get(
             "checkpoint_dir", "artifacts/checkpoints/visibility"
         )
-        self._resume_spec = resume
         automatic = resume is None or (isinstance(resume, str) and resume.lower() == "auto")
         fresh = resume is False or (isinstance(resume, str) and resume.lower() == "none")
-        local = automatic or (not fresh and Path(os.path.abspath(resume)) in {
+        explicit = None if automatic or fresh else Path(resume)
+        if explicit is not None and not explicit.is_absolute():
+            explicit = self.root / explicit
+        self._resume_spec = explicit if explicit is not None else resume
+        local = automatic or (explicit is not None and Path(os.path.abspath(explicit)) in {
             Path(os.path.abspath(self.ckpt_dir / name)) for name in _CHECKPOINT_NAMES
         })
         self._deferred_resume = not fresh and local and (
             self.ckpt_dir / _TRANSACTION_DIRECTORY / "journal.json"
         ).exists()
-        self.resume_path = None if self._deferred_resume else resolve_resume_spec(resume, self.ckpt_dir)
+        self.resume_path = None if self._deferred_resume else resolve_resume_spec(
+            self._resume_spec, self.ckpt_dir, self.root
+        )
         self.history = TrainHistory()
         self.calibration: CalibrationStats | None = None
         self.scaler: torch.amp.GradScaler | None = None
@@ -590,6 +640,9 @@ class VisibilityTrainer:
 
         dcfg = self.cfg.get("data", {})
         acdc_root = self.root / dcfg.get("acdc_root", "data/raw/acdc")
+        validate_visibility_manifest(
+            dcfg.get("cleaning_manifest"), self.root / dcfg.get("project_root", ".")
+        )
         paths = list_ref_images(
             acdc_root,
             cleaning_manifest=dcfg.get("cleaning_manifest"),
@@ -846,7 +899,7 @@ class VisibilityTrainer:
             else:
                 recovered = recover_visibility_checkpoint_transaction(self.ckpt_dir)
                 previous = self.resume_path
-                self.resume_path = resolve_resume_spec(self._resume_spec, self.ckpt_dir)
+                self.resume_path = resolve_resume_spec(self._resume_spec, self.ckpt_dir, self.root)
                 reinitialize = self._deferred_resume or recovered or self.resume_path != previous
                 self._deferred_resume = False
                 if reinitialize:

@@ -219,10 +219,14 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
     manifest = {
         "signature": "joint-manifest",
         "seed": 42,
-        "classes": [{"name": "car", "source_id": 26}],
+        "classes": [{"name": name, "source_id": index} for index, name in enumerate(
+            ["car", "truck", "bus", "motorcycle", "bicycle", "person", "rider", "train"])]
+            + [{"name": "road_obstacle", "source_id": "lost_and_found:obstacle"}],
         "joint_supervision": True,
         "known_class_count": 8,
-        "source_weights": {"acdc": 0.75, "laf": 0.25},
+        "source_weights": {"acdc": 0.75, "lost_and_found": 0.25},
+        "classification_loss_weights": {"acdc": 1.0, "lost_and_found": 1.0},
+        "images": [],
         "valid_roi_ids": [1, 2],
     }
     (data_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -241,13 +245,17 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
         "joint_foreground_exclusive": False,
     }
     monkeypatch.setattr(cli, "load_yolo_config", lambda _path: cfg)
-    def validate_export(_path, *, verify_hashes=False):
+    validation_calls = []
+    def validate_export(_root, selected_data, _mapping=None, *, verify_hashes=False):
         assert verify_hashes is True
-        return {"images": 1}
+        validation_calls.append(Path(selected_data))
+        return manifest, {"images": 1}, None
 
-    monkeypatch.setattr(cli, "validate_detection_export", validate_export)
+    from car_smart_assist.data import joint_paths
+    monkeypatch.setattr(joint_paths, "read_detection_manifest", validate_export)
     monkeypatch.setattr(cli, "resolve_yolo_device", lambda _device: "cpu")
-    monkeypatch.setattr(cli.importlib.metadata, "version", lambda _name: "synthetic-version")
+    monkeypatch.setattr(cli, "importlib", SimpleNamespace(metadata=SimpleNamespace(version=lambda _name: "synthetic-version")))
+    monkeypatch.setenv("YOLO_CONFIG_DIR", str(tmp_path / "local-settings"))
     monkeypatch.setattr(cli, "attach_training_state_callbacks", lambda *args, **kwargs: None)
     # This entry-point test isolates contract propagation; paired-state rejection is covered separately.
     monkeypatch.setattr(cli, "load_training_state", lambda *_args: {"best_checkpoint_sha256": "fixture-best"})
@@ -268,7 +276,7 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
 
     model = FakeModel()
     monkeypatch.setattr(cli, "load_yolo_model", lambda *_args: model)
-    monkeypatch.setattr(cli, "detection_trainer_for_resume", lambda *_args: object)
+    monkeypatch.setattr(cli, "detection_trainer_for_resume", lambda *_args, **_kwargs: object)
     monkeypatch.setattr(
         "car_smart_assist.perception.joint_yolo_backend.joint_trainer",
         lambda *args, **kwargs: captured.update(joint_contract=kwargs["selection_contract"]) or object,
@@ -276,7 +284,17 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
     monkeypatch.setattr(sys, "argv", [str(script_path), "--name", "contract-test"])
 
     assert cli.main() == 0
-    expected = yolo_model_selection_contract(cfg, manifest)
+    # Literal public selection schema: do not compute this oracle with the factory.
+    expected = {
+        "schema_version": 1, "postprocess_version": "best_class_threshold_v1",
+        "ap_mode": "ap_sweep", "sweep_confidence": 0.001, "imgsz": 960,
+        "nms_iou": 0.5, "max_det": 100, "max_nms": 30000, "max_wh": 7680,
+        "agnostic_nms": False, "class_selection": "original_best_class_only",
+        "threshold_comparison": ">=", "task": "detect", "fitness": "0.1*mAP50+0.9*mAP50_95",
+        "joint_selection": {"known_class_count": 8, "source_weights": {"acdc": 0.75, "lost_and_found": 0.25},
+                            "valid_roi_ids": [1, 2], "foreground_exclusive": False},
+    }
+    assert validation_calls == [data_dir / "data.yaml"]
     run = Path(cfg["project"]) / cfg["name"]
     metadata = json.loads((run / "run_metadata.json").read_text(encoding="utf-8"))
     summary = json.loads((run / "validation_summary.json").read_text(encoding="utf-8"))

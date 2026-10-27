@@ -55,10 +55,11 @@ def _fake_backend(monkeypatch, output, calls):
                 }
             return metrics
 
-    def validate_export(path, *, verify_hashes=False):
+    def validate_export(path, verify_hashes=False, **_kwargs):
         assert verify_hashes is True
 
-    monkeypatch.setattr(evaluate, "validate_detection_export", validate_export)
+    from car_smart_assist.data import detection
+    monkeypatch.setattr(detection, "validate_detection_export", validate_export)
     monkeypatch.setattr(evaluate, "load_yolo_model", lambda root, checkpoint: Model())
     monkeypatch.setattr(
         evaluate,

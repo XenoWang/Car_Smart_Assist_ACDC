@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from PIL import Image
 
+from car_smart_assist.data.joint_paths import resolve_joint_manifest
 from car_smart_assist.perception.detection_yolo import configure_yolo_environment
 from car_smart_assist.perception.joint_yolo import (
     JointDetectionLoss,
@@ -30,7 +31,9 @@ from ultralytics.utils.metrics import DetMetrics  # noqa: E402
 
 def load_joint_index(data):
     path = Path(data["joint_manifest"])
-    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest = resolve_joint_manifest(
+        json.loads(path.read_text(encoding="utf-8")), data.get("joint_lost_and_found_root")
+    )
     index = {str((path.parent / row["image"]).resolve()): row for row in manifest["images"]}
     return manifest, index
 
@@ -256,8 +259,8 @@ class JointValidator(DeploymentValidator):
         return {key: value[keep] for key, value in result.items()}
 
 
-def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract):
-    base = detection_trainer_for_resume(resume_state, selection_contract)
+def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None):
+    base = detection_trainer_for_resume(resume_state, selection_contract, validated_data=validated_data)
 
     class Trainer(base):
         def build_dataset(self, img_path, mode="train", batch=None):

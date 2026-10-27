@@ -221,6 +221,8 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 .venv\Scripts\python.exe scripts\train_detection.py --config configs/model/yolo_detection.yaml
 ```
 
+联合检测数据迁移目录后，训练或评估命令可添加 `--joint-data-config configs/data/acdc_lost_and_found_detection.yaml`，用当前数据配置显式解析路径。只有内容、划分和监督语义一致时才保留既有身份；原清单和数据配置文件保持只读。
+
 #### 串行训练全部模型
 
 ```powershell
@@ -259,6 +261,8 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 | `--stop` | 当前轮完成训练、验证和保存后停止 |
 | `--continue` | 从配对 `last` 恢复，继续原累计目标 |
 | `--fresh` | 归档旧产物后，从配置的初始化权重重新训练 |
+
+天气单模型的 `--fresh` 会同时归档旧预检证据，自动重新预检，通过后才开始训练；`--continue` 继续原训练预算，不因此额外重跑预检。
 
 **停止当前训练批次时，请使用 `--stop`，不建议直接按 `Ctrl+C`。** 这是单模型训练和串行管线统一推荐的停止方式：另开终端，向正在运行的任务发送停止请求，让当前轮完成训练、验证和检查点保存后退出；串行管线不会再启动后续模型。
 

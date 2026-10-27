@@ -1,4 +1,4 @@
-"""Focused synthetic regressions for PRD V0.0.4 data and policy fixes."""
+"""Dataset preparation, source weighting, weather policy and degradation boundaries."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ def _load_helper(relative: str, name: str):
 
 
 def _joint_fixture(root: Path):
-    helper = _load_helper("tests/unit/test_p2_pipeline_followup.py", "prd004_joint_fixture")
+    helper = _load_helper("tests/unit/test_training_state_and_dataset_integrity.py", "joint_publication_fixture")
     helper._write_base_export(root)
     helper._write_laf_fixture(root)
     return helper, helper._joint_config()
@@ -91,7 +91,7 @@ def test_joint_staging_interruption_keeps_final_absent_then_reuses_published_byt
 def test_joint_source_weight_maps_require_exact_source_keys(tmp_path, weight_key, weights):
     from car_smart_assist.data.detection_joint import prepare_joint_detection
 
-    helper = _load_helper("tests/unit/test_p2_pipeline_followup.py", "prd004_joint_key_fixture")
+    helper = _load_helper("tests/unit/test_training_state_and_dataset_integrity.py", "joint_source_weights_fixture")
     cfg = helper._joint_config()
     cfg[weight_key] = weights
     with pytest.raises(ValueError, match=weight_key):

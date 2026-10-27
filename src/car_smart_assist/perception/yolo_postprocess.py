@@ -130,8 +130,9 @@ def calibration_path(root: Path, cfg, output_dir=None):
 def calibration_identity(root: Path, cfg, names, checkpoint=None, manifest=None):
     names = ordered_class_names(names)
     if manifest is None:
-        data = root / cfg["data"]
-        manifest = json.loads((data.parent / "manifest.json").read_text(encoding="utf-8"))
+        from car_smart_assist.data.joint_paths import read_detection_manifest
+
+        manifest, _, _ = read_detection_manifest(root, cfg["data"], cfg.get("joint_data_config"))
     manifest_names = [
         row["name"] if isinstance(row, dict) else row for row in manifest["classes"]
     ]

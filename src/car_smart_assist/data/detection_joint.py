@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import random
+import re
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ import yaml
 from PIL import Image
 
 from car_smart_assist.data.detection import (
+    _empty_output_identity,
     _label_text,
     _materialize_image,
     _publish_detection_staging,
@@ -24,6 +26,7 @@ from car_smart_assist.data.detection import (
     validate_detection_export,
 )
 from car_smart_assist.data.preprocessing import load_invalid_entries
+from car_smart_assist.data.joint_paths import read_joint_yaml, resolve_joint_manifest, validate_joint_classes
 
 
 def sha256(path: Path) -> str:
@@ -90,7 +93,11 @@ def split_development_locations(rows, ratios, seed):
     return [{**row, "split": assignments[row["group"]]} for row in rows]
 
 
-def prepare_joint_detection(root: Path, cfg: dict) -> dict:
+def _joint_manifest_inputs(root: Path, cfg: dict, *, include_signature=False) -> dict:
+    if type(cfg.get("seed")) is not int or type(cfg.get("integrity_workers")) is not int or cfg["integrity_workers"] < 1:
+        raise ValueError("Joint seed and integrity_workers must be integers, with positive integrity_workers")
+    if cfg["image_mode"] not in ("hardlink", "copy"):
+        raise ValueError("Joint image_mode must be hardlink or copy")
     if type(cfg.get("obstacle_train_id")) is not int or cfg["obstacle_train_id"] != 2:
         raise ValueError("Lost & Found obstacle_train_id must be the integer 2")
     roi_ids = cfg.get("valid_roi_ids")
@@ -106,6 +113,8 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         weights = cfg.get(key)
         if not isinstance(weights, dict) or set(weights) != {"acdc", "lost_and_found"}:
             raise ValueError(f"{key} must contain exactly acdc and lost_and_found")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in weights.values()):
+            raise ValueError(f"{key} values must be finite positive numbers")
     if not np.isclose(sum(cfg["source_weights"].values()), 1) or any(
         not np.isfinite(value) or value <= 0 for value in cfg["source_weights"].values()
     ):
@@ -124,10 +133,15 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
     }
     if base["seed"] != cfg["seed"]:
         raise ValueError("Joint and ACDC split seeds differ")
-    output = (root / cfg["output_root"]).resolve()
-    if not output.is_relative_to((root / "data/processed").resolve()):
+    requested_output = root / cfg["output_root"]
+    if requested_output.is_symlink() or getattr(requested_output, "is_junction", lambda: False)():
+        raise ValueError("Joint output must be a real directory, not a symbolic link or junction")
+    output = requested_output.resolve()
+    processed = (root / "data/processed").resolve()
+    if output == processed or not output.is_relative_to(processed):
         raise ValueError("Joint export must be under data/processed")
     classes = [*base["classes"], cfg["additional_class"]]
+    validate_joint_classes(classes)
     obstacle_class = len(base["classes"])
     rows = [
         {
@@ -205,11 +219,15 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
     )
     rows += [row for row in laf if row["official_split"] == "test"]
     rows.sort(key=lambda row: (row["split"], row["source_relative"]))
-    signature = hashlib.sha256(
-        json.dumps(
-            {"config": cfg, "base_signature": base["signature"], "images": rows}, sort_keys=True
-        ).encode()
-    ).hexdigest()
+    # A new identity is computed only for a genuinely new export. Compatibility
+    # checks prove the existing identity without recomputing or replacing it.
+    signature = None
+    if include_signature:
+        signature = hashlib.sha256(
+            json.dumps(
+                {"config": cfg, "base_signature": base["signature"], "images": rows}, sort_keys=True
+            ).encode()
+        ).hexdigest()
     manifest_path = output / "manifest.json"
     for row in rows:
         image = Path("images") / row["split"] / row["source_relative"]
@@ -233,7 +251,6 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         "deferred_corrupt": deferred,
         "base_signature": base["signature"],
     }
-    manifest_text = json.dumps(manifest, indent=2)
     data = {
         "path": output.as_posix(),
         "train": "train.txt",
@@ -247,21 +264,81 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
         "calibration.yaml": {**data, "val": "calibration.txt"},
     }
 
-    def validate_current(directory):
-        if json.loads((directory / "manifest.json").read_text(encoding="utf-8")) != json.loads(manifest_text):
-            raise ValueError("Prepared joint metadata differs from current inputs")
-        for name, expected in yaml_documents.items():
-            if yaml.safe_load((directory / name).read_text(encoding="utf-8")) != expected:
-                raise ValueError(f"Prepared joint dataset YAML differs: {name}")
-        for name, expected in split_lists.items():
-            if (directory / name).read_text(encoding="utf-8") != expected:
-                raise ValueError(f"Prepared joint split list differs: {name}")
-        return validate_detection_export(directory, verify_hashes=True)
+    return {
+        "output": output, "dataset": dataset, "manifest": manifest,
+        "split_lists": split_lists, "yaml_documents": yaml_documents, "acdc_sources": acdc_sources,
+    }
 
-    existing = output.exists() or output.is_symlink()
+
+def _validate_joint_current(directory, inputs, *, allow_relocation=False):
+    expected = inputs["manifest"]
+    previous = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
+    if (not isinstance(previous, dict) or not isinstance(previous.get("images"), list)
+            or any(not isinstance(row, dict) for row in previous["images"])):
+        raise ValueError("Prepared joint manifest must be an object with an images object list")
+    # Every non-location field remains exact, including class order, all box/hash
+    # records, source/group/split metadata and supervision weights/IDs.
+    def semantics(value):
+        result = json.loads(json.dumps(value))
+        if allow_relocation:
+            result.pop("signature", None)
+            for row in result["images"]:
+                row.pop("source", None)
+                row.pop("roi_mask", None)
+        return result
+
+    if semantics(previous) != semantics(expected):
+        raise ValueError("Prepared joint metadata differs from current content, splits or supervision")
+    if not isinstance(previous.get("signature"), str) or re.fullmatch(r"[0-9a-f]{64}", previous["signature"]) is None:
+        raise ValueError("Prepared joint identity is missing or invalid")
+    resolved = resolve_joint_manifest(previous, inputs["dataset"] if allow_relocation else None)
+    for name, expected_yaml in inputs["yaml_documents"].items():
+        actual = read_joint_yaml(directory / name)
+        if allow_relocation:
+            if any(not isinstance(actual.get(key), str) or not actual[key] for key in ("path", "joint_manifest")):
+                raise ValueError(f"Prepared joint dataset YAML lacks location fields: {name}")
+            actual = {key: value for key, value in actual.items() if key not in ("path", "joint_manifest")}
+            expected_yaml = {key: value for key, value in expected_yaml.items() if key not in ("path", "joint_manifest")}
+        if actual != expected_yaml:
+            raise ValueError(f"Prepared joint dataset YAML differs: {name}")
+    for name, expected_list in inputs["split_lists"].items():
+        if (directory / name).read_text(encoding="utf-8") != expected_list:
+            raise ValueError(f"Prepared joint split list differs: {name}")
+    counts = validate_detection_export(
+        directory, verify_hashes=True,
+        lost_and_found_root=inputs["dataset"] if allow_relocation else None,
+    )
+    return resolved, counts
+
+
+def validate_existing_joint_export(root: Path, cfg: dict, directory: Path):
+    """Reconstruct the current semantic evidence entirely in memory, then compare."""
+    inputs = _joint_manifest_inputs(root, cfg)
+    if directory.resolve() != inputs["output"]:
+        raise ValueError("Explicit joint config output_root differs from the selected detection export")
+    return _validate_joint_current(directory, inputs, allow_relocation=True)
+
+
+def prepare_joint_detection(root: Path, cfg: dict) -> dict:
+    requested_output = root / cfg["output_root"]
+    if requested_output.is_symlink() or getattr(requested_output, "is_junction", lambda: False)():
+        raise ValueError("Joint output must be a real directory, not a symbolic link or junction")
+    output = requested_output.resolve()
+    empty_identity = _empty_output_identity(output)
+    existing = (output.exists() or output.is_symlink()) and empty_identity is None
+    inputs = _joint_manifest_inputs(root, cfg, include_signature=not existing)
+    manifest = inputs["manifest"]
+    rows = manifest["images"]
+    classes = manifest["classes"]
+    deferred = manifest["deferred_corrupt"]
+    signature = manifest["signature"]
+    manifest_text = json.dumps(manifest, indent=2)
+    split_lists, yaml_documents = inputs["split_lists"], inputs["yaml_documents"]
+    acdc_sources = inputs["acdc_sources"]
     if existing:
         try:
-            counts = validate_current(output)
+            previous, counts = _validate_joint_current(output, inputs, allow_relocation=True)
+            signature = previous["signature"]
         except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
             raise ValueError(
                 f"Existing joint export is incomplete or differs from current inputs: {exc}; "
@@ -288,10 +365,8 @@ def prepare_joint_detection(root: Path, cfg: dict) -> dict:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary_manifest, staging / "manifest.json")
-            counts = validate_current(staging)
-            if output.exists() or output.is_symlink():
-                raise ValueError("Joint output appeared during preparation; choose a new output_root")
-            _publish_detection_staging(staging, output)
+            _, counts = _validate_joint_current(staging, inputs)
+            _publish_detection_staging(staging, output, empty_identity=empty_identity)
         finally:
             if staging.exists() or staging.is_symlink():
                 current = staging.lstat()

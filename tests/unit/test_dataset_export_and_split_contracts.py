@@ -248,7 +248,7 @@ def test_large_group_split_fallback_covers_four_splits_reproducibly(monkeypatch)
 
 
 def _joint_helpers():
-    return _helper("tests/unit/test_p2_pipeline_followup.py", "remaining_joint_fixtures")
+    return _helper("tests/unit/test_training_state_and_dataset_integrity.py", "remaining_joint_fixtures")
 
 
 def _write_five_laf_train_locations(root, helper):

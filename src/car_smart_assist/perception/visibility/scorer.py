@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -348,6 +349,24 @@ class CalibrationStats:
         return {"mean": self.mean, "std": self.std, "p95": self.p95, "p99": self.p99, "n": self.n}
 
 
+def _load_visibility_checkpoint(path: str | Path) -> dict[str, Any]:
+    """统一文件及反序列化错误；程序错误与中断仍交给调用方。"""
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except (OSError, EOFError, pickle.UnpicklingError, RuntimeError, ValueError, ImportError) as exc:
+        raise ValueError(
+            f"无法读取能见度检查点：{path}；文件可能损坏或不兼容。"
+            "请保留原件并确认路径，使用可用的配对检查点或 --fresh 新开实验。"
+        ) from exc
+    if not isinstance(checkpoint, dict):
+        raise ValueError(f"能见度检查点格式无效：{path}；预期为状态字典，请检查权重来源")
+    for key in ("model_cfg", "model_state", "scoring_cfg", "calibration", "config_snapshot", "history"):
+        if (key in checkpoint and not (key == "calibration" and checkpoint[key] is None)
+                and not isinstance(checkpoint[key], dict)):
+            raise ValueError(f"能见度检查点 {path} 的 {key} 必须为字典；请检查权重来源")
+    return checkpoint
+
+
 class VisibilityScorer:
     """加载训练好的 AE，对图像算能见度分数。
 
@@ -388,17 +407,41 @@ class VisibilityScorer:
         scoring_cfg: dict[str, Any] | None = None,
     ) -> VisibilityScorer:
         """从训练 checkpoint 恢复。checkpoint 里嵌了模型配置和校准统计。"""
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        ckpt = _load_visibility_checkpoint(checkpoint_path)
         model_cfg = ckpt.get("model_cfg", cfg or {})
-        model = build_autoencoder(model_cfg)
-        model.load_state_dict(ckpt["model_state"])
+        if not isinstance(model_cfg, dict) or not isinstance(ckpt.get("model_state"), dict):
+            raise ValueError(f"能见度检查点 {checkpoint_path} 缺少有效 model_cfg/model_state；请检查权重来源")
+        try:
+            model = build_autoencoder(model_cfg)
+            model.load_state_dict(ckpt["model_state"])
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"能见度检查点 {checkpoint_path} 的模型配置或权重不兼容；请使用匹配的 AE 检查点：{exc}"
+            ) from exc
         cal = ckpt.get("calibration")
-        calibration = CalibrationStats(**cal) if cal else None
+        try:
+            calibration = CalibrationStats(**cal) if cal else None
+        except TypeError as exc:
+            raise ValueError(f"能见度检查点 {checkpoint_path} 的 calibration 字段无效；请检查校准统计") from exc
+        if calibration is not None:
+            values = (calibration.mean, calibration.std, calibration.p95, calibration.p99)
+            if (any(isinstance(value, (bool, np.bool_))
+                    or not isinstance(value, (int, float, np.integer, np.floating))
+                    or not np.isfinite(value) for value in values)
+                    or calibration.std < 0
+                    or isinstance(calibration.n, (bool, np.bool_))
+                    or not isinstance(calibration.n, (int, np.integer)) or calibration.n <= 0):
+                raise ValueError(f"能见度检查点 {checkpoint_path} 的 calibration 必须包含有限统计、非负 std 和正整数 n")
         # 调用方显式传入的配置代表当前实验/部署策略，优先于 checkpoint 快照里的值。
         # 未提供时再回退到训练时保存的值，独立加载也能复现。
         effective_scoring_cfg = (
             scoring_cfg if scoring_cfg is not None else ckpt.get("scoring_cfg", {})
         )
+        if not isinstance(effective_scoring_cfg, dict):
+            raise ValueError(f"能见度检查点 {checkpoint_path} 的 scoring_cfg 必须为字典")
+        for key in ("features", "feature_scales", "aggregation", "reconstruction_error"):
+            if key in effective_scoring_cfg and not isinstance(effective_scoring_cfg[key], dict):
+                raise ValueError(f"能见度检查点 {checkpoint_path} 的 scoring_cfg.{key} 必须为字典")
         if calibration is None:
             logger.warning(
                 "checkpoint 中没有校准统计，z 分数不可用。"

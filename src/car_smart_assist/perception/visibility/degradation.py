@@ -86,9 +86,16 @@ def add_blur(img: np.ndarray, severity: float, rng: np.random.Generator,
     k /= k.sum()
 
     a = img.astype(np.float32)
-    # 先横向卷积再纵向卷积
-    a = np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), axis=1, arr=a)
-    a = np.apply_along_axis(lambda m: np.convolve(m, k, mode="same"), axis=0, arr=a)
+
+    def convolve_same(m: np.ndarray) -> np.ndarray:
+        if len(m) >= len(k):
+            return np.convolve(m, k, mode="same")
+        # 短信号仍按零边界取中心，不能让 same 模式把长度扩成核长。
+        return np.convolve(m, k, mode="full")[radius:radius + len(m)]
+
+    # 先横向卷积再纵向卷积；正常尺寸保留原有数值路径。
+    a = np.apply_along_axis(convolve_same, axis=1, arr=a)
+    a = np.apply_along_axis(convolve_same, axis=0, arr=a)
     return np.clip(a, 0, 255).astype(np.uint8), DegradationSpec(
         "blur", severity, {"sigma": sigma}
     )

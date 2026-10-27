@@ -18,6 +18,7 @@ from zipfile import ZipFile
 import numpy as np
 import torch
 from PIL import Image
+from filelock import FileLock
 from torch.utils.data import Dataset
 
 from car_smart_assist.config.weather_pyramid import WeatherPyramidConfig
@@ -321,10 +322,98 @@ def prepare_pyramid_splits(cfg: WeatherPyramidConfig, root: Path):
     output = root / cfg.data["cache_dir"] / f"splits_{signature[:16]}.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(info, ensure_ascii=False, indent=2)
-    if not output.exists() or output.read_text(encoding="utf-8") != serialized:
-        output.write_text(serialized, encoding="utf-8")
+    with FileLock(str(output.resolve()) + ".lock"):
+        if not output.exists() or output.read_text(encoding="utf-8") != serialized:
+            _write_cache_metadata(output, info)
     info["manifest"] = str(output)
     return splits, info
+
+
+def _write_cache_metadata(path: Path, value):
+    content = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=path.name + ".", suffix=".tmp", dir=path.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if temporary.read_bytes() != content:
+            raise OSError(f"天气缓存记录临时文件回读不一致：{temporary}")
+        temporary.replace(path)
+        temporary = None
+        if path.read_bytes() != content:
+            raise OSError(f"天气缓存记录最终回读不一致：{path}")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _load_pyramid_cache(samples, cfg, output, signature):
+    """调用方持有缓存路径锁；读取者只会打开完整发布的数组。"""
+    manifest = output.with_suffix(".json")
+    expected_shape = (len(samples), *cfg.image_size, 3)
+    cached = None
+    if output.exists() and manifest.exists():
+        try:
+            info = json.loads(manifest.read_text(encoding="utf-8"))
+            cached = np.load(output, mmap_mode="r", allow_pickle=False)
+            if (
+                info["signature"] == signature
+                and cached.shape == expected_shape
+                and cached.dtype == np.uint8
+            ):
+                return cached
+        except (OSError, ValueError, KeyError, TypeError, EOFError):
+            pass
+        if cached is not None:
+            cached._mmap.close()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            prefix=output.stem + ".", suffix=".partial.npy", dir=output.parent, delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+        array = np.lib.format.open_memmap(
+            temporary, mode="w+", dtype=np.uint8, shape=expected_shape
+        )
+        try:
+            with ExitStack() as stack:
+                archives = {
+                    p: stack.enter_context(ZipFile(p))
+                    for p in {s.archive_path for s in samples}
+                    if p is not None
+                }
+                for index, sample in enumerate(samples):
+                    source = (
+                        sample.path
+                        if sample.path is not None
+                        else io.BytesIO(archives[sample.archive_path].read(sample.member))
+                    )
+                    with Image.open(source) as image:
+                        array[index] = prepare_pyramid_image(image, cfg.image_size)
+                    if (index + 1) % 256 == 0:
+                        logger.info("新天气缓存 %d/%d", index + 1, len(samples))
+            array.flush()
+        finally:
+            array._mmap.close()
+        with temporary.open("r+b") as stream:
+            os.fsync(stream.fileno())
+        candidate = np.load(temporary, mmap_mode="r", allow_pickle=False)
+        try:
+            if candidate.shape != expected_shape or candidate.dtype != np.uint8:
+                raise ValueError(f"天气缓存候选形状或类型无效：{temporary}")
+        finally:
+            candidate._mmap.close()
+        temporary.replace(output)
+        temporary = None
+        _write_cache_metadata(manifest, {"signature": signature})
+        return np.load(output, mmap_mode="r", allow_pickle=False)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 class PyramidDataset(Dataset):
@@ -335,53 +424,17 @@ class PyramidDataset(Dataset):
         self.signature = hashlib.sha256(
             (_sample_signature(samples, cfg.image_size) + "rgb-letterbox-bilinear-v1").encode()
         ).hexdigest()
-        cache_dir.mkdir(parents=True, exist_ok=True)
         output = cache_dir / f"images_{self.signature[:16]}.npy"
-        manifest = output.with_suffix(".json")
-        expected_shape = (len(samples), *cfg.image_size, 3)
-        reuse = False
-        if output.exists() and manifest.exists():
-            try:
-                info = json.loads(manifest.read_text(encoding="utf-8"))
-                cached = np.load(output, mmap_mode="r", allow_pickle=False)
-                reuse = (
-                    info["signature"] == self.signature
-                    and cached.shape == expected_shape
-                    and cached.dtype == np.uint8
-                )
-            except (OSError, ValueError, KeyError):
-                reuse = False
-        if not reuse:
-            if "cached" in locals():
-                del cached
-            temporary = output.with_suffix(".partial.npy")
-            array = np.lib.format.open_memmap(
-                temporary, mode="w+", dtype=np.uint8, shape=expected_shape
-            )
-            try:
-                with ExitStack() as stack:
-                    archives = {
-                        p: stack.enter_context(ZipFile(p))
-                        for p in {s.archive_path for s in samples}
-                        if p is not None
-                    }
-                    for index, sample in enumerate(samples):
-                        source = (
-                            sample.path
-                            if sample.path is not None
-                            else io.BytesIO(archives[sample.archive_path].read(sample.member))
-                        )
-                        with Image.open(source) as image:
-                            array[index] = prepare_pyramid_image(image, cfg.image_size)
-                        if (index + 1) % 256 == 0:
-                            logger.info("新天气缓存 %d/%d", index + 1, len(samples))
-                array.flush()
-            finally:
-                del array
-            temporary.replace(output)
-            manifest.write_text(json.dumps({"signature": self.signature}), encoding="utf-8")
-            cached = np.load(output, mmap_mode="r", allow_pickle=False)
-        self.images = cached
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with FileLock(str(output.resolve()) + ".lock"):
+                self.images = _load_pyramid_cache(samples, cfg, output, self.signature)
+        except PermissionError as exc:
+            raise ValueError(
+                f"无法读取或发布天气图像缓存：{output}。缓存可能仍被其他训练进程或 "
+                "DataLoader 映射，也可能没有写权限；请结束占用进程、核对目录权限，"
+                "或设置独立的 data.cache_dir 后重试。"
+            ) from exc
 
     def __len__(self):
         return len(self.samples)

@@ -69,7 +69,7 @@ def _write_yaml(path: Path, value):
     path.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
 
 
-def test_fix_p3_01_calibration_pause_then_ordinary_resume_clears_stop(tmp_path, monkeypatch):
+def test_calibration_pause_then_ordinary_resume_clears_stop(tmp_path, monkeypatch):
     helper = _load("tests/unit/test_training_stop_models.py", "control_stop_models")
     from car_smart_assist.utils.stop import StopController
 
@@ -137,7 +137,8 @@ def _weather_main_fixture(tmp_path, monkeypatch, *, compare):
     module.main.__globals__["validate_weather_attention_config"] = lambda _cfg: None
     module.main.__globals__["require_independent_weather_reports"] = lambda *_: None
     module.main.__globals__["require_independent_weather_output"] = lambda *_: None
-    module.main.__globals__["attention_model_config"] = lambda _cfg: {"synthetic": True}
+    from car_smart_assist.perception import weather_attention_training as training
+    monkeypatch.setattr(training, "attention_model_config", lambda _cfg: {"synthetic": True})
     module.main.__globals__["prepare_attention_datasets"] = lambda *_: ({}, {"signature": "sig"})
     module.main.__globals__["train_attention"] = lambda *_args, **_kwargs: (
         object(), {"manual_stop": False, "best_epoch": 2}
@@ -153,7 +154,7 @@ def _weather_main_fixture(tmp_path, monkeypatch, *, compare):
     return module, controller, root
 
 
-def test_fix_p3_02_weather_main_late_stop_keeps_completed_comparison_report(tmp_path, monkeypatch):
+def test_weather_main_late_stop_keeps_completed_comparison_report(tmp_path, monkeypatch):
     def compare(controller, root):
         def run(*_args, **_kwargs):
             (root / "reports/REPORT.md").write_text(
@@ -174,7 +175,7 @@ def test_fix_p3_02_weather_main_late_stop_keeps_completed_comparison_report(tmp_
     assert json.loads((root / "reports/progress.json").read_text(encoding="utf-8"))["status"] == "completed"
 
 
-def test_fix_p3_02_weather_main_early_compare_stop_and_pipeline_boundary(tmp_path, monkeypatch):
+def test_weather_main_early_compare_stop_and_pipeline_boundary(tmp_path, monkeypatch):
     def compare(controller, _root):
         def run(*_args, **_kwargs):
             controller.request()
@@ -214,7 +215,7 @@ def test_fix_p3_02_weather_main_early_compare_stop_and_pipeline_boundary(tmp_pat
     assert state["stages"][1]["status"] == "PENDING"
 
 
-def test_fix_p3_03_cpu_yolo_state_saves_no_cuda_and_restores_without_gpu(tmp_path, monkeypatch):
+def test_cpu_yolo_state_saves_no_cuda_and_restores_without_gpu(tmp_path, monkeypatch):
     helper = _load("tests/unit/test_yolo_training_state.py", "control_yolo_state")
     from car_smart_assist.perception import yolo_training
 
@@ -249,7 +250,7 @@ def test_fix_p3_03_cpu_yolo_state_saves_no_cuda_and_restores_without_gpu(tmp_pat
     assert restored._project_best_checkpoint_sha256 == resume_state["best_checkpoint_sha256"]
 
 
-def test_fix_p3_04_split_identity_errors_are_distinct_and_match_still_scores(tmp_path, monkeypatch):
+def test_split_identity_errors_are_distinct_and_match_still_scores(tmp_path, monkeypatch):
     module = _load("scripts/evaluate_visibility.py", "control_eval_visibility")
     import car_smart_assist.perception.visibility.dataset as dataset
     monkeypatch.setattr(dataset, "split_ref_indices", lambda *_a, **_k: tuple(
@@ -282,7 +283,7 @@ def test_fix_p3_04_split_identity_errors_are_distinct_and_match_still_scores(tmp
     assert result["test_false_positive_rate"] == 1.0 and len(calls) == 4
 
 
-def test_fix_p3_04_cli_returns_two_without_traceback_or_report_on_missing_identity(tmp_path, monkeypatch, capsys):
+def test_cli_returns_two_without_traceback_or_report_on_missing_identity(tmp_path, monkeypatch, capsys):
     module = _load("scripts/evaluate_visibility.py", "control_eval_cli")
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -321,7 +322,7 @@ def test_fix_p3_04_cli_returns_two_without_traceback_or_report_on_missing_identi
     with pytest.raises(ValueError, match="unrelated program error"):
         module.main()
 
-def test_rev01_checkpoint_scoring_snapshot_fallback_and_explicit_empty_override(tmp_path):
+def test_checkpoint_scoring_snapshot_fallback_and_explicit_empty_override(tmp_path):
     helper = _load("tests/unit/test_visibility_best_identity.py", "control_visibility_identity")
     from car_smart_assist.perception.visibility.trainer import (
         VisibilityTrainer, _atomic_save, _model_state_sha256,
@@ -340,7 +341,7 @@ def test_rev01_checkpoint_scoring_snapshot_fallback_and_explicit_empty_override(
     assert explicit_empty.scoring_cfg == {}
 
 
-def test_rev01_evaluate_visibility_main_passes_none_for_omission_and_empty_for_override(
+def test_evaluate_visibility_main_passes_none_for_omission_and_empty_for_override(
     tmp_path, monkeypatch
 ):
     module = _load("scripts/evaluate_visibility.py", "control_eval_scoring_callers")
@@ -412,7 +413,7 @@ def _minimal_ablation_setup(tmp_path, monkeypatch, *, tags=("alpha", "beta")):
     return module, base, input_calls
 
 
-def test_rev01_callers_pass_omitted_scoring_as_none_and_empty_as_override(tmp_path, monkeypatch):
+def test_callers_pass_omitted_scoring_as_none_and_empty_as_override(tmp_path, monkeypatch):
     module, base, _ = _minimal_ablation_setup(tmp_path, monkeypatch, tags=("alpha",))
     seen = []
 
@@ -456,7 +457,7 @@ def test_rev01_callers_pass_omitted_scoring_as_none_and_empty_as_override(tmp_pa
     assert seen == [{}]
 
 
-def test_rev02_subset_preserves_suite_successful_subset_continue_and_identity_rejection(tmp_path, monkeypatch):
+def test_subset_preserves_suite_successful_subset_continue_and_identity_rejection(tmp_path, monkeypatch):
     module, base, _ = _minimal_ablation_setup(tmp_path, monkeypatch)
     out = tmp_path / "artifacts/reports/visibility/ablations"
     out.mkdir(parents=True)
@@ -526,7 +527,7 @@ def test_rev02_subset_preserves_suite_successful_subset_continue_and_identity_re
         module.main()
     assert trained_tags == ["beta"]
 
-def test_rev06_empty_only_exits_two_before_input_preparation_and_list_still_works(tmp_path, monkeypatch):
+def test_empty_only_exits_two_before_input_preparation_and_list_still_works(tmp_path, monkeypatch):
     module, _base, input_calls = _minimal_ablation_setup(tmp_path, monkeypatch, tags=("alpha",))
     monkeypatch.setattr(module, "_prepare_inputs", lambda *_: pytest.fail("prepared inputs before parser rejection"))
     monkeypatch.setattr(sys, "argv", ["run_visibility_ablations.py", "--only"])
@@ -538,8 +539,8 @@ def test_rev06_empty_only_exits_two_before_input_preparation_and_list_still_work
     assert input_calls == []
 
 
-def test_rev07_attention_fork_rng_receives_explicit_cuda_zero_before_model_factory(tmp_path, monkeypatch):
-    helper = _load("tests/unit/test_training_stop_models.py", "control_stop_models_rev07")
+def test_attention_fork_rng_receives_explicit_cuda_zero_before_model_factory(tmp_path, monkeypatch):
+    helper = _load("tests/unit/test_training_stop_models.py", "control_stop_models_cuda_identity")
     training, cfg, datasets, split, _ = helper._attention_setup(tmp_path, monkeypatch)
     monkeypatch.setattr(training, "select_device", lambda *_: torch.device("cuda:0"))
     monkeypatch.setattr(training.torch, "manual_seed", lambda *_: None)
@@ -560,10 +561,10 @@ def test_rev07_attention_fork_rng_receives_explicit_cuda_zero_before_model_facto
         training._train_attention(
             cfg, tmp_path, datasets, split, fresh=True, stop_controller=_Controller(tmp_path / "STOP")
         )
-    assert captured == [[0]]
+    assert captured == [[0], [0]]  # Fresh preflight and training both isolate the selected GPU.
 
 
-def test_rev09_weather_cli_invalid_epoch_budgets_return_two_and_valid_override_reaches_preflight(
+def test_weather_cli_invalid_epoch_budgets_return_two_and_valid_override_reaches_preflight(
     tmp_path, monkeypatch, capsys
 ):
     module = _load("scripts/train_weather_attention.py", "control_weather_epoch_cli")
@@ -585,7 +586,7 @@ def test_rev09_weather_cli_invalid_epoch_budgets_return_two_and_valid_override_r
     assert module.main(["--preflight", "--config", "config.yaml", "--total-epochs", "450"]) == 0
 
 
-def test_rev10_from_config_resolves_relative_absolute_and_default_visibility_paths(tmp_path, monkeypatch):
+def test_from_config_resolves_relative_absolute_and_default_visibility_paths(tmp_path, monkeypatch):
     from car_smart_assist.inference.pipeline import InferencePipeline
     from car_smart_assist.perception.visibility.scorer import VisibilityScorer
 

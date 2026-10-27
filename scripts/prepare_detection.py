@@ -12,6 +12,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from car_smart_assist.data.joint_paths import load_joint_data_config  # noqa: E402
 from car_smart_assist.data.detection import (  # noqa: E402
     load_detection_data_config,
     prepare_detection_data,
@@ -31,10 +32,15 @@ def main() -> int:
         raw = yaml.safe_load((root / args.config).read_text(encoding="utf-8"))
         joint = "joint_detection_data" in raw
         cfg = (
-            raw["joint_detection_data"] if joint else load_detection_data_config(root / args.config)
+            load_joint_data_config(root / args.config) if joint else load_detection_data_config(root / args.config)
         )
         if args.verify_only:
-            result = validate_detection_export(root / cfg["output_root"], args.verify_hashes)
+            if joint:
+                from car_smart_assist.data.detection_joint import validate_existing_joint_export
+
+                _, result = validate_existing_joint_export(root, cfg, root / cfg["output_root"])
+            else:
+                result = validate_detection_export(root / cfg["output_root"], args.verify_hashes)
         else:
             if joint:
                 from car_smart_assist.data.detection_joint import prepare_joint_detection
@@ -42,7 +48,7 @@ def main() -> int:
                 result = prepare_joint_detection(root, cfg)
             else:
                 result = prepare_detection_data(root, cfg)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+    except (OSError, ValueError, KeyError, TypeError, yaml.YAMLError) as exc:
         print(f"Detection data preparation failed: {exc}", file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, indent=2))

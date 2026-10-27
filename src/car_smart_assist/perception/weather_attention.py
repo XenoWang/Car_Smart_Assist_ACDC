@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -133,6 +134,17 @@ def optimize_attention_inference(model: WeatherAttention) -> WeatherAttention:
     return _optimize_attention_inference_inplace(copy.deepcopy(model))
 
 
+def load_attention_checkpoint(path: str | Path):
+    """仅把检查点读取/反序列化错误转成带路径的输入错误。"""
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+    except (OSError, EOFError, pickle.UnpicklingError, RuntimeError) as exc:
+        raise ValueError(f"无法读取天气注意力检查点 {path}：{exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"天气注意力检查点须为映射：{path}")
+    return payload
+
+
 class WeatherAttentionPredictor:
     def __init__(self, model, cfg, thresholds, device):
         self.model, self.cfg, self.thresholds, self.device = model, cfg, thresholds, device
@@ -141,22 +153,32 @@ class WeatherAttentionPredictor:
     def from_checkpoint(
         cls, path: str | Path, cfg: WeatherAttentionConfig, device: str | None = None
     ):
-        payload = torch.load(path, map_location="cpu", weights_only=True)
+        payload = load_attention_checkpoint(path)
         if payload.get("format_version") != 1 or payload.get(
             "model_config"
         ) != attention_model_config(cfg):
             raise ValueError("天气注意力检查点与结构配置不符")
         if not payload.get("calibration_signature"):
             raise ValueError("天气注意力候选还没有完成独立校准")
-        thresholds = payload["decision_thresholds"]
-        if set(thresholds) != set(cfg.attributes) or any(
-            not np.isfinite(v) or not 0 < v < 1 for v in thresholds.values()
+        thresholds = payload.get("decision_thresholds")
+        if (
+            not isinstance(thresholds, dict)
+            or set(thresholds) != set(cfg.attributes)
+            or any(
+                type(v) not in (int, float) or not np.isfinite(v) or not 0 < v < 1
+                for v in thresholds.values()
+            )
         ):
-            raise ValueError("天气属性阈值无效")
+            raise ValueError(f"天气属性阈值无效：{path}")
+        if not isinstance(payload.get("model_state"), dict):
+            raise ValueError(f"天气注意力检查点缺少 model_state 映射：{path}")
         selected = select_device(device or cfg.device)
         # 旧copy路径也隔离配置；只复制元数据，不复制整份设备参数。
         model = WeatherAttention(copy.deepcopy(cfg)).to(selected)
-        model.load_state_dict(payload["model_state"])
+        try:
+            model.load_state_dict(payload["model_state"])
+        except (RuntimeError, TypeError) as exc:
+            raise ValueError(f"天气注意力检查点参数与模型不符（{path}）：{exc}") from exc
         if cfg.train["channels_last"]:
             model.to(memory_format=torch.channels_last)
         return cls(_optimize_attention_inference_inplace(model), cfg, thresholds, selected)

@@ -94,6 +94,8 @@ def test_trainer_honors_augmentation_switch(tmp_path, monkeypatch, cleaning_mani
         "data": {"acdc_root": "images", "split_by_sequence": False, "cleaning_manifest": cleaning_manifest},
         "train": {"augment": False, "augmentation": {"contrast_range": [1, 1]}},
     }
+    if cleaning_manifest is not None:
+        (tmp_path / cleaning_manifest).write_text('{"invalid": []}', encoding="utf-8")
     trainer = VisibilityTrainer(cfg, project_root=tmp_path, resume="none")
     train, val, calib, _ = trainer._build_datasets()
     assert train.augment is val.augment is calib.augment is False

@@ -1,4 +1,4 @@
-"""PRD004 regression contracts for weather routing, config, fresh runs and preflight."""
+"""Weather routing, configuration, fresh-run report archival and preflight contracts."""
 from __future__ import annotations
 
 import json
@@ -155,8 +155,7 @@ def test_fresh_archives_old_reports_byte_for_byte_before_training_continues(tmp_
     monkeypatch.setattr(training, "require_independent_weather_reports", lambda *_: None)
     monkeypatch.setattr(training, "select_device", lambda *_: SimpleNamespace(type="cpu", index=None))
     monkeypatch.setattr(training, "ensure_pretrained_weights", lambda *_: weights)
-    monkeypatch.setattr(training, "hashlib", SimpleNamespace(sha256=lambda *_: (_ for _ in ()).throw(
-        StopAfterArchive())))
+    monkeypatch.setattr(training, "preflight_attention", lambda *_a, **_k: (_ for _ in ()).throw(StopAfterArchive()))
     with pytest.raises(StopAfterArchive):
         training.train_attention(cfg, tmp_path, {}, {"signature": "synthetic"}, fresh=True,
                                  stop_controller=StopController())
@@ -182,12 +181,15 @@ def _preflight_cli(tmp_path, monkeypatch, profile):
     monkeypatch.setattr(module, "require_independent_weather_reports", lambda *_: None)
     monkeypatch.setattr(module, "require_independent_weather_output", lambda *_: None)
     monkeypatch.setattr(module, "prepare_attention_datasets", lambda *_: ({}, {"signature": "sig"}))
-    monkeypatch.setattr(module, "attention_model_config", lambda _cfg: {"architecture": "fixture"})
+    from car_smart_assist.perception import weather_attention_training as training
+    monkeypatch.setattr(training, "attention_model_config", lambda _cfg: {"architecture": "fixture"})
     (root / "reports").mkdir()
     (root / "reports/preflight.json").write_text(json.dumps(profile), encoding="utf-8")
 
     class Controller:
         requested = False
+        def resume(self):
+            self.requested = False
         def __enter__(self):
             return self
         def __exit__(self, *_args):
@@ -215,7 +217,7 @@ def _load_script(relative):
     import importlib.util
 
     path = ROOT / relative
-    spec = importlib.util.spec_from_file_location("prd004_weather_" + path.stem, path)
+    spec = importlib.util.spec_from_file_location("weather_cli_" + path.stem, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)

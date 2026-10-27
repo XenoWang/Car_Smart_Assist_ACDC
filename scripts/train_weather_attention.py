@@ -17,7 +17,6 @@ from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: 
 from filelock import FileLock, Timeout  # noqa: E402
 
 from car_smart_assist.config.weather_attention import (  # noqa: E402
-    attention_model_config,
     load_weather_attention_config,
     validate_weather_attention_config,
 )
@@ -26,6 +25,7 @@ from car_smart_assist.perception.weather_attention_training import (  # noqa: E4
     model_report,
     preflight_attention,
     prepare_attention_datasets,
+    require_attention_preflight,
     require_independent_weather_output,
     require_independent_weather_reports,
     train_attention,
@@ -40,7 +40,7 @@ def main(argv=None, *, stop_controller=None):
     modes.add_argument(
         "--preflight", action="store_true", help="只检查真实图像前后向和效率，不更新参数"
     )
-    modes.add_argument("--fresh", action="store_true", help="保存已有 best/last 快照，再开新实验")
+    modes.add_argument("--fresh", action="store_true", help="归档已有产物，自动重新预检通过后开新实验")
     parser.add_argument(
         "--total-epochs", type=int, default=None, help="新实验累计目标；普通恢复须与原配方一致，追加预算使用 continuation"
     )
@@ -86,24 +86,8 @@ def main(argv=None, *, stop_controller=None):
                 report = preflight_attention(cfg, root, datasets, info)
                 print(json.dumps(report, ensure_ascii=False, indent=2))
             else:
-                profile_path = root / cfg.report_dir / "preflight.json"
-                if not profile_path.is_file():
-                    raise ValueError("请先运行 --preflight 完成真实数据与效率检查")
-                profile = json.loads(profile_path.read_text(encoding="utf-8"))
-                if (
-                    profile.get("model_config") != attention_model_config(cfg)
-                    or profile.get("backbone_training") != {
-                        "fine_tune_from": cfg.backbone["fine_tune_from"],
-                        "freeze_epochs": cfg.backbone["freeze_epochs"],
-                        "probe_epoch": cfg.backbone["freeze_epochs"] + 1,
-                    }
-                    or profile["split_signature"] != info["signature"]
-                    or profile["batch_size"] != cfg.train["batch_size"]
-                    or profile["channels_last"] != cfg.train["channels_last"]
-                    or profile.get("swad") != cfg.train.get("swad")
-                    or profile.get("l2_sp_coefficient", 0) != cfg.train.get("l2_sp", 0)
-                ):
-                    raise ValueError("模型、微调配方、批量或数据已改变，请重新运行 --preflight")
+                if not args.fresh:
+                    require_attention_preflight(cfg, root, info)
                 trained_model, trained = train_attention(
                     cfg, root, datasets, info, fresh=args.fresh, stop_controller=controller,
                     continue_only=args.continue_training
@@ -139,11 +123,19 @@ def main(argv=None, *, stop_controller=None):
             return STOP_EXIT_CODE
         except Exception as exc:
             path = root / cfg.report_dir / "progress.json"
-            previous = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"epoch": 0}
-            previous.update(status="中断", error=f"{type(exc).__name__}: {exc}")
-            write_json(path, previous)
-            model_report(cfg, root, previous)
-            logging.exception("天气注意力任务中断；已有检查点保留")
+            try:
+                previous = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"epoch": 0}
+                if not isinstance(previous, dict):
+                    raise ValueError("任务进度记录必须为 JSON 对象")
+                previous.update(status="中断", error=f"{type(exc).__name__}: {exc}")
+                write_json(path, previous)
+                model_report(cfg, root, previous)
+            except (OSError, ValueError, KeyError, TypeError) as report_error:
+                logging.error("无法更新中断记录：%s", report_error)
+            if isinstance(exc, (OSError, ValueError)):
+                print(f"天气注意力任务未完成：{exc}", file=sys.stderr)
+            else:
+                logging.exception("天气注意力任务中断；已有检查点保留")
             return 2
         return STOP_EXIT_CODE if controller.requested else 0
 

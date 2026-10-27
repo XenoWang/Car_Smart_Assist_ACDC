@@ -112,6 +112,8 @@ def _attention_setup(root, monkeypatch, *, stop_controller=None, pause_on_first=
     monkeypatch.setattr(training, "detailed_metrics", lambda *_args: {"synthetic": True})
     monkeypatch.setattr(training, "optimize_attention_inference", lambda model: model)
     monkeypatch.setattr(training, "model_report", lambda *_args: None)
+    from _model_test_helpers import synthetic_attention_preflight
+    monkeypatch.setattr(training, "preflight_attention", synthetic_attention_preflight)
 
     def controlled_selection(dataset, _values, _cfg):
         row = {name: {"source_balanced_ap": 0.5} for name in cfg.attributes}

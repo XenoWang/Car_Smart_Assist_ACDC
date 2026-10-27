@@ -81,6 +81,19 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         from ultralytics import YOLO
         from ultralytics.data import utils as data_utils
         from ultralytics.utils import downloads
+        from ultralytics.engine import trainer as trainer_module, validator as validator_module
+        from ultralytics.utils.torch_utils import select_device
+
+        def select_cpu_without_hiding_cuda(device, *args, **kwargs):
+            # The vendor string CPU selector can cache zero visible GPUs in a
+            # fresh pytest process. Its resolved-device path preserves visibility
+            # while retaining the real CPU trainer, validator and model updates.
+            if str(device) == "cpu":
+                device = torch.device("cpu")
+            return select_device(device, *args, **kwargs)
+
+        monkeypatch.setattr(trainer_module, "select_device", select_cpu_without_hiding_cuda)
+        monkeypatch.setattr(validator_module, "select_device", select_cpu_without_hiding_cuda)
 
         # Plotting is disabled; font acquisition is unrelated to the training contract.
         monkeypatch.setattr(data_utils, "check_font", lambda *_a, **_k: None)
@@ -182,6 +195,8 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
             **initial_plan["train"],
         )
 
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == previous_environment["CUDA_VISIBLE_DEVICES"]
+
         weights = run / "weights"
         last = weights / "last.pt"
         best = weights / "best.pt"
@@ -260,6 +275,7 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
             **continuation["train"],
         )
 
+        assert os.environ.get("CUDA_VISIBLE_DEVICES") == previous_environment["CUDA_VISIBLE_DEVICES"]
         assert resumed_epochs == [1]
         assert resumed_results.results_dict
         _assert_tree_equal(restored["model"], stopped_state["model"])
@@ -316,3 +332,4 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
             torch.equal(actual, expected)
             for actual, expected in zip(restored_cuda_rng, previous_cuda_rng, strict=True)
         )
+        print(f"CUDA_RNG_RESTORED_DEVICES={len(restored_cuda_rng)}")

@@ -387,7 +387,7 @@ def test_yolo_fresh_archive_clears_stale_pair_but_normal_archive_retains_it(tmp_
     [("train_visibility", "visibility.yaml", "visibility", "VisibilityTrainer"),
      ("train_weather", "weather_classifier.yaml", "weather_classifier", "train_weather"),
      ("train_weather_attention", "weather_attention.yaml", "weather_attention", "prepare_attention_datasets"),
-     ("train_detection", "yolo_detection.yaml", "yolo_detection", "validate_detection_export")],
+     ("train_detection", "yolo_detection.yaml", "yolo_detection", "detection_data_scope")],
 )
 def test_individual_stop_action_never_starts_model_or_reads_dataset(
     tmp_path, monkeypatch, module_name, config_name, key, guard_name

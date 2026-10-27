@@ -73,6 +73,4 @@ visibility:
   report:
     output_dir: artifacts/reports/retrain_300_20261017/visibility
     sample_per_condition: 200
-    export_gallery: true
-    gallery_size: 32
   device: auto

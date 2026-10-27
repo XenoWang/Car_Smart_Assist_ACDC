@@ -9,7 +9,6 @@ import logging
 import sys
 from pathlib import Path
 
-import yaml
 from filelock import FileLock, Timeout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -19,6 +18,7 @@ from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: 
 from car_smart_assist.perception.visibility import VisibilityTrainer  # noqa: E402
 from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
     archive_visibility_checkpoints,
+    load_visibility_config,
     recover_visibility_checkpoint_transaction,
 )
 
@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     g = p.add_mutually_exclusive_group()
     g.add_argument(
         "--resume", nargs="?", const="auto", default="auto", metavar="PATH",
-        help="从检查点续训。不带参数时自动取 checkpoint_dir/last.pt（默认）。",
+        help="从检查点续训。相对路径按项目根解析；不带参数自动取 checkpoint_dir/last.pt（默认）。",
     )
     g.add_argument(
         "--fresh", action="store_true",
@@ -60,12 +60,11 @@ def main() -> int:
 
     root = Path(__file__).resolve().parents[1]
     cfg_path = root / args.config
-    if not cfg_path.exists():
-        print(f"配置文件不存在: {cfg_path}", file=sys.stderr)
+    try:
+        cfg = load_visibility_config(cfg_path)
+    except ValueError as exc:
+        logging.getLogger(__name__).error("无法使用训练配置：%s", exc)
         return 2
-
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    cfg = raw.get("visibility", raw)
 
     # 命令行覆盖（--set 那套等 config/loader.py 完成后再统一）
     if args.epochs is not None:

@@ -168,12 +168,12 @@ def execute(work, state, controller):
         if stage["status"] == "COMPLETED":
             continue
         if controller.requested:
-            state.update(status="PAUSED", termination_reason="manual_stop")
+            state.update(status="PAUSED", active_model=None, termination_reason="manual_stop")
             save_state(work, state)
             return STOP_EXIT_CODE
         verify_identity(state, work)
         if controller.requested:
-            state.update(status="PAUSED", termination_reason="manual_stop")
+            state.update(status="PAUSED", active_model=None, termination_reason="manual_stop")
             save_state(work, state)
             return STOP_EXIT_CODE
         command = list(stage["command"])
@@ -238,7 +238,7 @@ def execute(work, state, controller):
         stage["checkpoints"] = checkpoint_records(work, stage)
         if code == STOP_EXIT_CODE:
             stage["status"] = "PAUSED"
-            state.update(status="PAUSED", termination_reason="manual_stop")
+            state.update(status="PAUSED", active_model=None, termination_reason="manual_stop")
         elif code != 0:
             stage["status"] = "FAILED"
             state.update(status="FAILED", termination_reason=f"child_exit_{code}")
@@ -252,7 +252,7 @@ def execute(work, state, controller):
                 save_state(work, state)
                 raise ValueError(f"Successful command left missing checkpoints: {stage['name']}")
             stage["status"] = "COMPLETED"
-            state.update(status="PAUSED" if controller.requested else "RUNNING",
+            state.update(status="PAUSED" if controller.requested else "RUNNING", active_model=None,
                          termination_reason="manual_stop" if controller.requested else None)
         save_state(work, state)
         if state["status"] == "PAUSED":

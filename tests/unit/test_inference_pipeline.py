@@ -257,7 +257,7 @@ class TestGateBlocksPerception:
         assert result.advisory.source == "fallback"
 
     def test_short_batch_scores_fail_closed_for_every_frame(self):
-        # PRD003 batch contract requires one result per input; this rejects [] as a vacuous all().
+        # The batch contract requires one result per input; this rejects [] as a vacuous all().
         predictor = StubPredictor()
         pipe = InferencePipeline(
             scorer=ShortScorer(),
@@ -419,7 +419,7 @@ class TestInputHandling:
         assert predictor.seen_minmax == [(0, 255)]
 
     def test_batch_preserves_order_and_count(self):
-        # Distinct shapes/pixel labels are independent observable order oracles (PRD003 batch contract).
+        # Distinct shapes/pixel labels are independent observable order oracles.
         class OrderedPredictor(StubPredictor):
             def predict(self, image):
                 result = super().predict(image)

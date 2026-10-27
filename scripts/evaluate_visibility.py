@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -28,7 +27,16 @@ from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     read_rgb_image,
 )
 
+from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
+    load_visibility_config,
+    validate_visibility_manifest,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class EvaluationInputError(ValueError):
+    """Expected configuration or file-input failure, excluding model/program errors."""
 
 
 class SplitIdentityError(ValueError):
@@ -109,30 +117,34 @@ def eval_fit_quality(
         reference_split_signature,
     )
 
-    if dcfg.get("split_mode", "fixed") == "random":
-        raise ValueError("评估不能重建训练时的随机分区；请使用 data.split_mode=fixed 的匹配检查点")
+    try:
+        if dcfg.get("split_mode", "fixed") == "random":
+            raise ValueError("评估不能重建训练时的随机分区；请使用 data.split_mode=fixed 的匹配检查点")
 
-    # 划分参数必须和 trainer 完全一致，否则各集合会错位
-    groups = (
-        [sequence_of(p) for p in ref_paths]
-        if dcfg.get("split_by_sequence", True)
-        else None
-    )
-    tr_idx, val_idx, ca_idx, te_idx = split_ref_indices(
-        len(ref_paths),
-        train_ratio=float(dcfg.get("train_ratio", 0.80)),
-        val_ratio=float(dcfg.get("val_ratio", 0.05)),
-        calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
-        test_ratio=float(dcfg.get("test_ratio", 0.10)),
-        seed=int(dcfg.get("split_seed", 42)),
-        mode=str(dcfg.get("split_mode", "fixed")),
-        groups=groups,
-    )
+        # 划分参数必须和 trainer 完全一致，否则各集合会错位
+        groups = (
+            [sequence_of(p) for p in ref_paths]
+            if dcfg.get("split_by_sequence", True)
+            else None
+        )
+        tr_idx, val_idx, ca_idx, te_idx = split_ref_indices(
+            len(ref_paths),
+            train_ratio=float(dcfg.get("train_ratio", 0.80)),
+            val_ratio=float(dcfg.get("val_ratio", 0.05)),
+            calib_ratio=float(dcfg.get("calib_ratio", 0.05)),
+            test_ratio=float(dcfg.get("test_ratio", 0.10)),
+            seed=int(dcfg.get("split_seed", 42)),
+            mode=str(dcfg.get("split_mode", "fixed")),
+            groups=groups,
+        )
 
-    acdc_root = Path(__file__).resolve().parents[1] / dcfg.get("acdc_root", "data/raw/acdc")
-    signature = reference_split_signature(
-        ref_paths, acdc_root, scorer.input_size, groups, tr_idx, val_idx, ca_idx, te_idx
-    )
+        acdc_root = Path(__file__).resolve().parents[1] / dcfg.get("acdc_root", "data/raw/acdc")
+        signature = reference_split_signature(
+            ref_paths, acdc_root, scorer.input_size, groups, tr_idx, val_idx, ca_idx, te_idx
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        raise EvaluationInputError(f"无法重建能见度评估分区：{exc}") from exc
+
     if not scorer.split_signature:
         raise SplitIdentityError("检查点缺少 split_signature，无法验证四分身份；请使用带训练分区身份的检查点")
     if scorer.split_signature != signature:
@@ -216,13 +228,16 @@ def eval_real_adverse(
     rng = np.random.default_rng(seed)
     result: dict[str, Any] = {}
     for cond in ("fog", "night", "rain", "snow"):
-        paths = list_adverse_images(
-            acdc_root, [cond], cleaning_manifest=cleaning_manifest, project_root=project_root
-        )
-        if not paths:
-            continue
-        idx = rng.choice(len(paths), size=min(n, len(paths)), replace=False)
-        imgs = load_images([paths[i] for i in idx], size)
+        try:
+            paths = list_adverse_images(
+                acdc_root, [cond], cleaning_manifest=cleaning_manifest, project_root=project_root
+            )
+            if not paths:
+                continue
+            idx = rng.choice(len(paths), size=min(n, len(paths)), replace=False)
+            imgs = load_images([paths[i] for i in idx], size)
+        except (OSError, TypeError, ValueError) as exc:
+            raise EvaluationInputError(f"无法读取真实天气输入 {cond}：{exc}") from exc
         scores = scorer.score_arrays(imgs)
         verdicts = gate.judge_many(scores)
         s = summarize(verdicts)
@@ -253,6 +268,8 @@ def eval_synthetic(
     seed: int,
 ) -> dict[str, Any]:
     """合成退化：度量召回率和单调性。"""
+    if not severities or any(not np.isfinite(sev) or not 0.0 <= sev <= 1.0 for sev in severities):
+        raise ValueError("合成退化 severities 必须为非空、有限的 [0,1] 强度列表")
     rng = np.random.default_rng(seed)
     idx = rng.choice(len(refs), size=min(n, len(refs)), replace=False)
     base = [refs[i] for i in idx]
@@ -285,11 +302,12 @@ def eval_synthetic(
             )
 
         # 单调性：检查information是否随合成severity单调不增；不等同于真实能见度真值
-        infos = [c["information_mean"] for c in curve]
+        ordered_curve = sorted(curve, key=lambda point: point["severity"])
+        infos = [c["information_mean"] for c in ordered_curve]
         monotonic = all(
             infos[i] >= infos[i + 1] - 1e-6 for i in range(len(infos) - 1)
         )
-        high = curve[-1]
+        high = ordered_curve[-1]
         out[kind] = {
             "curve": curve,
             "recall_at_max_severity": high["blind_rate"],
@@ -452,9 +470,20 @@ def main() -> int:
 
     root = Path(__file__).resolve().parents[1]
     cfg_path = root / args.config
-    raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
-    cfg = raw.get("visibility", raw)
-    dcfg, rcfg = cfg.get("data", {}), cfg.get("report", {})
+    try:
+        cfg = load_visibility_config(cfg_path)
+        dcfg, rcfg = cfg.get("data", {}), cfg.get("report", {})
+        n = int(args.samples if args.samples is not None else rcfg.get("sample_per_condition", 200))
+        if n <= 0:
+            raise ValueError("--samples / report.sample_per_condition 必须为正整数")
+        split_seed = int(dcfg.get("split_seed", 42))
+        for key, default in (("train_ratio", 0.80), ("val_ratio", 0.05), ("calib_ratio", 0.05), ("test_ratio", 0.10)):
+            float(dcfg.get(key, default))
+        if any(not np.isfinite(sev) or not 0.0 <= sev <= 1.0 for sev in args.severities):
+            raise ValueError("--severities 必须为有限的 [0,1] 强度列表")
+    except (TypeError, ValueError) as exc:
+        logger.error("无法使用能见度配置 %s：%s", cfg_path, exc)
+        return 2
     if dcfg.get("split_mode", "fixed") == "random":
         logger.error("评估不能重建训练时的随机分区；请使用 data.split_mode=fixed 的匹配检查点")
         return 2
@@ -484,7 +513,11 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError) as exc:
         logger.error("无法初始化能见度评估：%s", exc)
         return 2
-    gate = VisibilityGate.from_config(cfg)
+    try:
+        gate = VisibilityGate.from_config(cfg)
+    except (TypeError, ValueError) as exc:
+        logger.error("能见度配置 %s 的门控参数无效：%s", cfg_path, exc)
+        return 2
     if scorer.calibration is None:
         logger.warning(
             "缺少AE重建校准；信息量仍独立判档，极低时直接BLIND。"
@@ -494,12 +527,16 @@ def main() -> int:
         logger.info("零校准: mean=%.6f std=%.6f (n=%d)",
                     scorer.calibration.mean, scorer.calibration.std, scorer.calibration.n)
 
-    n = int(args.samples or rcfg.get("sample_per_condition", 200))
     cleaning_root = root / dcfg.get("project_root", ".")
-    ref_paths = list_ref_images(
-        acdc_root, cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root
-    )
-    refs = load_images(ref_paths, size)
+    try:
+        validate_visibility_manifest(dcfg.get("cleaning_manifest"), cleaning_root)
+        ref_paths = list_ref_images(
+            acdc_root, cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root
+        )
+        refs = load_images(ref_paths, size)
+    except (OSError, ValueError) as exc:
+        logger.error("无法读取能见度评估输入（数据 %s，清单 %s）：%s", acdc_root, dcfg.get("cleaning_manifest"), exc)
+        return 2
     if not refs:
         logger.error("未找到正常天气参考图，请确认 ACDC 已解压")
         return 2
@@ -513,7 +550,14 @@ def main() -> int:
         "scoring": scorer.scoring_cfg,
         "evaluation_protocol": {
             "sample_per_condition": n,
-            "sample_seed": 0,
+            "split_seed": split_seed,
+            "sample_seeds": {
+                "fit_quality": split_seed,
+                "clean_control": 0,
+                "real_adverse": 0,
+                "synthetic": 0,
+            },
+            "synthetic_degradation_seed": "synthetic sample seed + sampled image index",
             "severities": list(args.severities),
             "synthetic_kinds": ["fog", "darkness", "occlusion", "blur"],
         },
@@ -534,11 +578,18 @@ def main() -> int:
             r"--checkpoint artifacts/checkpoints/retrain_300_20261017/visibility/best.pt"
         )
         return 2
+    except EvaluationInputError as exc:
+        logger.error("无法使用能见度划分配置 %s：%s", cfg_path, exc)
+        return 2
     report["clean_control"] = eval_clean_control(scorer, gate, refs, n, 0)
-    report["real_adverse"] = eval_real_adverse(
-        scorer, gate, acdc_root, size, n, 0,
-        cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root,
-    )
+    try:
+        report["real_adverse"] = eval_real_adverse(
+            scorer, gate, acdc_root, size, n, 0,
+            cleaning_manifest=dcfg.get("cleaning_manifest"), project_root=cleaning_root,
+        )
+    except EvaluationInputError as exc:
+        logger.error("无法读取真实恶劣天气评估输入（数据 %s，清单 %s）：%s", acdc_root, dcfg.get("cleaning_manifest"), exc)
+        return 2
     logger.info("合成退化实验（%d 张基准图 × %d 种退化 × %d 档强度）...",
                 min(n, len(refs)), 4, len(args.severities))
     report["synthetic"] = eval_synthetic(scorer, gate, refs, list(args.severities), n, 0)

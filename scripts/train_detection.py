@@ -23,7 +23,7 @@ from car_smart_assist.config.detection import (  # noqa: E402
     resolve_yolo_device,
     yolo_model_selection_contract,
 )
-from car_smart_assist.data.detection import validate_detection_export  # noqa: E402
+from car_smart_assist.data.joint_paths import detection_data_scope  # noqa: E402
 from car_smart_assist.perception.detection_yolo import (  # noqa: E402
     configure_yolo_environment,
     load_yolo_model,
@@ -231,6 +231,7 @@ def archive_checkpoints(run, *, clear=False):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Fixed-seed ACDC YOLO training")
     parser.add_argument("--config", default="configs/model/yolo_detection.yaml")
+    parser.add_argument("--joint-data-config", default=None, help="Explicit current joint data roots for read-only relocation")
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--name", default=None)
     group = parser.add_mutually_exclusive_group()
@@ -254,6 +255,13 @@ def main() -> int:
         name = args.name or cfg["name"]
         if Path(name).name != name or name in (".", ".."):
             raise ValueError("Run name must be a simple directory name")
+        if not args.stop:
+            configure_yolo_environment(root)
+            from ultralytics.cfg import DEFAULT_CFG_DICT
+
+            unknown = set(cfg["train"]) - set(DEFAULT_CFG_DICT) - {"resume_extra_epochs"}
+            if unknown:
+                raise ValueError("Unknown YOLO train keys: " + ", ".join(sorted(map(str, unknown))))
         project = root / cfg["project"]
         run = project / name
         with StopController(args.stop_file, default_directory=run / "weights") as controller, ExitStack() as locks:
@@ -266,9 +274,10 @@ def main() -> int:
             if args.fresh or args.continue_training:
                 controller.resume()
             controller.require_running()
-            data = root / cfg["data"]
-            counts = validate_detection_export(data.parent, verify_hashes=True)
-            manifest = json.loads((data.parent / "manifest.json").read_text(encoding="utf-8"))
+            data, manifest, counts = locks.enter_context(detection_data_scope(
+                root, cfg["data"],
+                joint_data_config=args.joint_data_config or cfg.get("joint_data_config"), directory=run,
+            ))
             metadata_path = run / "run_metadata.json"
             plan = resolve_training_plan(
                 root,
@@ -342,14 +351,14 @@ def main() -> int:
                 + json.dumps(plan["model_selection_contract"], ensure_ascii=False, sort_keys=True)
             )
             trainer_class = detection_trainer_for_resume(
-                plan["resume_state"], plan["model_selection_contract"]
+                plan["resume_state"], plan["model_selection_contract"], validated_data=data
             )
             if manifest.get("joint_supervision"):
                 from car_smart_assist.perception.joint_yolo_backend import joint_trainer
 
                 trainer_class = joint_trainer(
                     plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
-                    selection_contract=plan["model_selection_contract"],
+                    selection_contract=plan["model_selection_contract"], validated_data=data,
                 )
             if plan["resume_state"] is not None:
                 save_metadata(None)
@@ -388,7 +397,7 @@ def main() -> int:
             )
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return STOP_EXIT_CODE if final_state.get("manual_stop") or controller.requested else 0
-    except (ImportError, OSError, ValueError, KeyError, RuntimeError, Timeout) as exc:
+    except (ImportError, OSError, ValueError, KeyError, TypeError, RuntimeError, Timeout) as exc:
         print(f"YOLO training failed: {exc}", file=sys.stderr)
         return 2
 

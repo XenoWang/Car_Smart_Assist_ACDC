@@ -187,7 +187,7 @@ def test_orphan_attention_best_is_preserved_before_initialization(tmp_path, monk
     folder.mkdir()
     best = folder / "best.pt"
     best.write_bytes(b"orphan original")
-    cfg = SimpleNamespace(checkpoint_root="checkpoints", report_dir="reports", report_file="reports/REPORT.md", train={})
+    cfg = SimpleNamespace(checkpoint_root="checkpoints", report_dir="reports", report_file="reports/REPORT.md", train={}, evaluation={})
     monkeypatch.setattr(training, "ensure_pretrained_weights", lambda *_: pytest.fail("initialized before orphan check"))
     with pytest.raises(ValueError, match="缺少配对 last"):
         training.train_attention(cfg, tmp_path, {}, {})
