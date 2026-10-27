@@ -20,6 +20,7 @@ from car_smart_assist.advisory.generator import AdvisoryGenerator
 from car_smart_assist.advisory.schema import AdvisoryResult, PerceptionResult
 from car_smart_assist.config.visibility import MODEL_DEFAULTS, validate_input_size
 from car_smart_assist.config.weather import load_weather_config
+from car_smart_assist.data.image_input import ImageFrame, ImageInput, to_rgb_uint8
 from car_smart_assist.perception.visibility.gate import (
     VisibilityGate,
     VisibilityLevel,
@@ -70,35 +71,9 @@ class PipelineResult:
         }
 
 
-def _to_array(image: np.ndarray | Image.Image | str | Path) -> np.ndarray:
-    """把各种输入统一成 (H, W, 3) uint8 数组。"""
-    if isinstance(image, np.ndarray):
-        a = image
-    elif isinstance(image, Image.Image):
-        if image.mode == "F" and not np.isfinite(np.asarray(image)).all():
-            raise ValueError("图像包含 NaN 或 Inf")
-        a = np.asarray(image.convert("RGB"), dtype=np.uint8)
-    elif isinstance(image, (str, Path)):
-        with Image.open(image) as decoded:
-            return _to_array(decoded)
-    else:
-        raise TypeError(f"不支持的图像输入类型: {type(image).__name__}")
-
-    if a.ndim not in (2, 3) or a.shape[0] == 0 or a.shape[1] == 0:
-        raise ValueError(f"图像必须有非空的高和宽，实际形状: {a.shape}")
-    if a.ndim == 3 and a.shape[2] not in (3, 4):
-        raise ValueError(f"图像通道数必须为 3 或 4，实际形状: {a.shape}")
-    if a.dtype.kind not in "buif":
-        raise TypeError(f"图像必须使用实数数值类型，实际类型: {a.dtype}")
-    if a.dtype.kind == "f" and not np.isfinite(a).all():
-        raise ValueError("图像包含 NaN 或 Inf")
-    if a.ndim == 2:
-        a = np.stack([a] * 3, axis=-1)
-    if a.shape[2] == 4:
-        a = a[..., :3]
-    if a.dtype != np.uint8:
-        a = np.clip(a, 0, 255).astype(np.uint8)
-    return np.array(a, dtype=np.uint8, order="C", copy=True)
+def _to_array(image: ImageInput) -> np.ndarray:
+    """统一摄像头帧、数组或编码图像，返回独立的 RGB uint8 图像。"""
+    return to_rgb_uint8(image)
 
 
 class InferencePipeline:
@@ -352,17 +327,17 @@ class InferencePipeline:
 
     # --- 主流程 ---
 
-    def run(self, image: np.ndarray | Image.Image | str | Path) -> PipelineResult:
+    def run(self, image: ImageInput) -> PipelineResult:
         """单帧推理。"""
         return self.run_batch([image])[0]
 
     def run_batch(
-        self, images: Sequence[np.ndarray | Image.Image | str | Path]
+        self, images: Sequence[ImageInput]
     ) -> list[PipelineResult]:
         """批量推理。门控阶段真正批量执行；感知阶段按 predictor 的接口走。"""
         if isinstance(images, np.ndarray) and images.ndim != 4:
             raise ValueError("run_batch 的数组输入必须为 (N,H,W,C)；单张图像请使用 run(image)")
-        if isinstance(images, (str, Path, Image.Image)):
+        if isinstance(images, (str, Path, Image.Image, ImageFrame, bytes, bytearray, memoryview)):
             raise TypeError("run_batch 需要图像序列；单张图像请使用 run(image)")
         if len(images) == 0:
             return []

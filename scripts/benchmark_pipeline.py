@@ -61,6 +61,8 @@ def _count(text: str, *, allow_zero: bool = False) -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", action="append", required=True, help="Explicit image path; repeat in order")
+    parser.add_argument("--image-range", nargs=2, type=float, metavar=("MIN", "MAX"),
+                        help="Fixed input code range, e.g. 0 4095 for processed 12-bit images")
     parser.add_argument("--config", default="configs/model/visibility.yaml")
     parser.add_argument("--checkpoint", help="Visibility checkpoint; otherwise use the pipeline default")
     parser.add_argument("--weather-config")
@@ -74,7 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Stable full sample-set passes per input mode")
     parser.add_argument("--output-dir", "--output", dest="output_dir", required=True,
                         help="A new directory; existing directories are refused")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.image_range is not None:
+        low, high = args.image_range
+        if not all(math.isfinite(value) for value in (low, high, high - low)) or high <= low:
+            parser.error("--image-range must be a finite increasing code range")
+    return args
 
 
 def _path(text: str | Path) -> Path:
@@ -599,8 +606,14 @@ def main(argv: list[str] | None = None) -> int:
         import yaml
 
         sys.path.insert(0, str(ROOT / "src"))
+        from car_smart_assist.data.image_input import ImageFrame
         from car_smart_assist.inference.pipeline import InferencePipeline, _to_array
         from car_smart_assist.perception.weather import select_device
+
+        value_range = getattr(args, "image_range", None)
+        image_inputs = [
+            ImageFrame(path, value_range=tuple(value_range)) if value_range else path for path in images
+        ]
 
         for package in ("torch", "torchvision", "numpy", "Pillow", "PyYAML", "ultralytics",
                         "car-smart-assist"):
@@ -646,7 +659,7 @@ def main(argv: list[str] | None = None) -> int:
         metadata["ram_samples"].append({"phase": "after_construction", **_ram()})
         for phase, passes in (("first_pass", 1), ("warmup", args.warmup), ("steady", args.repeats)):
             for iteration in range(passes):
-                _run_pass(pipe, images, images, torch, devices, "paths", phase, iteration,
+                _run_pass(pipe, image_inputs, images, torch, devices, "paths", phase, iteration,
                           args.batch_size, measurements, frames)
         metadata["components_after_path_calls"] = _components(pipe)
         observed_devices = _cuda_devices(torch, selected, metadata["components_after_path_calls"])
@@ -661,7 +674,7 @@ def main(argv: list[str] | None = None) -> int:
             started = time.perf_counter_ns()
             error = None
             try:
-                array = _to_array(path)
+                array = _to_array(image_inputs[index])
                 arrays.append(array)
                 image_shapes.append({"input_index": index, "path": str(path),
                                      "height": array.shape[0], "width": array.shape[1],

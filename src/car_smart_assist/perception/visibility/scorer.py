@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 from car_smart_assist.config.visibility import MODEL_DEFAULTS, SCORING_DEFAULTS
+from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
 from car_smart_assist.perception.visibility.autoencoder import (
     ConvAutoencoder,
     build_autoencoder,
@@ -64,21 +65,15 @@ class InformationFeatures:
 
 
 def compute_information_features(
-    img: np.ndarray, scoring_cfg: dict[str, Any] | None = None
+    img: ImageInput, scoring_cfg: dict[str, Any] | None = None
 ) -> InformationFeatures:
-    """从 (H, W, 3) uint8 或 float[0,1] 图像算信息量特征。
+    """按统一图像输入合同计算信息量特征，保持模型的 RGB uint8 量纲。
 
     实现在 numpy 上而不是 torch：这些特征要逐帧单独解释，
     用 numpy 方便直接对着数值排查，也不需要 GPU。
     """
-    if img.dtype == np.uint8:
-        a = img.astype(np.float32) / 255.0
-    elif np.issubdtype(img.dtype, np.floating):
-        if not np.isfinite(img).all() or img.min() < 0.0 or img.max() > 1.0:
-            raise ValueError("浮点图像必须是有限的 float[0,1] 数据")
-        a = img.astype(np.float32)
-    else:
-        raise ValueError("信息量特征仅接受 uint8 或 float[0,1] 图像")
+    img = to_rgb_uint8(img, copy=False)
+    a = img.astype(np.float32) / 255.0
     gray = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
 
     # --- 对比度：灰度标准差 ---
@@ -459,10 +454,11 @@ class VisibilityScorer:
 
     # --- 打分 ---
 
-    def _to_tensor_batch(self, images: Sequence[np.ndarray]) -> torch.Tensor:
+    def _to_tensor_batch(self, images: Sequence[ImageInput]) -> torch.Tensor:
         """一次完成 batch 堆叠、通道转换、类型转换和设备传输。"""
         # np.stack 会生成可写的 uint8 连续数组，随后在一次 dtype/内存格式
         # 转换中直接得到 NCHW float32，不用逐图分配张量再 torch.cat。
+        images = [to_rgb_uint8(image, copy=False) for image in images]
         batch = np.stack(images, axis=0)
         if self.device.type == "cuda" and batch.dtype == np.uint8:
             # 先传输 uint8，避免在 CPU 分配整个 float32 batch。
@@ -490,10 +486,11 @@ class VisibilityScorer:
         errs = reconstruction_error(self.model, x.to(self.device), block_grid=block_grid)
         return [(e.mean, e.p90_block) for e in errs]
 
-    def score_arrays(self, images: Sequence[np.ndarray], paths: Sequence[str] | None = None):
-        """对一组已解码的 (H,W,3) uint8 数组打分。"""
+    def score_arrays(self, images: Sequence[ImageInput], paths: Sequence[str] | None = None):
+        """先统一每帧输入，使 AE 和信息量特征使用同一份规范像素。"""
         if not images:
             return []
+        images = [to_rgb_uint8(image, copy=False) for image in images]
         batch = self._to_tensor_batch(images)
         recon = self.score_tensors(batch)
 
@@ -529,7 +526,7 @@ class VisibilityScorer:
 
     # --- 校准 ---
 
-    def calibrate(self, images: Sequence[np.ndarray]) -> CalibrationStats:
+    def calibrate(self, images: Sequence[ImageInput]) -> CalibrationStats:
         """用一组正常天气图重新计算校准统计。"""
         if not images:
             raise ValueError("校准至少需要一张正常天气参考图")

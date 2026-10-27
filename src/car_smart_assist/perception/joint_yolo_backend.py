@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -18,12 +19,13 @@ from car_smart_assist.perception.joint_yolo import (
     preserve_classification_outputs,
 )
 from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
-from car_smart_assist.config.detection import YOLO_AP_MODE
+from car_smart_assist.config.detection import YOLO_AP_MODE, validate_joint_dataset_options
 from car_smart_assist.perception.yolo_postprocess import postprocess_detection
 
 # 导入 Ultralytics 时会初始化 settings，这份初始化要留在项目里。
 if not os.environ.get("YOLO_CONFIG_DIR"):
     configure_yolo_environment(Path(__file__).resolve().parents[3])
+from ultralytics.data.base import BaseDataset  # noqa: E402
 from ultralytics.data.dataset import YOLODataset  # noqa: E402
 from ultralytics.models.yolo.detect.val import DetectionValidator  # noqa: E402
 from ultralytics.utils.metrics import DetMetrics  # noqa: E402
@@ -52,6 +54,13 @@ def native_roi(row, manifest):
 
 class JointDataset(YOLODataset):
     def __init__(self, *args, **kwargs):
+        options = signature(BaseDataset.__init__).bind_partial(
+            self, *args, **{key: value for key, value in kwargs.items() if key not in ("data", "task")}
+        ).arguments
+        hyp = options.get("hyp")
+        if hyp is not None:
+            validate_joint_dataset_options(vars(hyp))
+        validate_joint_dataset_options(options)
         self.manifest, self.index = load_joint_index(kwargs["data"])
         super().__init__(*args, **kwargs)
 
@@ -264,6 +273,8 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
 
     class Trainer(base):
         def build_dataset(self, img_path, mode="train", batch=None):
+            # 选模参数会覆盖single_cls；先检查恢复后的原始有效参数。
+            validate_joint_dataset_options(vars(self.args))
             if mode == "train":
                 # ROI 必须和图像做同样的几何变换。
                 # 这一版只允许颜色和模糊增强，不做空间混合。

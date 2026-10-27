@@ -30,13 +30,19 @@ def load_script(name: str):
     return module
 
 
-def test_near_black_uint8_and_normalized_float_keep_the_same_feature_scale():
+def test_near_black_uint8_and_normalized_float_keep_hand_calculated_scale():
     image = np.zeros((32, 48, 3), dtype=np.uint8)
     image[:, ::2] = 1
-    uint8_features = compute_information_features(image)
-    float_features = compute_information_features(image.astype(np.float32) / 255.0)
-    for name in ("contrast", "entropy", "edge_density", "hf_ratio"):
-        assert getattr(uint8_features, name) == pytest.approx(getattr(float_features, name))
+    features = compute_information_features(image)
+    # Equal populations at 0 and 1/255: std=1/510, entropy=1 bit.
+    assert features.contrast == pytest.approx(1 / 510, rel=1e-6)
+    assert features.entropy == pytest.approx(1.0)
+    assert features.edge_density == 0.0
+    assert features.hf_ratio == pytest.approx(1.0)
+    floating = compute_information_features(image.astype(np.float32) / 255.0)
+    assert floating.to_dict() == pytest.approx(
+        {"contrast": 1 / 510, "entropy": 1.0, "edge_density": 0.0, "hf_ratio": 1.0}, rel=1e-6,
+    )
 
 
 @pytest.mark.parametrize("scoring", [

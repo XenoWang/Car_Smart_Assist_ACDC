@@ -111,14 +111,29 @@ def test_calibration_bound_to_checkpoint(tmp_path):
         YoloDetectionPredictor(_model(lambda **kwargs: []), config(), tmp_path)
 
 
-def test_reject_non_rgb_uint8(tmp_path):
+def test_shared_image_contract_accepts_gray_and_unit_float_and_rejects_bad_inputs_before_yolo(tmp_path):
     cfg = config()
     _write_valid_calibration(tmp_path, cfg)
-    adapter = YoloDetectionPredictor(_model(lambda **kwargs: []), cfg, tmp_path)
-    with pytest.raises(ValueError, match="RGB uint8"):
-        adapter.predict(np.zeros((20, 30), dtype=np.uint8))
-    with pytest.raises(ValueError, match="RGB uint8"):
-        adapter.predict(np.zeros((20, 30, 3), dtype=np.float32))
+    sources = []
+
+    def predict(**kwargs):
+        sources.append(np.asarray(kwargs["source"]).copy())
+        boxes = SimpleNamespace(
+            xyxy=ArrayResult([]), conf=ArrayResult([]), cls=ArrayResult([]),
+        )
+        return [SimpleNamespace(boxes=boxes, names={0: "car", 1: "truck"})]
+
+    adapter = YoloDetectionPredictor(_model(predict), cfg, tmp_path)
+    adapter.predict(np.full((20, 30), 85, dtype=np.uint8))
+    adapter.predict(np.full((20, 30, 3), 0.5, dtype=np.float32))
+    assert len(sources) == 2
+    np.testing.assert_array_equal(sources[0], np.full((20, 30, 3), 85, np.uint8))
+    np.testing.assert_array_equal(sources[1], np.full((20, 30, 3), 128, np.uint8))
+    with pytest.raises(ValueError, match="通道数"):
+        adapter.predict(np.zeros((20, 30, 2), dtype=np.uint8))
+    with pytest.raises(ValueError, match="value_range"):
+        adapter.predict(np.full((20, 30, 3), 128.0, dtype=np.float32))
+    assert len(sources) == 2
 
 
 def test_installed_predictor_postprocess_calls_shared_helper(monkeypatch):

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import io
 import itertools
 import json
 import logging
@@ -17,7 +16,6 @@ from zipfile import ZipFile
 
 import numpy as np
 import torch
-from PIL import Image
 from filelock import FileLock
 from torch.utils.data import Dataset
 
@@ -390,10 +388,9 @@ def _load_pyramid_cache(samples, cfg, output, signature):
                     source = (
                         sample.path
                         if sample.path is not None
-                        else io.BytesIO(archives[sample.archive_path].read(sample.member))
+                        else archives[sample.archive_path].read(sample.member)
                     )
-                    with Image.open(source) as image:
-                        array[index] = prepare_pyramid_image(image, cfg.image_size)
+                    array[index] = prepare_pyramid_image(source, cfg.image_size)
                     if (index + 1) % 256 == 0:
                         logger.info("新天气缓存 %d/%d", index + 1, len(samples))
             array.flush()

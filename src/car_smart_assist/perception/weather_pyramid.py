@@ -11,14 +11,13 @@ from torch import nn
 from torch.nn import functional as F
 
 from car_smart_assist.config.weather_pyramid import WeatherPyramidConfig, pyramid_model_config
+from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
 from car_smart_assist.perception.weather import WeatherPrediction, select_device
 
 
-def prepare_pyramid_image(image: np.ndarray | Image.Image, size: tuple[int, int]) -> np.ndarray:
+def prepare_pyramid_image(image: ImageInput, size: tuple[int, int]) -> np.ndarray:
     """保留画幅比例，用黑边补齐；训练和推理共用。"""
-    array = np.asarray(image.convert("RGB") if isinstance(image, Image.Image) else image)
-    if array.ndim != 3 or array.shape[2] != 3 or array.dtype != np.uint8 or 0 in array.shape[:2]:
-        raise ValueError("新天气模型需要非空 RGB uint8 图像")
+    array = to_rgb_uint8(image, copy=False)
     height, width = size
     scale = min(height / array.shape[0], width / array.shape[1])
     resized_width = min(width, max(1, round(array.shape[1] * scale)))

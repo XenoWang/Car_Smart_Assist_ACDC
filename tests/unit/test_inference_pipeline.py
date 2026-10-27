@@ -409,14 +409,16 @@ class TestInputHandling:
         assert result.perception.road_condition == "fog"
         assert predictor.seen_minmax == [(11, 66)]
 
-    def test_float_input_clipped(self):
+    def test_float_outside_default_unit_range_is_reported_before_models(self):
         f = np.random.default_rng(0).integers(-10, 300, (720, 1280, 3)).astype(np.float32)
         predictor = StubPredictor()
         pipe = make_pipeline(predictor=predictor)
         result = pipe.run(f)
-        assert "input" not in result.skipped
-        # 感知阶段拿到的是原图，能观察到裁剪后的 0..255 范围。
-        assert predictor.seen_minmax == [(0, 255)]
+        assert "value_range" in result.skipped["input"]
+        assert pipe.scorer.calls == 0
+        assert predictor.seen_minmax == []
+        assert result.perception is None
+        assert result.advisory.should_takeover is True
 
     def test_batch_preserves_order_and_count(self):
         # Distinct shapes/pixel labels are independent observable order oracles.

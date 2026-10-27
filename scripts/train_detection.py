@@ -21,6 +21,7 @@ from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: 
 from car_smart_assist.config.detection import (  # noqa: E402
     load_yolo_config,
     resolve_yolo_device,
+    validate_joint_dataset_options,
     yolo_model_selection_contract,
 )
 from car_smart_assist.data.joint_paths import detection_data_scope  # noqa: E402
@@ -41,6 +42,8 @@ def resolve_training_plan(
     root, cfg, manifest, run, *, fresh=False, epochs=None, require_resume=False, continue_only=False
 ):
     train = dict(cfg["train"])
+    if manifest.get("joint_supervision"):
+        validate_joint_dataset_options(train)
     extra = train.pop("resume_extra_epochs", None)
     if epochs is not None:
         if epochs <= 0:
@@ -122,6 +125,8 @@ def resolve_training_plan(
     if state is not None:
         train = dict(previous["train_args"])
         train.pop("resume_extra_epochs", None)
+        if manifest.get("joint_supervision"):
+            validate_joint_dataset_options(train)
         start = int(state["epoch"]) + 1
         saved_segment = state["training_segment"]
         # 请求先写metadata再启动训练；若首轮保存前中断，仍绑定旧last恢复本段目标。

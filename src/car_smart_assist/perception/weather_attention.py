@@ -9,11 +9,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
 from torch import nn
 from torchvision.models import MobileNet_V3_Large_Weights, mobilenet_v3_large
 
 from car_smart_assist.config.weather_attention import WeatherAttentionConfig, attention_model_config
+from car_smart_assist.data.image_input import ImageInput
 from car_smart_assist.perception.weather import WeatherPrediction, select_device
 from car_smart_assist.perception.weather_pyramid import prepare_pyramid_image
 
@@ -183,7 +183,7 @@ class WeatherAttentionPredictor:
             model.to(memory_format=torch.channels_last)
         return cls(_optimize_attention_inference_inplace(model), cfg, thresholds, selected)
 
-    def predict(self, image: np.ndarray | Image.Image):
+    def predict(self, image: ImageInput):
         pixels = prepare_pyramid_image(image, self.cfg.image_size)
         tensor = (
             torch.from_numpy(pixels)

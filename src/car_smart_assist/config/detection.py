@@ -62,6 +62,15 @@ def yolo_selection_validator_args(contract):
     }
 
 
+def validate_joint_dataset_options(options):
+    """联合监督仅支持完整多类数据集，未支持的非默认参数不得被静默忽略。"""
+    for name, default in (
+        ("fraction", 1.0), ("classes", None), ("cache", False), ("single_cls", False),
+    ):
+        if options.get(name, default) != default:
+            raise ValueError(f"JointDataset requires {name}={default!r}; non-default settings are unsupported")
+
+
 def load_yolo_config(path: Path) -> dict[str, Any]:
     try:
         cfg = yaml.safe_load(path.read_text(encoding="utf-8"))["yolo_detection"]

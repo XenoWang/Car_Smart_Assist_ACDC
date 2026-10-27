@@ -6,11 +6,11 @@ import os
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 from PIL import Image
 
 from car_smart_assist.advisory.schema import PerceptionResult, TargetObject
 from car_smart_assist.config.detection import YOLO_AGNOSTIC_NMS, resolve_yolo_device
+from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
 from car_smart_assist.perception.yolo_postprocess import (
     calibration_path, detection_predictor_class, load_calibration,
 )
@@ -73,9 +73,8 @@ class YoloDetectionPredictor:
             raise FileNotFoundError(f"Trained YOLO checkpoint not found: {checkpoint}")
         return cls(load_yolo_model(project_root, checkpoint), cfg, project_root)
 
-    def predict(self, image: np.ndarray) -> PerceptionResult:
-        if image.ndim != 3 or image.shape[2] != 3 or image.dtype != np.uint8:
-            raise ValueError("YOLO pipeline input must be RGB uint8")
+    def predict(self, image: ImageInput) -> PerceptionResult:
+        image = to_rgb_uint8(image, copy=False)
         args = self.cfg["inference"]
         if not isinstance(self.model.predictor, self.predictor_class):
             self.model.predictor = None
