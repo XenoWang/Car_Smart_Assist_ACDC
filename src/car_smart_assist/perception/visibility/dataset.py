@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 
 from car_smart_assist.config.visibility import AUGMENTATION_DEFAULTS, MODEL_DEFAULTS
 from car_smart_assist.data.detection import recording_group
+from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
 from car_smart_assist.data.preprocessing import load_invalid_entries
 
 logger = logging.getLogger(__name__)
@@ -85,18 +86,17 @@ def list_adverse_images(
     return _exclude_invalid(sorted(paths), cleaning_manifest, project_root)
 
 
-def read_rgb_image(path: str | Path, size: tuple[int, int] | None = None) -> np.ndarray:
+def read_rgb_image(path: ImageInput, size: tuple[int, int] | None = None) -> np.ndarray:
     """读取 RGB uint8 图像；size 为 (H, W)，省略时保留原始分辨率。
 
     缩放统一用 BILINEAR，避免训练与评估的频率特征口径不一致。
     读取异常交给调用方处理，文件句柄在返回前关闭。
     """
-    with Image.open(path) as image:
-        rgb = image.convert("RGB")
-        if size is not None:
-            h, w = size
-            rgb = rgb.resize((w, h), Image.BILINEAR)
-        return np.asarray(rgb, dtype=np.uint8)
+    array = to_rgb_uint8(path)
+    if size is not None:
+        h, w = size
+        array = np.asarray(Image.fromarray(array).resize((w, h), Image.BILINEAR), dtype=np.uint8)
+    return array
 
 
 def _build_cache(paths: Sequence[Path], size: tuple[int, int], cache: Path) -> None:

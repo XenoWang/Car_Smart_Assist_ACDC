@@ -13,6 +13,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from car_smart_assist.data.image_input import ImageFrame  # noqa: E402
 from car_smart_assist.inference.pipeline import InferencePipeline, _to_array  # noqa: E402
 from car_smart_assist.perception.visibility.dataset import (  # noqa: E402
     list_adverse_images,
@@ -25,6 +26,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", default="configs/model/visibility.yaml")
     p.add_argument("--checkpoint", default=None, help="门控权重，默认取配置里的路径")
     p.add_argument("--image", action="append", default=None, help="指定图像，可重复")
+    p.add_argument("--image-range", nargs=2, type=float, metavar=("MIN", "MAX"),
+                   help="指定图片的固定码值范围，例如已处理12位图像为0 4095")
     p.add_argument("--synthetic", action="store_true", help="额外跑合成退化对照")
     p.add_argument("--device", default=None)
     p.add_argument("--weather-config", default=None, help="新天气模型配置；省略时沿用当前默认天气模型")
@@ -32,7 +35,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weather-checkpoint", default=None, help="指定天气权重，默认从所选配置读取")
     p.add_argument("--json", action="store_true")
     p.add_argument("--log-level", default="WARNING")
-    return p.parse_args()
+    args = p.parse_args()
+    if args.image_range is not None:
+        low, high = args.image_range
+        if not np.isfinite([low, high, high - low]).all() or high <= low:
+            p.error("--image-range 必须是有限且递增的码值范围")
+        if not args.image:
+            p.error("--image-range 需要显式 --image")
+    return args
 
 
 def build_samples(root: Path, cfg: dict) -> list[tuple[str, np.ndarray | Path]]:
@@ -74,7 +84,11 @@ def main() -> int:
         )
 
         if args.image:
-            samples = [(Path(p).name, Path(p)) for p in args.image]
+            value_range = getattr(args, "image_range", None)
+            samples = [
+                (Path(p).name, ImageFrame(Path(p), value_range=tuple(value_range)) if value_range else Path(p))
+                for p in args.image
+            ]
         else:
             samples = build_samples(root, cfg)
     except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:

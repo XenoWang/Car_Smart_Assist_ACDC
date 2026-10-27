@@ -941,11 +941,12 @@ class TestInformationFeatures:
         lo = information_score(compute_information_features(uniform_image(128)))
         assert hi > lo
 
-    def test_accepts_both_uint8_and_float(self):
+    def test_uint8_and_normalized_float_represent_the_same_structured_image(self):
         img = structured_image()
-        a = compute_information_features(img)
-        b = compute_information_features(img.astype(np.float32) / 255.0)
-        assert a.contrast == pytest.approx(b.contrast, rel=1e-4)
+        features = compute_information_features(img)
+        assert features.contrast > 0.0
+        floating = compute_information_features(img.astype(np.float32) / 255.0)
+        assert floating.to_dict() == pytest.approx(features.to_dict(), rel=1e-6)
 
     def test_information_score_in_unit_range(self):
         for img in (uniform_image(0), uniform_image(255), structured_image()):

@@ -173,6 +173,8 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 | `timings_ms` | 各阶段耗时（诊断用途） |
 | `blocked` | 是否因能见度 `BLIND` 阻断感知 |
 
+图像入口支持 RGB/BGR、灰度、归一化浮点、显式范围的已处理高位深图像，以及声明颜色信息的常见 YUV 格式。所有入口统一转换到模型训练所用的 RGB 表示；`float` 裸数组约定 0–1，其他量纲通过 `ImageFrame` 明确声明。接入示例和原始缓冲要求见[摄像头输入](docs/camera_inputs.md)。
+
 ### 运行测试
 
 ```powershell
@@ -222,6 +224,8 @@ YOLO 推理还需要与权重匹配的校准文件，默认位于 `artifacts/rep
 ```
 
 联合检测数据迁移目录后，训练或评估命令可添加 `--joint-data-config configs/data/acdc_lost_and_found_detection.yaml`，用当前数据配置显式解析路径。只有内容、划分和监督语义一致时才保留既有身份；原清单和数据配置文件保持只读。
+
+联合检测数据集仅支持完整九类数据：`fraction=1.0`、`classes=None`、`cache=False`、`single_cls=False`。这些参数的非默认设置会在训练开始前报错。
 
 #### 串行训练全部模型
 

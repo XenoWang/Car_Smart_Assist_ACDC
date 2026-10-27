@@ -6,12 +6,13 @@ import torch
 from PIL import Image
 
 import car_smart_assist.inference.pipeline as pipeline
+from car_smart_assist.data.image_input import ImageFrame
 from car_smart_assist.perception.visibility.scorer import VisibilityScorer
 
 
-def test_to_array_preserves_shape_dtype_clipping_and_copy_isolation():
-    source = (np.arange(4 * 6 * 4, dtype=np.uint16) * 7).reshape(4, 6, 4)
-    expected = np.clip(source[..., :3], 0, 255).astype(np.uint8)
+def test_to_array_preserves_uint8_shape_pixels_and_copy_isolation():
+    source = np.arange(4 * 6 * 4, dtype=np.uint8).reshape(4, 6, 4)
+    expected = source[..., :3].copy()
     original = source.copy()
 
     result = pipeline._to_array(source)
@@ -25,8 +26,8 @@ def test_to_array_preserves_shape_dtype_clipping_and_copy_isolation():
     np.testing.assert_array_equal(source, original)
 
 
-def test_to_array_repeats_boolean_grayscale_channels():
-    source = np.array([[True, False], [False, True]], dtype=np.bool_)
+def test_to_array_repeats_uint8_grayscale_channels():
+    source = np.array([[255, 0], [0, 255]], dtype=np.uint8)
 
     result = pipeline._to_array(source)
 
@@ -35,14 +36,14 @@ def test_to_array_repeats_boolean_grayscale_channels():
     assert result.flags.c_contiguous
 
 
-def test_to_array_does_not_scan_integer_boolean_or_ordinary_pil_for_finiteness(monkeypatch):
+def test_to_array_does_not_scan_uint8_or_ordinary_pil_for_finiteness(monkeypatch):
     def unexpected_scan(*_args, **_kwargs):
         raise AssertionError("finite scan is unnecessary for integer, boolean, or RGB PIL input")
 
     monkeypatch.setattr(pipeline.np, "isfinite", unexpected_scan)
     for source in (
         np.zeros((2, 3), dtype=np.uint8),
-        np.zeros((2, 3, 3), dtype=np.bool_),
+        np.zeros((2, 3, 3), dtype=np.uint8),
         Image.new("RGB", (3, 2), color=(7, 11, 13)),
     ):
         result = pipeline._to_array(source)
@@ -74,17 +75,17 @@ def test_float_pil_f_rejects_nonfinite_before_rgb_conversion(monkeypatch, bad_va
 
     monkeypatch.setattr(Image.Image, "convert", observe_conversion)
     with pytest.raises(ValueError, match="NaN 或 Inf"):
-        pipeline._to_array(image)
+        pipeline._to_array(ImageFrame(image, value_range=(0, 255)))
     assert conversion_calls == []
 
 
 @pytest.mark.parametrize(
     ("source", "exception", "message"),
     [
-        (np.zeros((2,), dtype=np.uint8), ValueError, "高和宽"),
+        (np.zeros((2,), dtype=np.uint8), ValueError, "HW"),
         (np.zeros((0, 3), dtype=np.uint8), ValueError, "非空"),
         (np.zeros((2, 3, 2), dtype=np.uint8), ValueError, "通道数"),
-        (np.zeros((2, 3), dtype=object), TypeError, "实数数值类型"),
+        (np.zeros((2, 3), dtype=object), TypeError, "real integers"),
         (np.array([[0.0, np.nan]], dtype=np.float32), ValueError, "NaN 或 Inf"),
     ],
 )
@@ -145,13 +146,11 @@ def test_tensor_batch_cuda_preserves_every_uint8_value_exactly():
     pytest.param("cuda", marks=[pytest.mark.gpu,
         pytest.mark.skipif(not torch.cuda.is_available(), reason="需要可用 CUDA GPU")]),
 ])
-def test_non_uint8_tensor_batch_keeps_the_legacy_normalization(device):
+def test_pixel_unit_float_tensor_batch_requires_range_without_mutating_inputs(device):
     image = np.linspace(0.0, 255.0, 4 * 8 * 3, dtype=np.float32).reshape(4, 8, 3)
     inputs = [image[:, ::-1], image]
     snapshots = [value.copy() for value in inputs]
-    expected = _old_float32_batch_reference(inputs)
-    actual = _scorer_for_device(device)._to_tensor_batch(inputs)
-    assert torch.equal(actual.cpu(), expected)
-    assert actual.is_contiguous()
+    with pytest.raises(ValueError, match="value_range"):
+        _scorer_for_device(device)._to_tensor_batch(inputs)
     for value, snapshot in zip(inputs, snapshots, strict=True):
         np.testing.assert_array_equal(value, snapshot)
