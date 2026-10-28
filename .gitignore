@@ -76,3 +76,13 @@ _pytest_tmp/*
 /DEVELOPER_NOTICE.md
 
 AI_Skills/
+
+# Local-only paper crawler, documentation, tests and downloaded library.
+/scripts/crawl_papers.py
+/src/car_smart_assist/research/
+/configs/paper_crawler.json
+/requirements/requirements-papers.txt
+/tests/unit/test_paper_crawler.py
+/docs/paper_crawler.md
+/papers/
+/scripts/run_daily_papers.cmd
