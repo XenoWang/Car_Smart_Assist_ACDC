@@ -1,6 +1,7 @@
 """Validation uses the inference selection contract without changing training args."""
 
 import hashlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -168,10 +169,21 @@ def test_both_trainers_separate_validation_args_and_final_eval(
     trainer.last.write_bytes(b"synthetic last")
     trainer.best.write_bytes(b"synthetic best")
     trainer.wdir = tmp_path
-    torch.save({
+    # Supply valid complete history before checking final-evaluation identity;
+    # the independent expected validator args and strip side effects stay below.
+    fixture_spec = importlib.util.spec_from_file_location(
+        "validation_complete_state_fixture", Path(__file__).with_name("test_detection_training_cli.py")
+    )
+    fixture_module = importlib.util.module_from_spec(fixture_spec)
+    fixture_spec.loader.exec_module(fixture_module)
+    _, _, fixture_run = fixture_module.setup_run(tmp_path / "full_state_fixture", state_version=5)
+    state = torch.load(fixture_run / "weights/last_training_state.pt", weights_only=True)
+    state.update({
+        "model_selection_contract": contract,
         "checkpoint_sha256": hashlib.sha256(trainer.last.read_bytes()).hexdigest(),
         "best_checkpoint_sha256": hashlib.sha256(trainer.best.read_bytes()).hexdigest(),
-    }, tmp_path / "last_training_state.pt")
+    })
+    torch.save(state, tmp_path / "last_training_state.pt")
     stripped = []
 
     def strip_optimizer(path, updates=None):

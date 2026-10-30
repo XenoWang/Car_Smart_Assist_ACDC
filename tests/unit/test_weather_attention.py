@@ -411,10 +411,10 @@ def test_interruption_resume_matches_uninterrupted_training(
     full, expected = train_attention(cfg, tmp_path / "complete", datasets, {"signature": "split"})
     writer = training.write_json
 
-    def interrupt(path, value):
+    def interrupt(path, value, **kwargs):
         if path.name == "progress.json" and value.get("epoch") == 2:
             raise RuntimeError("simulated interruption after checkpoint")
-        return writer(path, value)
+        return writer(path, value, **kwargs)
 
     monkeypatch.setattr(training, "write_json", interrupt)
     with pytest.raises(RuntimeError, match="simulated"):
@@ -564,10 +564,10 @@ def test_continuation_preserves_state_reopens_swad_and_resumes_exactly(cfg, tmp_
     )
     writer = training.write_json
 
-    def interrupt(path, value):
+    def interrupt(path, value, **kwargs):
         if path.name == "progress.json" and value.get("epoch") == 5:
             raise RuntimeError("stage interruption")
-        return writer(path, value)
+        return writer(path, value, **kwargs)
 
     monkeypatch.setattr(training, "write_json", interrupt)
     with pytest.raises(RuntimeError, match="stage interruption"):

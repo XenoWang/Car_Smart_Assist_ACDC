@@ -255,6 +255,8 @@ class TestCheckpointResume:
         t1.history.best_val_loss = 0.75
         t1.history.best_epoch = 3
         t1.calibration = CalibrationStats(mean=0.01, std=0.003, p95=0.02, p99=0.03, n=10)
+        # This synthetic calibration belongs to these exact fixture weights.
+        t1._calibration_model_sha256 = _model_state_sha256(t1.model.state_dict())
         expected = {k: v.clone() for k, v in t1.model.state_dict().items()}
         self._save_valid_resume_fixture(
             t1, tmp_path / "ckpt" / "last.pt", epoch=3, optimizer=opt1,

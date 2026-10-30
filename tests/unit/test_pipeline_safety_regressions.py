@@ -229,20 +229,26 @@ def yolo_state(tmp_path, monkeypatch):
     model = SimpleNamespace(add_callback=lambda k, v: callbacks.update({k: v}))
     helper.attach_training_state_callbacks(model, "data", None, selection_contract=helper.SELECTION_CONTRACT,
                                           training_segment=helper.TRAINING_SEGMENT)
-    callbacks["on_train_start"](trainer)
+    trainer = helper.project_trainer_after_one_pending_batch(trainer, callbacks)
     callbacks["on_model_save"](trainer)
     state = torch.load(tmp_path / "last_training_state.pt", weights_only=True)
     return helper, trainer, model, callbacks, state
 
 
-def test_yolo_empty_disabled_scaler_can_resume_with_enabled_scaler(tmp_path, monkeypatch):
+def test_yolo_resume_rejects_changed_scaler_mode_without_mutating_weights(tmp_path, monkeypatch):
     helper, trainer, model, callbacks, state = yolo_state(tmp_path, monkeypatch)
     assert state["scaler"] == {} and state["scaler_enabled"] is False
     trainer.scaler = torch.amp.GradScaler("cpu", enabled=True)
+    weights_before = {name: value.clone() for name, value in trainer.model.state_dict().items()}
+    optimizer_before = copy.deepcopy(trainer.optimizer.state_dict())
     helper.attach_training_state_callbacks(model, "data", state, selection_contract=helper.SELECTION_CONTRACT,
                                           training_segment=helper.TRAINING_SEGMENT)
-    callbacks["on_train_start"](trainer)
+    with pytest.raises(ValueError, match=r"gradient-accumulation layout changed \(scaler_enabled\)"):
+        callbacks["on_train_start"](trainer)
     assert trainer.scaler.is_enabled()
+    for name, value in weights_before.items():
+        assert torch.equal(trainer.model.state_dict()[name], value)
+    assert trainer.optimizer.state_dict() == optimizer_before
 
 
 @pytest.mark.parametrize("ids", [["GPU-other"], None])

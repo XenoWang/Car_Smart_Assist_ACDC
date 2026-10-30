@@ -186,7 +186,7 @@ def test_positional_constructor_options_cannot_bypass_rejection(
 
 def _resume_inputs(root):
     helper = load_module("tests/unit/test_detection_training_cli.py", "joint_option_resume_fixture")
-    cfg, manifest, run = helper.setup_run(root, epoch=0, state_version=4)
+    cfg, manifest, run = helper.setup_run(root, epoch=0, state_version=5)
     manifest.update(joint_supervision=True, known_class_count=8,
                     source_weights={"acdc": 0.8, "lost_and_found": 0.2}, valid_roi_ids=[1, 2])
     manifest["classes"] = [{"name": f"traffic_{i}", "source_id": i} for i in range(8)]

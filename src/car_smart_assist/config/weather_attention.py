@@ -81,9 +81,9 @@ def validate_weather_attention_config(cfg: WeatherAttentionConfig):
             raise ValueError(f"{section}.metadata 必须为映射")
     if (
         not isinstance(cfg.device, str)
-        or re.fullmatch(r"(?:auto|cpu|cuda(?::[0-9]+)?|mps)", cfg.device) is None
+        or re.fullmatch(r"(?:auto|cpu|cuda(?::[0-9]+)?)", cfg.device) is None
     ):
-        raise ValueError("device 必须是 auto/cpu/cuda/cuda:N/mps 非空字符串")
+        raise ValueError("device 必须是 auto/cpu/cuda/cuda:N 非空字符串")
     if cfg.attributes != ("fog", "rain", "snow", "night"):
         raise ValueError("保持四个独立天气属性 fog/rain/snow/night")
     if len(cfg.image_size) != 2 or any(

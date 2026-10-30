@@ -80,12 +80,16 @@ def test_calibration_and_history_metadata_do_not_change_checkpoint_weight_identi
     state_identity = _model_state_sha256(trainer.model.state_dict())
     trainer._best_model_sha256 = state_identity
     trainer.calibration = CalibrationStats(mean=0.01, std=0.002, p95=0.02, p99=0.03, n=4)
+    trainer._calibration_model_sha256 = state_identity
     trainer.history.train_loss = [1.0]
     before = trainer._make_payload(1, None, None, 0.5)
     trainer.calibration = CalibrationStats(mean=0.05, std=0.01, p95=0.1, p99=0.2, n=9)
+    trainer._calibration_model_sha256 = state_identity
     trainer.history.train_loss.append(0.4)
     after = trainer._make_payload(2, None, None, 0.4)
     assert before["best_model_sha256"] == after["best_model_sha256"] == state_identity
+    assert before["calibration"]["n"] == 4
+    assert after["calibration"]["n"] == 9
 
 
 def test_training_writes_format3_best_and_last_bound_to_best_state(tmp_path, monkeypatch):

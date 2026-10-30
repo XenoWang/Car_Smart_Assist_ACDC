@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from torch.utils.data import BatchSampler, SequentialSampler
 
 from car_smart_assist.perception.yolo_training import (
     attach_training_state_callbacks,
@@ -69,17 +70,38 @@ def trainer(tmp_path):
     optimizer = torch.optim.AdamW(module.parameters(), lr=0.001)
     module.weight.grad = torch.full_like(module.weight, 1e-8)
     optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
     optimizer.param_groups[0]["lr"] = np.float64(0.001)
     last = tmp_path / "last.pt"
     last.write_bytes(b"paired checkpoint")
     best = tmp_path / "best.pt"
     best.write_bytes(b"paired best checkpoint")
+    class FixtureLoader:
+        def __init__(self):
+            self.dataset = tuple(range(4))
+            self.batch_size = 2
+            self.drop_last = False
+            self.sampler = SequentialSampler(self.dataset)
+            self.batch_sampler = BatchSampler(self.sampler, 2, drop_last=False)
+
+        def __len__(self):
+            return 2
+
     return SimpleNamespace(
         model=module,
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=torch.amp.GradScaler("cpu", enabled=False),
+        train_loader=FixtureLoader(),
+        batch_size=2,
+        args=SimpleNamespace(nbs=2, warmup_epochs=0, multi_scale=False, imgsz=64),
+        amp=False,
+        accumulate=1,
+        _project_last_processed_batch=0,
+        _project_last_optimizer_attempt=0,
+        _project_vendor_last_optimizer_attempt=0,
+        _project_actual_accumulate=1,
         ema=SimpleNamespace(ema=copy.deepcopy(module), updates=1),
         epoch=0,
         epochs=TRAINING_SEGMENT["target_epochs"],
@@ -93,6 +115,41 @@ def trainer(tmp_path):
         wdir=tmp_path,
         device=torch.device("cpu"),
     )
+
+
+def project_trainer_after_one_pending_batch(trainer_fixture, callbacks):
+    """Return a real project trainer after vendor start/zero_grad and one uncommitted batch."""
+    from ultralytics.utils.torch_utils import ModelEMA
+
+    from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
+
+    trainer_type = detection_trainer_for_resume(None, SELECTION_CONTRACT)
+    live = trainer_type.__new__(trainer_type)
+    live.__dict__.update(vars(trainer_fixture))
+    live.ema = ModelEMA(live.model)
+    live.args.nbs = 4
+    live.accumulate = 2
+    live.optimizer.state.clear()
+    callbacks["on_train_start"](live)
+    live.optimizer.zero_grad(set_to_none=True)
+    callbacks["on_train_epoch_start"](live)
+
+    live.preprocess_batch({
+        "img": torch.full((2, 3, 64, 64), 128, dtype=torch.uint8),
+    })
+    assert live._project_current_batch == 0
+    loss = 0.5 * (live.model.weight - 0.0).square().sum() / live.accumulate
+    loss.backward()
+
+    # Pinned Ultralytics 8.3.162 starts last_opt_step at -1 and checks this
+    # after preprocess_batch. With A=2, batch 0 is pending and cannot step.
+    assert live._project_current_batch - (-1) < live.accumulate
+    callbacks["on_train_batch_end"](live)
+    assert live._project_last_processed_batch == 0
+    assert live._project_last_optimizer_attempt == -1
+    assert live.model.weight.grad is not None
+    assert torch.isfinite(live.model.weight.grad).all()
+    return live
 
 
 def test_adam_small_variance_and_model_restored_without_half_rounding(tmp_path, monkeypatch):
@@ -173,7 +230,7 @@ def test_completed_checkpoint_rebound_to_final_file(tmp_path, monkeypatch):
     state = load_training_state(
         tmp_path / "last_training_state.pt", saved.last, "dataset", SELECTION_CONTRACT
     )
-    assert state["format_version"] == 4
+    assert state["format_version"] == 5
     assert state["model_selection_contract"] == SELECTION_CONTRACT
     assert state["epoch"] == 0
     assert state["best_fitness"] == 0.2

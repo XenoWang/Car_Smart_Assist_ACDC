@@ -10,6 +10,7 @@ import logging
 import shutil
 import sys
 import time
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ from car_smart_assist.perception.visibility.trainer import (  # noqa: E402
     VisibilityTrainer,
     apply_config_overrides,
     archive_visibility_checkpoints,
+    recover_visibility_checkpoint_transaction,
 )
 
 logger = logging.getLogger(__name__)
@@ -247,32 +249,36 @@ def main() -> int:
 
     with StopController(
         args.stop_file, default_directory=root / "artifacts/checkpoints/visibility_ablations"
-    ) as controller:
+    ) as controller, ExitStack() as locks:
         for preset in presets:
             controller.watch_directory(root / "artifacts/checkpoints/visibility_ablations" / preset["tag"])
         if args.stop:
             controller.request_stop_file()
             print(f"已请求轮末停止：{controller.path}")
             return 0
-        if args.fresh or args.continue_training:
-            controller.resume()
-        controller.require_running()
+        resume_requested = args.fresh or args.continue_training
+        marker_paths = {controller.path, root / "artifacts/checkpoints/visibility_ablations/STOP", *(
+            root / "artifacts/checkpoints/visibility_ablations" / preset["tag"] / "STOP"
+            for preset in presets
+        )}
+
+        def marker_identity(path):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                return None
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+        previous_markers = {path: marker_identity(path) for path in marker_paths}
+        if not resume_requested:
+            controller.require_running()
         if args.continue_training and args.force:
             logger.error("--continue 不能与重新执行全部组的 --force 一起使用")
             return 2
         out_dir = root / "artifacts/reports/visibility/ablations"
         out_dir.mkdir(parents=True, exist_ok=True)
+        locks.enter_context(FileLock(str((out_dir / "run.lock").resolve()), timeout=0, is_singleton=True))
         results_path = out_dir / "results.json"
-        if args.fresh or args.force:
-            old = [p for p in (results_path, out_dir / "training_progress.json") if p.is_file()]
-            if old:
-                archive = out_dir / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                archive.mkdir(parents=True)
-                for path in old:
-                    original = path.read_bytes()
-                    shutil.copy2(path, archive / path.name)
-                    if (archive / path.name).read_bytes() != original:
-                        raise OSError(f"消融历史归档回读不一致：{path}")
         results: dict[str, Any] = {}
         if results_path.exists():
             results = json.loads(results_path.read_text(encoding="utf-8"))
@@ -332,7 +338,20 @@ def main() -> int:
 
         state_path = out_dir / "training_progress.json"
         suite_identity = {p["tag"]: sig for p, _, _, _, sig in prepared}
-        if args.continue_training or (args.only is not None and state_path.is_file()):
+        # 共享进度与所有所选组在整轮运行中保持锁定，归档和状态发布使用同一锁域。
+        for _, cfg, *_ in prepared:
+            directory = root / cfg["train"]["checkpoint_dir"]
+            directory.mkdir(parents=True, exist_ok=True)
+            locks.enter_context(FileLock(str((directory / "run.lock").resolve()), timeout=0, is_singleton=True))
+        if resume_requested:
+            if getattr(controller, "_requested", False) or any(
+                marker_identity(path) != previous for path, previous in previous_markers.items()
+            ):
+                controller.request()
+            else:
+                controller.resume()
+        controller.require_running()
+        if args.continue_training or state_path.is_file():
             if not state_path.is_file():
                 logger.error("--continue 缺少原组进度，不能推测缺失 last 是未开始")
                 return 2
@@ -340,6 +359,7 @@ def main() -> int:
             if (
                 not isinstance(suite, dict) or not isinstance(suite.get("identity"), dict)
                 or not isinstance(suite.get("groups"), dict)
+                or set(suite["identity"]) != set(suite["groups"])
             ):
                 logger.error("原消融组进度缺少有效 identity/groups，拒绝覆盖")
                 return 2
@@ -367,7 +387,8 @@ def main() -> int:
                                 continue
                             directory = root / cfg["train"]["checkpoint_dir"]
                             if tag in results or any(
-                                (directory / name).exists() for name in ("last.pt", "best.pt")
+                                (directory / name).exists()
+                                for name in ("last.pt", "best.pt", ".visibility_checkpoint_transaction")
                             ):
                                 logger.error("%s 未记录进度但已有结果或检查点，拒绝推测未开始", tag)
                                 return 2
@@ -377,11 +398,26 @@ def main() -> int:
                     logger.error("原消融配置、数据身份或组进度已改变")
                     return 2
             else:
+                if not (args.fresh or args.force) and any(
+                    tag in suite["identity"] and suite["identity"][tag] != sig
+                    for tag, sig in suite_identity.items()
+                ):
+                    logger.error("原消融配置、数据身份或组进度已改变")
+                    return 2
                 suite["identity"].update(suite_identity)
-                suite["groups"].update({p["tag"]: {"status": "pending"} for p in presets})
+                for preset in presets:
+                    if args.fresh or args.force:
+                        suite["groups"][preset["tag"]] = {"status": "pending"}
+                    else:
+                        suite["groups"].setdefault(preset["tag"], {"status": "pending"})
         else:
             suite = {"identity": suite_identity,
                      "groups": {p["tag"]: {"status": "pending"} for p in presets}}
+
+        def save_suite():
+            temporary = state_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(suite, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(state_path)
 
         def record_group(tag, status, directory):
             row = {"status": status}
@@ -389,32 +425,54 @@ def main() -> int:
                 row["last_sha256"] = _file_identity(directory / "last.pt")["sha256"]
                 row["best_sha256"] = _file_identity(directory / "best.pt")["sha256"]
             suite["groups"][tag] = row
-            temporary = state_path.with_suffix(".tmp")
-            temporary.write_text(json.dumps(suite, ensure_ascii=False, indent=2), encoding="utf-8")
-            temporary.replace(state_path)
+            save_suite()
 
-        if args.continue_training:
+        if args.fresh or args.force:
+            old = [path for path in (results_path, state_path) if path.is_file()]
+            if old:
+                archive = out_dir / "history" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                archive.mkdir(parents=True)
+                for path in old:
+                    original = path.read_bytes()
+                    shutil.copy2(path, archive / path.name)
+                    if (archive / path.name).read_bytes() != original or path.read_bytes() != original:
+                        raise OSError(f"消融历史归档回读不一致：{path}")
+            # 先归档全部所选组，暂停时尚未启动的 pending 组也不携带上一轮权重。
             for preset, cfg, *_ in prepared:
-                tag = preset["tag"]
-                directory = root / cfg["train"]["checkpoint_dir"]
-                row = suite["groups"].get(tag, {})
-                if not isinstance(row, dict) or row.get("status") not in {"pending", "running", "paused", "completed"}:
-                    logger.error("%s 的原组进度缺失或无效", tag)
+                archive_visibility_checkpoints(root / cfg["train"]["checkpoint_dir"])
+                results.pop(preset["tag"], None)
+            results_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+            save_suite()
+
+        for preset, cfg, *_ in prepared:
+            tag = preset["tag"]
+            directory = root / cfg["train"]["checkpoint_dir"]
+            row = suite["groups"].get(tag, {})
+            if not isinstance(row, dict) or row.get("status") not in {"pending", "running", "paused", "completed"}:
+                logger.error("%s 的原组进度缺失或无效", tag)
+                return 2
+            if args.continue_training:
+                recover_visibility_checkpoint_transaction(directory)
+            if row.get("status") == "pending":
+                if tag in results or any(
+                    (directory / item).exists()
+                    for item in ("last.pt", "best.pt", ".visibility_checkpoint_transaction")
+                ):
+                    logger.error("%s 标记未开始但已有结果或检查点；请明确使用 --fresh 或 --force", tag)
                     return 2
-                if row.get("status") == "pending":
-                    if any((directory / item).exists() for item in ("last.pt", "best.pt")):
-                        logger.error("%s 标记未开始但已有检查点", tag)
-                        return 2
-                elif not all((directory / item).is_file() for item in ("last.pt", "best.pt")):
-                    logger.error("%s 缺少已开始组的配对 last/best", tag)
+            elif not all((directory / item).is_file() for item in ("last.pt", "best.pt")):
+                logger.error("%s 缺少已开始组的配对 last/best", tag)
+                return 2
+            elif row.get("status") != "completed" and not args.continue_training:
+                logger.error("%s 的训练尚未完成；请使用 --continue 恢复或 --fresh 重训", tag)
+                return 2
+            if row.get("status") == "completed":
+                if tag not in results or any(
+                    _file_identity(directory / item)["sha256"] != row.get(key)
+                    for item, key in (("last.pt", "last_sha256"), ("best.pt", "best_sha256"))
+                ):
+                    logger.error("%s 已完成结果或配对检查点已改变", tag)
                     return 2
-                if row.get("status") == "completed":
-                    if tag not in results or any(
-                        _file_identity(directory / item)["sha256"] != row.get(key)
-                        for item, key in (("last.pt", "last_sha256"), ("best.pt", "best_sha256"))
-                    ):
-                        logger.error("%s 已完成结果或配对检查点已改变", tag)
-                        return 2
 
         for i, (preset, cfg, inputs, identity, signature) in enumerate(prepared, 1):
             controller.require_running()
@@ -422,11 +480,7 @@ def main() -> int:
             directory = root / cfg["train"]["checkpoint_dir"]
             row = suite["groups"].get(tag, {})
             group_continue = args.continue_training and row.get("status") != "pending"
-            if tag in results and not (args.force or args.fresh):
-                if not args.continue_training and all(
-                    (directory / item).is_file() for item in ("last.pt", "best.pt")
-                ):
-                    record_group(tag, "completed", directory)
+            if row.get("status") == "completed" and tag in results and not (args.force or args.fresh):
                 logger.info("[%d/%d] 跳过 %s（实验身份一致）", i, len(presets), tag)
                 continue
             logger.info("[%d/%d] %s  覆盖: %s", i, len(presets), tag, preset.get("set", {}))
@@ -440,8 +494,6 @@ def main() -> int:
             record_group(tag, "running", directory)
             directory.mkdir(parents=True, exist_ok=True)
             with FileLock(str((directory / "run.lock").resolve()), timeout=0, is_singleton=True):
-                if args.fresh or args.force:
-                    archive_visibility_checkpoints(directory)
                 trainer = VisibilityTrainer(
                     cfg, project_root=root, resume=directory / "last.pt" if group_continue else "none"
                 )

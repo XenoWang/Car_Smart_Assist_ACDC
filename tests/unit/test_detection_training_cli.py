@@ -49,13 +49,38 @@ def setup_run(root, *, epoch=-1, state_version=None):
             )
         )
     if state_version is not None:
+        # A tiny independent valid format5 fixture; numeric resume behavior is
+        # covered by real trainer tests, while this module tests CLI budgets.
+        model = torch.nn.Linear(1, 1, bias=False)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        saved_epoch = epoch if epoch >= 0 else 1
+        kind = lambda value: f"{type(value).__module__}.{type(value).__qualname__}"
+        accumulation = {
+            "format_version": 1, "batches_per_epoch": 2, "dataset_size": 4,
+            "batch_size": 2, "loader_batch_size": 2, "drop_last": False,
+            "sampler_type": "torch.utils.data.sampler.SequentialSampler",
+            "batch_sampler_type": "torch.utils.data.sampler.BatchSampler",
+            "nbs": 4, "warmup_epochs": 0.0, "warmup_iterations": -1,
+            "amp": False, "model_type": kind(model), "optimizer_type": kind(optimizer),
+            "scaler_type": kind(scaler), "scaler_enabled": False,
+            "parameter_layout": [{"name": "weight", "shape": [1, 1],
+                                  "dtype": "torch.float32", "requires_grad": True}],
+            "optimizer_parameter_names": [["weight"]],
+            "last_processed_batch": (saved_epoch + 1) * 2 - 1,
+            "last_optimizer_attempt": (saved_epoch + 1) * 2 - 1,
+            "accumulate": 2, "scaler_scale": 1.0, "pending_gradients": {"weight": None},
+        }
         torch.save(
             {
                 "format_version": state_version,
                 "dataset_signature": manifest["signature"],
                 "model_selection_contract": selection_contract,
                 "checkpoint_sha256": hashlib.sha256((weights / "last.pt").read_bytes()).hexdigest(),
-                "epoch": epoch if epoch >= 0 else 1,
+                "epoch": saved_epoch,
+                "model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                "scaler": scaler.state_dict(), "scaler_enabled": False,
+                **({"accumulation": accumulation} if state_version == 5 else {}),
                 "best_fitness": 0.2,
                 "best_checkpoint_sha256": hashlib.sha256((weights / "best.pt").read_bytes()).hexdigest(),
                 "training_segment": {
@@ -125,7 +150,7 @@ def test_new_directory_finetunes_old_best_without_old_state_or_fitness(tmp_path,
 
 
 def test_project_settings_configured_before_checkpoint_import(tmp_path, monkeypatch):
-    cfg, manifest, run = setup_run(tmp_path, state_version=4)
+    cfg, manifest, run = setup_run(tmp_path, state_version=5)
     monkeypatch.delenv("YOLO_CONFIG_DIR", raising=False)
     original_load = torch.load
 
@@ -140,7 +165,7 @@ def test_project_settings_configured_before_checkpoint_import(tmp_path, monkeypa
 
 
 def test_interrupted_run_defaults_to_full_resume(tmp_path):
-    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=4)
+    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=5)
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run)
     assert plan["mode"] == "resume"
     assert plan["train"]["epochs"] == 2
@@ -149,7 +174,7 @@ def test_interrupted_run_defaults_to_full_resume(tmp_path):
 
 @pytest.mark.parametrize("extra,override,expected", [(None, None, 4), (1, None, 3), (None, 1, 3)])
 def test_completed_full_state_adds_epochs(tmp_path, extra, override, expected):
-    cfg, manifest, run = setup_run(tmp_path, state_version=4)
+    cfg, manifest, run = setup_run(tmp_path, state_version=5)
     cfg["train"]["resume_extra_epochs"] = extra
     plan = cli.resolve_training_plan(tmp_path, cfg, manifest, run, epochs=override)
     assert plan["mode"] == "resume"
@@ -224,7 +249,7 @@ def test_archive_retains_original_files_and_separate_snapshots(tmp_path):
     for number in (1, 2):
         assert (run / f"history/round_{number:04d}/weights/best.pt").read_bytes() == original
 def test_interrupted_extra_segment_keeps_original_target_after_second_resume(tmp_path, monkeypatch):
-    cfg, manifest, run = setup_run(tmp_path, epoch=11, state_version=3)
+    cfg, manifest, run = setup_run(tmp_path, epoch=11, state_version=5)
     weights = run / "weights"
     best, last = weights / "best.pt", weights / "last.pt"
     segment = {
@@ -234,7 +259,7 @@ def test_interrupted_extra_segment_keeps_original_target_after_second_resume(tmp
     state_path = weights / "last_training_state.pt"
     state = torch.load(state_path, map_location="cpu", weights_only=True)
     state.update(
-        format_version=4,
+        format_version=5,
         checkpoint_sha256=hashlib.sha256(last.read_bytes()).hexdigest(),
         best_checkpoint_sha256=hashlib.sha256(best.read_bytes()).hexdigest(),
         training_segment=segment,
@@ -255,7 +280,8 @@ def test_interrupted_extra_segment_keeps_original_target_after_second_resume(tmp
     assert plan["train"]["epochs"] == 15
 
 
-def test_old_format3_complete_resume_is_explicitly_rejected(tmp_path):
-    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=3)
+@pytest.mark.parametrize("version", [3, 4])
+def test_old_complete_resume_format_is_explicitly_rejected(tmp_path, version):
+    cfg, manifest, run = setup_run(tmp_path, epoch=0, state_version=version)
     with pytest.raises(ValueError, match="history is missing or incompatible"):
         cli.resolve_training_plan(tmp_path, cfg, manifest, run)
