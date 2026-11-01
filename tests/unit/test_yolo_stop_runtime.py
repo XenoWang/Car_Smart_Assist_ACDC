@@ -28,14 +28,15 @@ def _assert_tree_equal(actual, expected):
         assert actual == expected
 
 
-def _write_tiny_detection_dataset(root):
+def _write_tiny_detection_dataset(root, *, train_images=2):
     for split in ("train", "val"):
         image_dir = root / "images" / split
         label_dir = root / "labels" / split
         image_dir.mkdir(parents=True)
         label_dir.mkdir(parents=True)
-        for index in range(2):
-            pixels = np.full((64, 64, 3), 40 + 50 * index, dtype=np.uint8)
+        image_count = train_images if split == "train" else 2
+        for index in range(image_count):
+            pixels = np.full((64, 64, 3), 40 + 50 * (index % 4), dtype=np.uint8)
             pixels[20:44, 20:44] = (180, 90, 30)
             Image.fromarray(pixels).save(image_dir / f"{split}_{index}.jpg")
             (label_dir / f"{split}_{index}.txt").write_text(
@@ -53,8 +54,13 @@ def _write_tiny_detection_dataset(root):
     return data
 
 
+@pytest.mark.parametrize(
+    "nbs,train_images,first_attempts,resume_attempts",
+    [(2, 2, [0], [1]), (4, 6, [1], [3, 5])],
+    ids=["single-batch", "accumulated-epoch-tail"],
+)
 def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved_target(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, nbs, train_images, first_attempts, resume_attempts
 ):
     vendor_environment = ("CUDA_VISIBLE_DEVICES", "CUBLAS_WORKSPACE_CONFIG", "PYTHONHASHSEED")
     previous_environment = {key: os.environ.get(key) for key in vendor_environment}
@@ -120,7 +126,7 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
             "seed": 41,
             "imgsz": 64,
             "batch": 2,
-            "nbs": 2,
+            "nbs": nbs,
             "workers": 0,
             "close_mosaic": 0,
             "resume_extra_epochs": None,
@@ -159,13 +165,23 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         (run / "run_metadata.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        data_yaml = _write_tiny_detection_dataset(tmp_path / "dataset")
+        data_yaml = _write_tiny_detection_dataset(
+            tmp_path / "dataset", train_images=train_images
+        )
 
         controller = StopController(default_directory=run / "weights")
         model = YOLO(str(model_yaml))
         trainer_type = detection_trainer_for_resume(
             None, initial_plan["model_selection_contract"]
         )
+        first_optimizer_attempts = []
+        original_optimizer_step = trainer_type.optimizer_step
+
+        def record_optimizer_step(trainer):
+            first_optimizer_attempts.append(trainer._project_current_batch)
+            return original_optimizer_step(trainer)
+
+        trainer_type.optimizer_step = record_optimizer_step
         attach_training_state_callbacks(
             model,
             manifest["signature"],
@@ -204,6 +220,16 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         stopped_state = load_training_state(
             state_path, last, manifest["signature"], initial_plan["model_selection_contract"]
         )
+        stopped_trainer = model.trainer
+        stopped_pending = {
+            name: None if parameter.grad is None else parameter.grad.detach().cpu().clone()
+            for name, parameter in stopped_trainer.model.named_parameters()
+        }
+        assert first_optimizer_attempts == first_attempts
+        _assert_tree_equal(stopped_pending, stopped_state["accumulation"]["pending_gradients"])
+        if nbs == 4:
+            assert stopped_state["accumulation"]["last_optimizer_attempt"] == 1
+            assert any(gradient is not None for gradient in stopped_pending.values())
         assert validated_epochs == [0]
         assert saved_epochs == [0]
         assert first_results.results_dict
@@ -234,6 +260,14 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         resumed_trainer_type = detection_trainer_for_resume(
             continuation["resume_state"], continuation["model_selection_contract"]
         )
+        resumed_optimizer_attempts = []
+        original_resumed_optimizer_step = resumed_trainer_type.optimizer_step
+
+        def record_resumed_optimizer_step(trainer):
+            resumed_optimizer_attempts.append(trainer._project_current_batch)
+            return original_resumed_optimizer_step(trainer)
+
+        resumed_trainer_type.optimizer_step = record_resumed_optimizer_step
         attach_training_state_callbacks(
             resumed_model,
             manifest["signature"],
@@ -260,8 +294,22 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
             restored["ema_updates"] = trainer.ema.updates
             restored["torch_rng"] = torch.get_rng_state().clone()
 
+        disk_state_oracle = torch.load(
+            state_path, map_location="cpu", weights_only=True
+        )
+
+        def capture_pending_after_epoch_start(trainer):
+            restored["pending_gradients"] = {
+                name: None if parameter.grad is None else parameter.grad.detach().cpu().clone()
+                for name, parameter in trainer.model.named_parameters()
+            }
+            restored["scaler_scale"] = trainer.scaler.get_scale()
+
         resumed_model.add_callback(
             "on_train_epoch_start", lambda trainer: resumed_epochs.append(trainer.epoch)
+        )
+        resumed_model.add_callback(
+            "on_train_epoch_start", capture_pending_after_epoch_start
         )
         resumed_model.add_callback("on_train_start", capture_restored_state)
         resumed_results = resumed_model.train(
@@ -277,6 +325,7 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
 
         assert os.environ.get("CUDA_VISIBLE_DEVICES") == previous_environment["CUDA_VISIBLE_DEVICES"]
         assert resumed_epochs == [1]
+        assert resumed_optimizer_attempts == resume_attempts
         assert resumed_results.results_dict
         _assert_tree_equal(restored["model"], stopped_state["model"])
         _assert_tree_equal(restored["optimizer"], stopped_state["optimizer"])
@@ -285,6 +334,11 @@ def test_real_ultralytics_stop_saves_epoch_then_continue_restores_and_uses_saved
         _assert_tree_equal(restored["ema"], stopped_state["ema"])
         assert restored["ema_updates"] == stopped_state["ema_updates"]
         assert torch.equal(restored["torch_rng"], stopped_state["torch_rng"])
+        _assert_tree_equal(
+            restored["pending_gradients"],
+            disk_state_oracle["accumulation"]["pending_gradients"],
+        )
+        assert restored["scaler_scale"] == disk_state_oracle["accumulation"]["scaler_scale"]
 
         completed_state = load_training_state(
             state_path, last, manifest["signature"], continuation["model_selection_contract"]

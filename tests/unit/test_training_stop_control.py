@@ -270,6 +270,7 @@ def _attention_compare_inputs(tmp_path):
 
     cfg = SimpleNamespace(
         device="cpu", image_size=(8, 8), attributes=("fog",), checkpoint_root="checkpoints",
+        report_dir="reports", report_file="reports/REPORT.md",
         train={"epochs": 1}, data={"cache_dir": "cache", "seed": 1},
         evaluation={"attention_references": {}, "asl_config": "asl.yaml", "asl_checkpoint": "asl.pt",
                     "old_config": "old.yaml", "old_checkpoint": "old.pt", "batch_size": 1},

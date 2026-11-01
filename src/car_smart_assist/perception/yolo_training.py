@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from copy import copy
 from pathlib import Path
 
@@ -16,6 +17,193 @@ from car_smart_assist.utils.stop import StopController
 
 STOPPER_FIELDS = ("best_fitness", "best_epoch", "patience", "possible_stop")
 EARLY_STOPPING_POLICY = "preserve_history"
+TRAINING_STATE_FORMAT = 5
+ACCUMULATION_STATE_FORMAT = 1
+
+
+def _type_identity(value):
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _accumulation_layout(trainer):
+    parameters = list(trainer.model.named_parameters())
+    names = {id(parameter): name for name, parameter in parameters}
+    try:
+        optimizer_names = [
+            [names[id(parameter)] for parameter in group["params"]]
+            for group in trainer.optimizer.param_groups
+        ]
+    except KeyError as error:
+        raise ValueError("Optimizer contains a parameter outside the training model") from error
+    nb = len(trainer.train_loader)
+    warmup_epochs = float(trainer.args.warmup_epochs)
+    return {
+        "batches_per_epoch": nb,
+        "dataset_size": len(trainer.train_loader.dataset),
+        "batch_size": trainer.batch_size,
+        "loader_batch_size": trainer.train_loader.batch_size,
+        "drop_last": trainer.train_loader.drop_last,
+        "sampler_type": _type_identity(trainer.train_loader.sampler),
+        "batch_sampler_type": _type_identity(trainer.train_loader.batch_sampler),
+        "nbs": trainer.args.nbs,
+        "warmup_epochs": warmup_epochs,
+        "warmup_iterations": max(round(warmup_epochs * nb), 100) if warmup_epochs > 0 else -1,
+        "amp": trainer.amp,
+        "model_type": _type_identity(trainer.model),
+        "optimizer_type": _type_identity(trainer.optimizer),
+        "scaler_type": _type_identity(trainer.scaler),
+        "scaler_enabled": trainer.scaler.is_enabled(),
+        "parameter_layout": [
+            {
+                "name": name, "shape": list(parameter.shape), "dtype": str(parameter.dtype),
+                "requires_grad": parameter.requires_grad,
+            }
+            for name, parameter in parameters
+        ],
+        "optimizer_parameter_names": optimizer_names,
+    }
+
+
+def _require_accumulation_state(state):
+    def incompatible(reason):
+        raise ValueError(
+            f"Complete gradient-accumulation resume state is missing or incompatible ({reason}); "
+            "retain the old weights and use a new run directory (--name) to fine-tune them"
+        )
+
+    accumulation = state.get("accumulation")
+    if (
+        state.get("format_version") != TRAINING_STATE_FORMAT
+        or not isinstance(accumulation, dict)
+        or accumulation.get("format_version") != ACCUMULATION_STATE_FORMAT
+    ):
+        incompatible("format")
+    for name in ("batches_per_epoch", "dataset_size", "batch_size", "loader_batch_size", "nbs", "accumulate"):
+        if type(accumulation.get(name)) is not int or accumulation[name] < 1:
+            incompatible(name)
+    for name in ("drop_last", "amp", "scaler_enabled"):
+        if type(accumulation.get(name)) is not bool:
+            incompatible(name)
+    for name in ("sampler_type", "batch_sampler_type", "model_type", "optimizer_type", "scaler_type"):
+        if not isinstance(accumulation.get(name), str) or not accumulation[name]:
+            incompatible(name)
+    warmup = accumulation.get("warmup_epochs")
+    if type(warmup) not in (int, float) or not math.isfinite(warmup) or warmup < 0:
+        incompatible("warmup_epochs")
+    nb = accumulation["batches_per_epoch"]
+    expected_warmup = max(round(warmup * nb), 100) if warmup > 0 else -1
+    if type(accumulation.get("warmup_iterations")) is not int or accumulation["warmup_iterations"] != expected_warmup:
+        incompatible("warmup_iterations")
+    last_batch = accumulation.get("last_processed_batch")
+    last_attempt = accumulation.get("last_optimizer_attempt")
+    epoch = state.get("epoch")
+    if (
+        type(epoch) is not int or epoch < 0
+        or type(last_batch) is not int or not epoch * nb <= last_batch < (epoch + 1) * nb
+        or type(last_attempt) is not int or not -1 <= last_attempt <= last_batch
+    ):
+        incompatible("batch/optimizer-attempt counters")
+    scale = accumulation.get("scaler_scale")
+    if type(scale) not in (int, float) or not math.isfinite(scale) or scale <= 0:
+        incompatible("scaler scale")
+    scaler = state.get("scaler")
+    if not isinstance(scaler, dict) or state.get("scaler_enabled") is not accumulation["scaler_enabled"]:
+        incompatible("scaler mode")
+    if accumulation["scaler_enabled"]:
+        if set(scaler) != {"scale", "growth_factor", "backoff_factor", "growth_interval", "_growth_tracker"}:
+            incompatible("scaler state")
+        for name in ("scale", "growth_factor", "backoff_factor"):
+            if type(scaler[name]) not in (int, float) or not math.isfinite(scaler[name]):
+                incompatible(f"scaler {name}")
+        if (
+            scaler["scale"] != scale or scaler["growth_factor"] <= 1
+            or not 0 < scaler["backoff_factor"] < 1
+            or type(scaler["growth_interval"]) is not int or scaler["growth_interval"] < 1
+            or type(scaler["_growth_tracker"]) is not int
+            or not 0 <= scaler["_growth_tracker"] < scaler["growth_interval"]
+        ):
+            incompatible("scaler counters/scale")
+    elif scaler or scale != 1.0:
+        incompatible("disabled scaler state")
+    layout = accumulation.get("parameter_layout")
+    gradients = accumulation.get("pending_gradients")
+    model_state = state.get("model")
+    if not isinstance(layout, list) or not layout or not isinstance(gradients, dict) or not isinstance(model_state, dict):
+        incompatible("parameter layout/gradients")
+    names = []
+    for entry in layout:
+        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str) or not entry["name"]:
+            incompatible("parameter name")
+        name = entry["name"]
+        shape = entry.get("shape")
+        if (
+            name in names or not isinstance(shape, list)
+            or any(type(size) is not int or size < 0 for size in shape)
+            or type(entry.get("requires_grad")) is not bool
+        ):
+            incompatible("parameter layout")
+        parameter = model_state.get(name)
+        if (
+            not isinstance(parameter, torch.Tensor) or list(parameter.shape) != shape
+            or str(parameter.dtype) != entry.get("dtype")
+        ):
+            incompatible(f"model parameter {name}")
+        names.append(name)
+        gradient = gradients.get(name)
+        # Pending AMP gradients remain scaled; Inf/NaN must reach the next real GradScaler attempt.
+        if gradient is not None and (
+            not isinstance(gradient, torch.Tensor) or gradient.device.type != "cpu"
+            or gradient.layout != torch.strided or list(gradient.shape) != shape
+            or str(gradient.dtype) != entry["dtype"] or gradient.requires_grad
+        ):
+            incompatible(f"pending gradient {name}")
+    if set(gradients) != set(names):
+        incompatible("pending gradient names")
+    optimizer_names = accumulation.get("optimizer_parameter_names")
+    optimizer = state.get("optimizer")
+    groups = optimizer.get("param_groups") if isinstance(optimizer, dict) else None
+    if not isinstance(optimizer_names, list) or not isinstance(groups, list) or len(optimizer_names) != len(groups):
+        incompatible("optimizer parameter groups")
+    seen_names, seen_ids = set(), set()
+    for group_names, group in zip(optimizer_names, groups):
+        parameter_ids = group.get("params") if isinstance(group, dict) else None
+        if (
+            not isinstance(group_names, list) or not isinstance(parameter_ids, list)
+            or len(group_names) != len(parameter_ids)
+        ):
+            incompatible("optimizer parameter order")
+        for name, parameter_id in zip(group_names, parameter_ids):
+            if (
+                not isinstance(name, str) or name not in names or name in seen_names
+                or type(parameter_id) is not int or parameter_id in seen_ids
+            ):
+                incompatible("optimizer parameter identity")
+            seen_names.add(name)
+            seen_ids.add(parameter_id)
+    optimizer_state = optimizer.get("state")
+    if not isinstance(optimizer_state, dict) or not set(optimizer_state).issubset(seen_ids):
+        incompatible("optimizer state parameter identity")
+    return accumulation
+
+
+def _restore_accumulation_gate(trainer):
+    trainer.accumulate = trainer._project_actual_accumulate
+
+
+def _capture_accumulation(trainer):
+    _restore_accumulation_gate(trainer)
+    return {
+        **_accumulation_layout(trainer),
+        "format_version": ACCUMULATION_STATE_FORMAT,
+        "last_processed_batch": trainer._project_last_processed_batch,
+        "last_optimizer_attempt": trainer._project_last_optimizer_attempt,
+        "accumulate": trainer._project_actual_accumulate,
+        "scaler_scale": trainer.scaler.get_scale(),
+        "pending_gradients": {
+            name: None if parameter.grad is None else parameter.grad.detach().cpu().clone()
+            for name, parameter in trainer.model.named_parameters()
+        },
+    }
 
 
 def _cuda_device_ids():
@@ -51,7 +239,7 @@ def require_training_history(state):
     stopper = state.get("early_stopper")
     segment = state.get("training_segment")
     if (
-        state.get("format_version") != 4
+        state.get("format_version") != TRAINING_STATE_FORMAT
         or not isinstance(stopper, dict)
         or any(name not in stopper for name in STOPPER_FIELDS)
         or not isinstance(segment, dict)
@@ -63,9 +251,10 @@ def require_training_history(state):
         or not {"resume_extra_epochs", "epochs_override"}.issubset(segment)
     ):
         raise ValueError(
-            "Complete early-stopper/segment resume history is missing or incompatible; "
-            "use a new run directory (--name) to fine-tune trained weights"
+            "Complete format5 early-stopper/segment/accumulation resume history is missing or incompatible; "
+            "retain the old weights and use a new run directory (--name) to fine-tune them"
         )
+    _require_accumulation_state(state)
 
 
 def _plain_numbers(value):
@@ -118,7 +307,7 @@ def attach_training_state_callbacks(
             )
         trainer._project_best_checkpoint_sha256 = best_sha256
         state = {
-            "format_version": 4,
+            "format_version": TRAINING_STATE_FORMAT,
             "dataset_signature": dataset_signature,
             "model_selection_contract": selection_contract,
             "checkpoint_sha256": hashlib.sha256(trainer.last.read_bytes()).hexdigest(),
@@ -148,7 +337,9 @@ def attach_training_state_callbacks(
             "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if trainer.device.type == "cuda" else [],
             "cuda_device_ids": _cuda_device_ids() if trainer.device.type == "cuda" else [],
+            "accumulation": _capture_accumulation(trainer),
         }
+        _require_accumulation_state(state)
         path = trainer.wdir / "last_training_state.pt"
         temporary = path.with_suffix(".tmp")
         torch.save(state, temporary)
@@ -165,6 +356,14 @@ def attach_training_state_callbacks(
             # Every epoch must retain the historical best, even with save=False.
             trainer.args.save = True
         trainer._project_best_checkpoint_sha256 = None
+        trainer._project_last_optimizer_attempt = -1
+        # This mirrors vendor's per-invocation last_opt_step, which always starts at -1.
+        trainer._project_vendor_last_optimizer_attempt = -1
+        trainer._project_last_processed_batch = -1
+        trainer._project_current_batch = -1
+        trainer._project_batch_index = 0
+        trainer._project_actual_accumulate = trainer.accumulate
+        trainer._project_pending_gradients = None
         if resume_state is None:
             return
         if resume_state["epoch"] != trainer.start_epoch - 1:
@@ -177,10 +376,17 @@ def attach_training_state_callbacks(
         ):
             raise ValueError("CUDA device layout changed; restore the original visible GPUs or use --fresh/new run")
         trainer._project_best_checkpoint_sha256 = require_best_checkpoint(resume_state, trainer.best)
+        accumulation = _require_accumulation_state(resume_state)
+        for name, value in _accumulation_layout(trainer).items():
+            if accumulation.get(name) != value:
+                raise ValueError(
+                    f"Resume gradient-accumulation layout changed ({name}); restore the original "
+                    "loader/batch/AMP/model/optimizer setup or use a new run directory (--name)"
+                )
         trainer.model.load_state_dict(resume_state["model"])
         trainer.optimizer.load_state_dict(resume_state["optimizer"])
         trainer.scheduler.load_state_dict(resume_state["scheduler"])
-        if trainer.scaler.is_enabled() and resume_state.get("scaler_enabled", bool(resume_state["scaler"])):
+        if trainer.scaler.is_enabled():
             trainer.scaler.load_state_dict(resume_state["scaler"])
         trainer.ema.ema.load_state_dict(resume_state["ema"])
         trainer.ema.updates = resume_state["ema_updates"]
@@ -191,11 +397,21 @@ def attach_training_state_callbacks(
         torch.set_rng_state(resume_state["torch_rng"])
         if torch.cuda.is_available() and resume_state["cuda_rng"]:
             torch.cuda.set_rng_state_all(resume_state["cuda_rng"])
+        trainer._project_last_optimizer_attempt = accumulation["last_optimizer_attempt"]
+        trainer._project_last_processed_batch = accumulation["last_processed_batch"]
+        trainer._project_actual_accumulate = accumulation["accumulate"]
+        _restore_accumulation_gate(trainer)
+        # Vendor zero_grad runs after on_train_start; restore these only at the first epoch start.
+        trainer._project_pending_gradients = {
+            name: None if gradient is None else gradient.detach().clone()
+            for name, gradient in accumulation["pending_gradients"].items()
+        }
 
     def finalize_state(trainer):
         # final_eval已核验旧best，并记录strip_optimizer合法改写后的身份。
         path = trainer.wdir / "last_training_state.pt"
         state = torch.load(path, map_location="cpu", weights_only=True)
+        require_training_history(state)
         state["best_checkpoint_sha256"] = require_best_checkpoint(
             {"best_checkpoint_sha256": trainer._project_best_checkpoint_sha256}, trainer.best
         )
@@ -209,6 +425,7 @@ def attach_training_state_callbacks(
         path = trainer.wdir / "last_training_state.pt"
         if path.is_file():
             state = torch.load(path, map_location="cpu", weights_only=True)
+            require_training_history(state)
             state.update(manual_stop=True, termination_reason="manual_stop")
             temporary = path.with_suffix(".tmp")
             torch.save(state, temporary)
@@ -218,8 +435,25 @@ def attach_training_state_callbacks(
         if stop_controller is not None and stop_controller.requested:
             mark_manual_stop(trainer)
             stop_controller.require_running()
+        trainer._project_batch_index = 0
+        trainer._project_current_batch = -1
+        _restore_accumulation_gate(trainer)
+        pending = trainer._project_pending_gradients
+        if pending is not None:
+            for name, parameter in trainer.model.named_parameters():
+                gradient = pending[name]
+                parameter.grad = None if gradient is None else gradient.to(
+                    device=parameter.device, dtype=parameter.dtype
+                ).clone()
+            trainer._project_pending_gradients = None
+
+    def finish_batch(trainer):
+        # Without warmup the next batch reuses self.accumulate, so never leave the temporary gate.
+        _restore_accumulation_gate(trainer)
 
     def before_validation(trainer):
+        # Also covers vendor's time-budget break, which can skip on_train_batch_end.
+        _restore_accumulation_gate(trainer)
         trainer._project_previous_best_fitness = trainer.best_fitness
         if stop_controller is not None and stop_controller.requested:
             trainer.args.val = True
@@ -230,6 +464,7 @@ def attach_training_state_callbacks(
             trainer.stop = True
 
     model.add_callback("on_train_epoch_start", before_epoch)
+    model.add_callback("on_train_batch_end", finish_batch)
     model.add_callback("on_train_epoch_end", before_validation)
     model.add_callback("on_fit_epoch_end", finish_epoch)
     model.add_callback("on_model_save", save_state)
@@ -245,6 +480,27 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
     from ultralytics.utils.torch_utils import de_parallel
 
     class ProjectDetectionTrainer(DetectionTrainer):
+        def preprocess_batch(self, batch):
+            batch = super().preprocess_batch(batch)
+            # Warmup has already selected the real A. Adjust only vendor's comparison gate:
+            # ni - V >= A + L - V is exactly ni - L >= A, including across invocations.
+            self._project_actual_accumulate = self.accumulate
+            self._project_current_batch = self.epoch * len(self.train_loader) + self._project_batch_index
+            self._project_batch_index += 1
+            self._project_last_processed_batch = self._project_current_batch
+            self.accumulate = (
+                self._project_actual_accumulate + self._project_last_optimizer_attempt
+                - self._project_vendor_last_optimizer_attempt
+            )
+            return batch
+
+        def optimizer_step(self):
+            _restore_accumulation_gate(self)
+            # The real vendor call preserves scaled-overflow, zero_grad and EMA behavior.
+            super().optimizer_step()
+            self._project_last_optimizer_attempt = self._project_current_batch
+            self._project_vendor_last_optimizer_attempt = self._project_current_batch
+
         def save_model(self):
             # Keep each checkpoint replacement atomic, without changing vendor state.
             last, best = self.last, self.best
@@ -294,6 +550,7 @@ def detection_trainer_for_resume(resume_state: dict | None, selection_contract: 
             state = torch.load(
                 self.wdir / "last_training_state.pt", map_location="cpu", weights_only=True
             )
+            require_training_history(state)
             if state["checkpoint_sha256"] != hashlib.sha256(self.last.read_bytes()).hexdigest():
                 raise ValueError("Final last checkpoint does not match the paired training state")
             require_best_checkpoint(state, self.best)

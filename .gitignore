@@ -71,7 +71,26 @@ secrets/
 
 _scaffold_generate.py
 
-_pytest_tmp/*
+/_pytest_tmp/
+
+# Local agent instructions, navigation and historical documentation.
+/AGENTS.md
+/MARKDOWN_INDEX.md
+/.agents/
+/.codex/
+/docs/README.md
+/docs/archive/
+
+# Ignore generated directories themselves so nested fixture rules cannot re-include them.
+/pytest-of-*/
+/workflow-policy-contracts-*/
+/artifacts/test_runs/
+/artifacts/pytest*/
+/artifacts/tests/
+/artifacts/documentation/
+/artifacts/implementation/
+/artifacts/implementation_candidates/
+/artifacts/reviews/
 
 /DEVELOPER_NOTICE.md
 

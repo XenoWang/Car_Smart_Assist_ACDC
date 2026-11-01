@@ -91,9 +91,12 @@ class BackboneL2SP:
         return self.coefficient * 0.5 * (current - self.reference_vector).square().sum()
 
 
-def write_json(path: Path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def write_json(path: Path, value, *, cfg=None, root=None):
+    path = Path(path)
+    root = Path(root).resolve() if root is not None else Path(__file__).resolve().parents[3]
     temporary = path.with_suffix(path.suffix + ".tmp")
+    require_independent_weather_reports(cfg, root, targets=(path, temporary))
+    path.parent.mkdir(parents=True, exist_ok=True)
     temporary.write_text(
         json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
@@ -263,6 +266,7 @@ def prepare_attention_datasets(cfg, root):
 
 
 def model_report(cfg, root, progress, comparison=None):
+    require_independent_weather_reports(cfg, root)
     stopping = cfg.train.get("early_stopping", {})
     stopping_text = (
         f"验证评分连续 {stopping['patience']} 轮未超过参考分数 {stopping['min_delta']:g} 时早停"
@@ -433,35 +437,78 @@ def model_report(cfg, root, progress, comparison=None):
     temporary.replace(destination)
 
 
-def require_independent_weather_reports(cfg, root):
-    """Preflight and training must preserve the deployed model's report artifacts."""
+def require_independent_weather_reports(cfg, root, *, targets=None):
+    """All report publishers preserve deployed evidence and checkpoint inputs."""
     import yaml
 
     root = Path(root).resolve()
+    protected_dirs, protected_files = [], []
+    paths = list(targets) if targets is not None else []
+    if cfg is not None:
+        evaluation = getattr(cfg, "evaluation", {})
+        if targets is None:
+            report_dir = root / cfg.report_dir
+            paths.append(report_dir)
+            for name in ("preflight.json", "progress.json", "history.json", "comparison.json"):
+                path = report_dir / name
+                paths.extend((path, path.with_suffix(path.suffix + ".tmp")))
+            paths.extend((report_dir / "test_predictions.csv", report_dir / "REPORT.md"))
+            report_file = root / cfg.report_file
+            paths.extend((report_file, report_file.with_suffix(".tmp.md")))
+            if "summary_file" in evaluation:
+                summary = (root / evaluation["summary_file"]).resolve()
+                if not summary.is_relative_to(root):
+                    raise ValueError("汇总报告须留在项目内")
+                paths.extend((summary, summary.with_suffix(".tmp.md")))
+        checkpoint_root = getattr(cfg, "checkpoint_root", None)
+        if checkpoint_root:
+            for name in ("best.pt", "last.pt", "single_best.pt", "swad.pt", "best.rollback.pt"):
+                checkpoint = root / checkpoint_root / name
+                protected_files.extend((checkpoint, checkpoint.with_suffix(".tmp")))
+        weights = getattr(cfg, "backbone", {}).get("weights_file")
+        if weights:
+            protected_files.append(root / weights)
+        protected_files.extend(
+            root / evaluation[key] for key in ("old_checkpoint", "asl_checkpoint")
+            if key in evaluation
+        )
+        protected_files.extend(
+            root / reference["checkpoint"]
+            for reference in evaluation.get("attention_references", {}).values()
+        )
+        continuation = getattr(cfg, "train", {}).get("continuation", {})
+        protected_files.extend(
+            root / continuation[key] for key in ("checkpoint", "single_best") if key in continuation
+        )
     route_path = root / "configs/model/weather_default.yaml"
-    if not route_path.exists():
-        return
-    try:
-        route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
-        if (
-            not isinstance(route, dict)
-            or set(route) != {"config", "checkpoint"}
-            or any(not isinstance(value, str) or not value.strip() for value in route.values())
+    if route_path.exists():
+        try:
+            route = yaml.safe_load(route_path.read_text(encoding="utf-8"))["weather_default"]
+            if (
+                not isinstance(route, dict)
+                or set(route) != {"config", "checkpoint"}
+                or any(not isinstance(value, str) or not value.strip() for value in route.values())
+            ):
+                raise ValueError("需要 config 和 checkpoint 两条路径")
+            deployed = load_weather_attention_config(root / route["config"])
+        except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
+            raise ValueError(f"默认天气路由或配置无效，停止写入以保护部署报告：{exc}") from exc
+        checkpoint = (root / route["checkpoint"]).resolve()
+        protected_dirs.extend((
+            root / deployed.report_dir, root / deployed.checkpoint_root, checkpoint.parent,
+        ))
+        protected_files.extend((root / deployed.report_file, checkpoint))
+    protected_dirs = {path.resolve() for path in protected_dirs}
+    protected_files = {path.resolve() for path in protected_files}
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in protected_files or any(
+            resolved.is_relative_to(directory) for directory in protected_dirs
         ):
-            raise ValueError("需要 config 和 checkpoint 两条路径")
-        deployed = load_weather_attention_config(root / route["config"])
-    except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError) as exc:
-        raise ValueError(f"默认天气路由或配置无效，停止写入以保护部署报告：{exc}") from exc
-    protected_dir = deployed.report_dir
-    protected_file = deployed.report_file
-    targets = [root / cfg.report_dir / name for name in ("preflight.json", "progress.json")]
-    targets.append(root / cfg.report_file)
-    for path in targets:
-        if (
-            protected_dir and path.resolve().is_relative_to((root / protected_dir).resolve())
-            or protected_file and path.resolve() == (root / protected_file).resolve()
-        ):
-            raise ValueError("报告输出包含受保护的默认天气运行证据；请使用独立 report_dir/report_file")
+            raise ValueError(
+                f"报告输出包含受保护的默认天气运行证据或检查点/参考资产：{resolved}；"
+                "请使用独立 report_dir/report_file/summary_file"
+            )
 
 
 def require_attention_preflight(cfg, root, split_info):
@@ -656,14 +703,14 @@ def preflight_attention(cfg, root, datasets, split_info):
         "training_started": False,
         "note": "只作效率与梯度检查，没有更新模型参数或开始正式训练。",
     }
-    write_json(root / cfg.report_dir / "preflight.json", result)
+    write_json(root / cfg.report_dir / "preflight.json", result, cfg=cfg, root=root)
     progress = {
         "status": "实现与训练前运行检查完成；等待启动",
         "epoch": 0,
         "planned_epochs": cfg.train["epochs"],
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
-    write_json(root / cfg.report_dir / "progress.json", progress)
+    write_json(root / cfg.report_dir / "progress.json", progress, cfg=cfg, root=root)
     model_report(cfg, root, progress)
     return result
 
@@ -1033,8 +1080,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 **({"early_stopping": dict(stopping_state)} if use_early_stopping else {}),
                 "updated": datetime.now().isoformat(timespec="seconds"),
             }
-            write_json(root / cfg.report_dir / "progress.json", progress)
-            write_json(root / cfg.report_dir / "history.json", history)
+            write_json(root / cfg.report_dir / "progress.json", progress, cfg=cfg, root=root)
+            write_json(root / cfg.report_dir / "history.json", history, cfg=cfg, root=root)
             model_report(cfg, root, progress)
             logger.info(
                 "attention %d/%d loss=%.6e ASL=%.6e L2-SP=%.6e score=%.4f rain-AP=%.4f fog-AP=%.4f best=%d %.1fs",
@@ -1068,7 +1115,7 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
                 "termination_reason": "manual_stop", "manual_stop": True,
                 "training_complete": last["training_complete"],
             }
-            write_json(root / cfg.report_dir / "progress.json", progress)
+            write_json(root / cfg.report_dir / "progress.json", progress, cfg=cfg, root=root)
             model_report(cfg, root, progress)
             return model.eval(), {
                 **progress, "checkpoint": str(best_path),
@@ -1153,8 +1200,10 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
 
 
 def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_controller=None):
+    root = Path(root).resolve()
     stop_controller = stop_controller or StopController(default_directory=root / cfg.checkpoint_root)
     stop_controller.require_running()
+    require_independent_weather_reports(cfg, root)
     device = select_device(cfg.device)
     selected = trained.get("selected_kind", "attention_asl")
     results = {selected: trained}
@@ -1264,7 +1313,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_c
             else {}
         ),
     }
-    write_json(root / cfg.report_dir / "comparison.json", output)
+    write_json(root / cfg.report_dir / "comparison.json", output, cfg=cfg, root=root)
     path = root / cfg.report_dir / "test_predictions.csv"
     with path.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
@@ -1312,7 +1361,7 @@ def compare_attention(cfg, root, datasets, split_info, model, trained, *, stop_c
         **({"early_stopping": trained["early_stopping"]} if "early_stopping" in trained else {}),
         "updated": datetime.now().isoformat(timespec="seconds"),
     }
-    write_json(root / cfg.report_dir / "progress.json", progress)
+    write_json(root / cfg.report_dir / "progress.json", progress, cfg=cfg, root=root)
     model_report(cfg, root, progress, output)
     if "summary_file" in cfg.evaluation:
         summary = (root / cfg.evaluation["summary_file"]).resolve()

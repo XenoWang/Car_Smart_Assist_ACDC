@@ -79,10 +79,10 @@ def test_attention_resume_restores_only_nonempty_real_scaler_state(
     monkeypatch.setattr(training.torch.amp, "GradScaler", cpu_scaler_factory)
     writer = training.write_json
 
-    def interrupt_after_checkpoint(path, value):
+    def interrupt_after_checkpoint(path, value, **kwargs):
         if path.name == "progress.json" and value.get("epoch") == 2:
             raise RuntimeError("synthetic interruption after checkpoint")
-        return writer(path, value)
+        return writer(path, value, **kwargs)
 
     monkeypatch.setattr(training, "write_json", interrupt_after_checkpoint)
     with pytest.raises(RuntimeError, match="synthetic interruption"):

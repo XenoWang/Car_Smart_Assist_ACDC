@@ -559,6 +559,7 @@ class VisibilityTrainer:
         )
         self.history = TrainHistory()
         self.calibration: CalibrationStats | None = None
+        self._calibration_model_sha256: str | None = None
         self.scaler: torch.amp.GradScaler | None = None
         self._pending_scaler_state: dict | None = None
         self._resume_train_cfg: dict[str, Any] | None = None
@@ -712,6 +713,13 @@ class VisibilityTrainer:
 
     # --- 检查点 ---
 
+    def _discard_stale_calibration(self) -> None:
+        if self.calibration is not None and (
+            _model_state_sha256(self.model.state_dict()) != self._calibration_model_sha256
+        ):
+            self.calibration = None
+            self._calibration_model_sha256 = None
+
     def _make_payload(
         self,
         epoch: int,
@@ -719,6 +727,7 @@ class VisibilityTrainer:
         sched: Any,
         val_loss: float | None,
     ) -> dict[str, Any]:
+        self._discard_stale_calibration()
         return {
             "format_version": 3,
             "best_model_sha256": self._best_model_sha256,
@@ -872,8 +881,10 @@ class VisibilityTrainer:
             logger.warning("旧检查点未保存完整随机/采样状态，无法保证中断恢复的随机轨迹一致")
 
         cal = ckpt.get("calibration")
-        if cal:
-            self.calibration = CalibrationStats(**cal)
+        self.calibration = CalibrationStats(**cal) if cal else None
+        self._calibration_model_sha256 = (
+            _model_state_sha256(self.model.state_dict()) if self.calibration is not None else None
+        )
 
         logger.info(
             "已载入检查点 %s：完成 %d 轮，历史最优验证损失 %.6f@%d",
@@ -1089,8 +1100,12 @@ class VisibilityTrainer:
                     self.model.parameters(), clip if clip > 0 else float("inf"),
                     error_if_nonfinite=not scaler.is_enabled(),
                 )
+                calibration_scale = scaler.get_scale() if self.calibration is not None else None
                 scaler.step(opt)
                 scaler.update()
+                # 只在仍有校准的短窗口核对模型；AMP 跳步不会令匹配统计失效。
+                if calibration_scale is not None and scaler.get_scale() >= calibration_scale:
+                    self._discard_stale_calibration()
                 batch_n = len(clean)
                 run.add_(loss.detach().to(torch.float64), alpha=batch_n)
                 n += batch_n
@@ -1177,6 +1192,7 @@ class VisibilityTrainer:
         logger.info("已回滚到 epoch %d 的最优权重", best_payload.get("epoch", -1))
         self.model.to(self.device).eval()
         self.calibration = self._calibrate(calib_loader)
+        self._calibration_model_sha256 = _model_state_sha256(self.model.state_dict())
         if pause_if_requested():
             return self.history
 
