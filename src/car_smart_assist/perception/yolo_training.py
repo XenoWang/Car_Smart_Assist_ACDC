@@ -365,6 +365,8 @@ def attach_training_state_callbacks(
         trainer._project_actual_accumulate = trainer.accumulate
         trainer._project_pending_gradients = None
         if resume_state is None:
+            if isinstance(stop_controller, StopController):
+                stop_controller.accept_resume()
             return
         if resume_state["epoch"] != trainer.start_epoch - 1:
             raise ValueError("Resume epoch does not match full-precision state")
@@ -406,6 +408,9 @@ def attach_training_state_callbacks(
             name: None if gradient is None else gradient.detach().clone()
             for name, gradient in accumulation["pending_gradients"].items()
         }
+
+        if isinstance(stop_controller, StopController):
+            stop_controller.accept_resume()
 
     def finalize_state(trainer):
         # final_eval已核验旧best，并记录strip_optimizer合法改写后的身份。

@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import json
 import logging
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from car_smart_assist.perception.weather_attention_training import (  # noqa: E4
 
 
 def main(argv=None, *, stop_controller=None):
+    started_ns = time.time_ns()
     parser = argparse.ArgumentParser(description="预训练属性注意力天气候选，默认恢复已有 last")
     parser.add_argument("--config", default="configs/model/weather_attention.yaml")
     modes = parser.add_mutually_exclusive_group()
@@ -62,7 +64,7 @@ def main(argv=None, *, stop_controller=None):
     except ValueError as exc:
         print(f"天气注意力训练未开始：{exc}", file=sys.stderr)
         return 2
-    with (stop_controller or StopController(args.stop_file, default_directory=root / cfg.checkpoint_root)) as controller, ExitStack() as locks:
+    with (stop_controller or StopController(args.stop_file, default_directory=root / cfg.checkpoint_root, started_ns=started_ns)) as controller, ExitStack() as locks:
         if args.stop:
             controller.request_stop_file()
             print(f"已请求轮末停止：{controller.path}")
@@ -75,7 +77,7 @@ def main(argv=None, *, stop_controller=None):
         try:
             locks.enter_context(FileLock(lock_path, timeout=0))
             if stop_controller is None and (args.fresh or args.continue_training):
-                controller.resume()
+                controller.prepare_resume()
             controller.require_running()
             if not args.preflight and cfg.train.get("swad", {}).get("enabled") and "continuation" not in cfg.train:
                 from car_smart_assist.perception.weather_extension import require_run_manifest

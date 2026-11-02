@@ -188,7 +188,7 @@ def _preflight_cli(tmp_path, monkeypatch, profile):
 
     class Controller:
         requested = False
-        def resume(self):
+        def prepare_resume(self):
             self.requested = False
         def __enter__(self):
             return self

@@ -59,6 +59,8 @@ class GateThresholds:
     use_recon_z: bool = GATE_DEFAULTS["thresholds"]["use_recon_z"]
 
     def __post_init__(self) -> None:
+        if type(self.use_recon_z) is not bool:
+            raise ValueError("use_recon_z must be a boolean")
         for name in ("info_blind", "info_degraded", "z_degraded", "z_blind"):
             value = getattr(self, name)
             if isinstance(value, bool):
@@ -84,7 +86,7 @@ class GateThresholds:
             info_degraded=float(cfg.get("info_degraded", cls.info_degraded)),
             z_degraded=float(cfg.get("z_degraded", cls.z_degraded)),
             z_blind=float(cfg.get("z_blind", cls.z_blind)),
-            use_recon_z=bool(cfg.get("use_recon_z", cls.use_recon_z)),
+            use_recon_z=cfg.get("use_recon_z", cls.use_recon_z),
         )
 
 
@@ -145,6 +147,8 @@ class VisibilityGate:
         degraded_confidence_multiplier: float = GATE_DEFAULTS["degraded_confidence_multiplier"],
     ) -> None:
         self.thresholds = thresholds or GateThresholds()
+        if type(require_calibration) is not bool:
+            raise ValueError("require_calibration must be a boolean")
         self.require_calibration = require_calibration
         self.degraded_confidence_multiplier = float(degraded_confidence_multiplier)
         if not 0.0 <= self.degraded_confidence_multiplier <= 1.0:
@@ -154,7 +158,7 @@ class VisibilityGate:
     def from_config(cls, cfg: dict[str, Any]) -> VisibilityGate:
         return cls(
             thresholds=GateThresholds.from_config(cfg.get("thresholds", {})),
-            require_calibration=bool(cfg.get("require_calibration", GATE_DEFAULTS["require_calibration"])),
+            require_calibration=cfg.get("require_calibration", GATE_DEFAULTS["require_calibration"]),
             degraded_confidence_multiplier=float(
                 cfg.get("degraded_confidence_multiplier", GATE_DEFAULTS["degraded_confidence_multiplier"])
             ),

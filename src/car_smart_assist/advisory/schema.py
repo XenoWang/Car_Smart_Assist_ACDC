@@ -2,9 +2,27 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from math import isfinite
+from numbers import Real
 from typing import Any
+
+
+def _json_value(value):
+    """Serialize invalid diagnostics as null without changing policy inputs."""
+    if isinstance(value, Enum):
+        return _json_value(value.value)
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, Real):
+        return float(value) if isfinite(value) else None
+    if isinstance(value, Mapping):
+        return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(item) for item in value]
+    return None
 
 
 class RiskLevel(str, Enum):
@@ -44,9 +62,18 @@ class TargetObject:
     confidence: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
-        d = asdict(self)
-        d["direction"] = self.direction.value
-        return d
+        try:
+            direction = TargetDirection(self.direction).value
+        except (TypeError, ValueError):
+            direction = TargetDirection.UNKNOWN.value
+        return _json_value({
+            "category": self.category,
+            "direction": direction,
+            "distance_m": self.distance_m,
+            "distance_uncertainty_m": self.distance_uncertainty_m,
+            "bbox": self.bbox,
+            "confidence": self.confidence,
+        })
 
 
 @dataclass
@@ -84,21 +111,22 @@ class PerceptionResult:
     road_obstacle_detection_available: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        return _json_value({
             "visibility_level": self.visibility_level,
             "visibility_confidence_multiplier": self.visibility_confidence_multiplier,
-            "visibility_reasons": list(self.visibility_reasons),
+            "visibility_reasons": self.visibility_reasons,
             "road_condition": self.road_condition,
             "road_condition_confidence": self.road_condition_confidence,
-            "weather_attributes": list(self.weather_attributes),
-            "weather_probabilities": dict(self.weather_probabilities),
+            "weather_attributes": self.weather_attributes,
+            "weather_probabilities": self.weather_probabilities,
             "handover_level": self.handover_level,
             "handover_confidence": self.handover_confidence,
-            "objects": [o.to_dict() for o in self.objects],
+            "objects": [o.to_dict() if isinstance(o, TargetObject) else None for o in self.objects]
+            if isinstance(self.objects, (list, tuple)) else None,
             "object_detection_available": self.object_detection_available,
-            "object_detection_classes": list(self.object_detection_classes),
+            "object_detection_classes": self.object_detection_classes,
             "road_obstacle_detection_available": self.road_obstacle_detection_available,
-        }
+        })
 
     def effective_confidence(self, raw: float) -> float:
         """保留门控折减值的兼容计算，不用于规则的原始置信度门槛。"""

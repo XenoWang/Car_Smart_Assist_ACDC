@@ -7,6 +7,7 @@ from contextlib import ExitStack
 import json
 import logging
 import sys
+import time
 from pathlib import Path
 
 from filelock import FileLock, Timeout
@@ -51,6 +52,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    started_ns = time.time_ns()
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
@@ -75,7 +77,7 @@ def main() -> int:
         cfg["device"] = args.device
 
     directory = root / cfg.get("train", {}).get("checkpoint_dir", "artifacts/checkpoints/visibility")
-    with StopController(args.stop_file, default_directory=directory) as controller, ExitStack() as locks:
+    with StopController(args.stop_file, default_directory=directory, started_ns=started_ns) as controller, ExitStack() as locks:
         if args.stop:
             controller.request_stop_file()
             print(f"已请求轮末停止：{controller.path}")
@@ -87,7 +89,7 @@ def main() -> int:
             logging.getLogger(__name__).error("已有能见度训练占用此输出目录")
             return 2
         if args.fresh or args.continue_training:
-            controller.resume()
+            controller.prepare_resume()
         controller.require_running()
         try:
             if args.fresh:

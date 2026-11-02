@@ -511,6 +511,7 @@ def reference_split_signature(paths, acdc_root, size, groups, train_idx, val_idx
                 p.relative_to(acdc_root).as_posix(),
                 p.stat().st_size,
                 p.stat().st_mtime_ns,
+                _file_sha256(p),
             )
             for p in paths
         ],

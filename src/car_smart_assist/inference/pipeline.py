@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import deepcopy
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -418,6 +419,7 @@ class InferencePipeline:
                         "predictor.predict() 必须返回 PerceptionResult，"
                         f"实际为 {type(perception).__name__}"
                     )
+                perception = deepcopy(perception)
                 if r.visibility is not None:
                     perception.visibility_level = r.visibility.level.value
                     perception.visibility_confidence_multiplier = r.visibility.confidence_multiplier

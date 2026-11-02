@@ -1074,6 +1074,8 @@ class VisibilityTrainer:
         elapsed_before = self.history.seconds
         since_best = self._since_best
         remaining = () if completed_stage else range(start_epoch + 1, epochs + 1)
+        if isinstance(stop_controller, StopController):
+            stop_controller.accept_resume()
         for epoch in remaining:
             if stop_controller.requested:
                 break

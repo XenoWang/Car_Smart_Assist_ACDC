@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -234,6 +235,7 @@ def archive_checkpoints(run, *, clear=False):
 
 
 def main() -> int:
+    started_ns = time.time_ns()
     parser = argparse.ArgumentParser(description="Fixed-seed ACDC YOLO training")
     parser.add_argument("--config", default="configs/model/yolo_detection.yaml")
     parser.add_argument("--joint-data-config", default=None, help="Explicit current joint data roots for read-only relocation")
@@ -269,7 +271,7 @@ def main() -> int:
                 raise ValueError("Unknown YOLO train keys: " + ", ".join(sorted(map(str, unknown))))
         project = root / cfg["project"]
         run = project / name
-        with StopController(args.stop_file, default_directory=run / "weights") as controller, ExitStack() as locks:
+        with StopController(args.stop_file, default_directory=run / "weights", started_ns=started_ns) as controller, ExitStack() as locks:
             if args.stop:
                 controller.request_stop_file()
                 print(f"Stop requested: {controller.path}")
@@ -277,7 +279,7 @@ def main() -> int:
             run.mkdir(parents=True, exist_ok=True)
             locks.enter_context(FileLock(str((run / "run.lock").resolve()), timeout=0))
             if args.fresh or args.continue_training:
-                controller.resume()
+                controller.prepare_resume()
             controller.require_running()
             data, manifest, counts = locks.enter_context(detection_data_scope(
                 root, cfg["data"],
@@ -325,6 +327,7 @@ def main() -> int:
                     checkpoint_sha256=state["checkpoint_sha256"],
                     training_segment=plan["training_segment"],
                 )
+                controller.accept_resume()
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
                 return STOP_EXIT_CODE if controller.requested else 0
             run.mkdir(parents=True, exist_ok=True)

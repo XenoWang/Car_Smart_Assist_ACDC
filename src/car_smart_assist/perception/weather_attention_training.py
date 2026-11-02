@@ -10,6 +10,7 @@ import math
 import shutil
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
@@ -539,8 +540,21 @@ def require_attention_preflight(cfg, root, split_info):
     return profile
 
 
+def _bf16_supported(device):
+    # PyTorch queries the current GPU; restore the caller's context afterward.
+    with torch.cuda.device(device):
+        return torch.cuda.is_bf16_supported()
+
+
 def preflight_attention(cfg, root, datasets, split_info):
     require_independent_weather_reports(cfg, root)
+    device = select_device(cfg.device)
+    # Shared benchmark helpers use the current CUDA device for their GPU probe.
+    with torch.cuda.device(device) if device.type == "cuda" else nullcontext():
+        return _preflight_attention(cfg, root, datasets, split_info)
+
+
+def _preflight_attention(cfg, root, datasets, split_info):
     device = select_device(cfg.device)
     weights = ensure_pretrained_weights(cfg, root)
     model = WeatherAttention(cfg, weights).to(device)
@@ -570,7 +584,7 @@ def preflight_attention(cfg, root, datasets, split_info):
         times = []
         for _ in range(5):
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             started = time.perf_counter()
             if name == "vector":
                 transferred = torch.from_numpy(
@@ -586,7 +600,7 @@ def preflight_attention(cfg, root, datasets, split_info):
             else:
                 transferred = batch_images(ds, indices, device, cfg)
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             times.append(time.perf_counter() - started)
         transfer[name] = float(np.median(times) * 1000)
     image = batch_images(ds, slice(0, 1), device, cfg)
@@ -634,11 +648,11 @@ def preflight_attention(cfg, root, datasets, split_info):
     mask = torch.from_numpy(ds.mask[indices]).to(device)
     dtype = (
         torch.bfloat16
-        if device.type == "cuda" and torch.cuda.is_bf16_supported()
+        if device.type == "cuda" and _bf16_supported(device)
         else torch.float16
     )
     if device.type == "cuda":
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
     regularizer = BackboneL2SP(model, cfg.train["l2_sp"]) if cfg.train.get("l2_sp", 0) else None
     training_probe_times = []
     for _ in range(3):
@@ -655,7 +669,7 @@ def preflight_attention(cfg, root, datasets, split_info):
             model.parameters(), cfg.train["gradient_clip"], error_if_nonfinite=True
         )
         if device.type == "cuda":
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device)
         training_probe_times.append(time.perf_counter() - training_probe_started)
     training_probe_seconds = float(np.median(training_probe_times[1:]))
     if logits.shape != (len(indices), 4) or not torch.isfinite(loss):
@@ -666,11 +680,11 @@ def preflight_attention(cfg, root, datasets, split_info):
         times = []
         for _ in range(6):
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             tick = time.perf_counter()
             tracker.update(cfg.train["swad"]["start_epoch"])
             if device.type == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
             times.append(time.perf_counter() - tick)
         swad_profile = {"swad_dense_update_ms": float(np.median(times[1:]) * 1000)}
     result = {
@@ -866,7 +880,7 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
             weight_decay=cfg.train["weight_decay"],
         )
         amp = device.type == "cuda" and cfg.train["amp"]
-        dtype = torch.bfloat16 if amp and torch.cuda.is_bf16_supported() else torch.float16
+        dtype = torch.bfloat16 if amp and _bf16_supported(device) else torch.float16
         scaler = torch.amp.GradScaler("cuda", enabled=amp and dtype == torch.float16)
         generator = torch.Generator().manual_seed(cfg.data["seed"])
         epoch, best_epoch, best_score, history, elapsed_before = 0, 0, -1.0, [], 0.0
@@ -931,6 +945,8 @@ def _train_attention(cfg, root, datasets, split_info, *, fresh, stop_controller,
         )
         completed_stage = continue_only and own_resume and bool(payload.get("training_complete"))
         remaining = () if stopping_state["stopped"] or completed_stage else range(epoch + 1, cfg.train["epochs"] + 1)
+        if isinstance(stop_controller, StopController):
+            stop_controller.accept_resume()
         for current in remaining:
             if stop_controller.requested:
                 break
