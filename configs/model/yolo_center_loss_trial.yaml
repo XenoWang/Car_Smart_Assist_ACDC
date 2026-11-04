@@ -1,0 +1,53 @@
+yolo_detection:
+  model: artifacts/runs/detection/yolo11n_acdc_laf/weights/best.pt
+  data: data/processed/acdc_lost_and_found_yolo/data.yaml
+  project: artifacts/runs/detection
+  name: yolo11n_center_loss_trial
+  device: auto
+  checkpoint: artifacts/runs/detection/yolo11n_center_loss_trial/weights/best.pt
+  calibration_file: artifacts/reports/detection/yolo11n_center_loss_trial/calibration.json
+  inference:
+    imgsz: 960
+    confidence: 0.25
+    iou: 0.5
+    max_det: 100
+    obstacle_class: road_obstacle
+  train:
+    epochs: 8
+    resume_extra_epochs: null
+    patience: 4
+    seed: 42
+    deterministic: true
+    imgsz: 960
+    batch: 4
+    workers: 2
+    amp: true
+    cache: false
+    optimizer: AdamW
+    lr0: 0.0002
+    warmup_bias_lr: 0.0
+    warmup_epochs: 3.0
+    weight_decay: 0.0005
+    mosaic: 0.0
+    close_mosaic: 5
+    mixup: 0.0
+    plots: true
+    copy_paste: 0.0
+    cutmix: 0.0
+    degrees: 0.0
+    translate: 0.0
+    scale: 0.0
+    shear: 0.0
+    perspective: 0.0
+    fliplr: 0.0
+    flipud: 0.0
+    multi_scale: false
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+  enabled_for_inference: false
+  joint_foreground_exclusive: true
+  center_loss:
+    enabled: true
+    weight: 0.1
+    normalization: train_mean_sqrt_area

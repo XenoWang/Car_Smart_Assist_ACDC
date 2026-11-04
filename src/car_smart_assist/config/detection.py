@@ -22,6 +22,26 @@ YOLO_MAX_WH = 7680
 YOLO_AGNOSTIC_NMS = False
 
 
+def center_loss_config(options):
+    """Normalize the project-owned optional loss; never forward it to vendor args."""
+    if not isinstance(options, dict) or set(options) - {"enabled", "weight", "normalization"}:
+        raise ValueError("center_loss requires only enabled, weight and normalization")
+    enabled = options.get("enabled", False)
+    weight = options.get("weight", 0.1)
+    if type(enabled) is not bool:
+        raise ValueError("center_loss.enabled must be boolean")
+    try:
+        valid = type(weight) in (int, float) and math.isfinite(weight) and weight >= 0
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise ValueError("center_loss.weight must be finite and non-negative")
+    normalization = options.get("normalization", "train_mean_sqrt_area")
+    if normalization != "train_mean_sqrt_area":
+        raise ValueError("center_loss.normalization must be train_mean_sqrt_area")
+    return {"enabled": True, "weight": float(weight), "normalization": normalization} if enabled else {"enabled": False}
+
+
 def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
@@ -89,6 +109,8 @@ def load_yolo_config(path: Path) -> dict[str, Any]:
         if extra is not None and (type(extra) is not int or extra <= 0):
             raise ValueError("YOLO resume_extra_epochs must be null or a positive integer")
         inference = cfg["inference"]
+        if "center_loss" in cfg:
+            cfg["center_loss"] = center_loss_config(cfg["center_loss"])
         for name in ("imgsz", "max_det"):
             if type(inference[name]) is not int or inference[name] <= 0:
                 raise ValueError(f"YOLO inference {name} must be a positive integer")

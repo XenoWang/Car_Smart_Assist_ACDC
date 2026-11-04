@@ -1,0 +1,788 @@
+{
+  "output_dir": "papers",
+  "since_year": 2016,
+  "limit": 20,
+  "candidates_per_topic": 40,
+  "request_interval_seconds": 3.2,
+  "timeout_seconds": 60,
+  "max_pdf_mb": 60,
+  "max_pages": 80,
+  "ocr_languages": [
+    "eng"
+  ],
+  "ocr_dpi": 150,
+  "image_dpi": 120,
+  "tessdata_dir": "artifacts/paper_crawler/tessdata",
+  "categories": [
+    "cs.CV",
+    "cs.LG",
+    "cs.AI",
+    "cs.RO",
+    "eess.IV"
+  ],
+  "seed_papers": [],
+  "topics": [
+    {
+      "id": "visibility",
+      "description": "能见度与任务相关图像质量：对应信息量门控、低照/模糊/遮挡失效及AE诊断，不把重建误差直接等同退化强度。",
+      "weight": 5,
+      "contexts": [
+        "visibility",
+        "image quality",
+        "no reference",
+        "degradation",
+        "fog",
+        "haze",
+        "low light",
+        "blur",
+        "driving scene"
+      ],
+      "terms": [
+        "image quality assessment",
+        "quality assessment",
+        "visibility estimation",
+        "fog density",
+        "information entropy",
+        "autoencoder",
+        "task oriented",
+        "perceptual quality",
+        "image degradation",
+        "ranking",
+        "quality ranking",
+        "contrast",
+        "exposure",
+        "sharpness"
+      ],
+      "boosts": [
+        "adverse weather",
+        "autonomous driving",
+        "contrast",
+        "blur",
+        "occlusion",
+        "low light",
+        "driving scene",
+        "no reference"
+      ]
+    },
+    {
+      "id": "weather",
+      "description": "雨雾雪夜可共存的多标签识别：对应A85、MobileNetV3、属性注意力、缺标与来源不均衡。",
+      "weight": 5,
+      "contexts": [
+        "weather",
+        "adverse conditions",
+        "driving",
+        "rain",
+        "fog",
+        "snow",
+        "night",
+        "road scene"
+      ],
+      "terms": [
+        "multi label",
+        "weather recognition",
+        "weather classification",
+        "attribute attention",
+        "asymmetric loss",
+        "partial label",
+        "label noise",
+        "class imbalance",
+        "long tailed",
+        "scene understanding",
+        "attribute prediction",
+        "missing labels",
+        "positive unlabeled",
+        "label co occurrence"
+      ],
+      "boosts": [
+        "rain",
+        "fog",
+        "snow",
+        "night",
+        "mobilenet",
+        "attention",
+        "class imbalance",
+        "ACDC",
+        "multi label"
+      ]
+    },
+    {
+      "id": "adverse_detection",
+      "description": "雨雾雪夜下的道路目标检测：对应联合YOLO的八类交通目标和小目标召回，兼顾精度与实际时延。",
+      "weight": 5,
+      "contexts": [
+        "driving",
+        "road",
+        "traffic",
+        "ACDC",
+        "autonomous driving",
+        "nighttime",
+        "pedestrian"
+      ],
+      "terms": [
+        "object detection",
+        "detector",
+        "small object",
+        "adverse weather",
+        "nighttime detection",
+        "robust detection",
+        "pedestrian detection",
+        "domain adaptive detection",
+        "traffic sign recognition"
+      ],
+      "boosts": [
+        "fog",
+        "rain",
+        "snow",
+        "low light",
+        "pedestrian",
+        "cyclist",
+        "vehicle",
+        "real time"
+      ]
+    },
+    {
+      "id": "road_anomalies",
+      "description": "道路杂物与未知障碍：对应第九类road_obstacle、Lost & Found稀疏ROI监督，区分开放集异常与普通九类检测。",
+      "weight": 6,
+      "contexts": [
+        "road",
+        "driving",
+        "traffic",
+        "anomaly",
+        "open set",
+        "obstacle",
+        "Lost and Found",
+        "Fishyscapes",
+        "SegmentMeIfYouCan",
+        "out of distribution"
+      ],
+      "terms": [
+        "anomaly detection",
+        "anomaly segmentation",
+        "obstacle detection",
+        "road obstacle",
+        "road debris",
+        "unknown object",
+        "open set",
+        "out of distribution",
+        "outlier detection",
+        "unknown obstacle",
+        "semantic anomaly"
+      ],
+      "boosts": [
+        "small obstacle",
+        "sparse annotation",
+        "region of interest",
+        "Fishyscapes",
+        "SegmentMeIfYouCan",
+        "Lost and Found"
+      ]
+    },
+    {
+      "id": "domain_generalization",
+      "description": "跨天气、相机与数据来源泛化：对应ACDC/PAB雨属性差异、录制族划分与域偏移，不把开发集改进等同真实泛化。",
+      "weight": 4,
+      "contexts": [
+        "driving",
+        "weather",
+        "road",
+        "ACDC",
+        "object detection",
+        "semantic segmentation",
+        "cross domain"
+      ],
+      "terms": [
+        "domain generalization",
+        "domain adaptation",
+        "distribution shift",
+        "group distributionally robust",
+        "test time adaptation",
+        "corruption robustness",
+        "source free",
+        "invariant representation",
+        "style transfer",
+        "cross domain",
+        "domain gap"
+      ],
+      "boosts": [
+        "adverse weather",
+        "multi label",
+        "camera",
+        "cross domain",
+        "night",
+        "fog",
+        "rain"
+      ]
+    },
+    {
+      "id": "efficient_detection",
+      "description": "轻量检测与车端部署：对应YOLO11n、MobileNetV3、剪枝/蒸馏/量化，重视端到端延迟和小障碍精度。",
+      "weight": 3,
+      "contexts": [
+        "object detection",
+        "YOLO",
+        "MobileNet",
+        "driving",
+        "detector",
+        "real time"
+      ],
+      "terms": [
+        "pruning",
+        "knowledge distillation",
+        "quantization",
+        "latency",
+        "real time",
+        "lightweight",
+        "TensorRT",
+        "edge deployment",
+        "computational cost",
+        "FLOPs"
+      ],
+      "boosts": [
+        "small object",
+        "adverse weather",
+        "structural pruning",
+        "DepGraph",
+        "focal and global",
+        "end to end",
+        "embedded"
+      ]
+    },
+    {
+      "id": "reliability",
+      "description": "感知可信度与失效检测：对应逐类校准、门控优先、风险证据与保守接管，不扩展为车辆控制。",
+      "weight": 4,
+      "contexts": [
+        "object detection",
+        "driving",
+        "road",
+        "weather",
+        "visibility",
+        "perception",
+        "autonomous driving"
+      ],
+      "terms": [
+        "confidence calibration",
+        "uncertainty estimation",
+        "selective prediction",
+        "failure detection",
+        "risk coverage",
+        "out of distribution",
+        "sensor degradation",
+        "conformal prediction",
+        "abstention",
+        "predictive uncertainty"
+      ],
+      "boosts": [
+        "safety",
+        "adverse weather",
+        "miscalibration",
+        "abstention",
+        "camera",
+        "robustness"
+      ]
+    },
+    {
+      "id": "detection_accuracy",
+      "description": "通用目标检测精度：覆盖可迁移到YOLO11n的标签分配、特征融合、多尺度、小目标与损失改进，不要求论文同时涉及道路或天气。",
+      "weight": 5,
+      "contexts": [
+        "object detection",
+        "YOLO",
+        "one stage detector",
+        "detection network",
+        "real time detection",
+        "detector"
+      ],
+      "terms": [
+        "small object",
+        "multi scale",
+        "feature fusion",
+        "feature pyramid",
+        "label assignment",
+        "localization",
+        "loss function",
+        "attention",
+        "data augmentation",
+        "knowledge distillation",
+        "neck",
+        "detection head",
+        "non maximum suppression",
+        "anchor free",
+        "query based detection",
+        "quality aware",
+        "task alignment",
+        "varifocal loss",
+        "distribution focal loss",
+        "positive sample"
+      ],
+      "boosts": [
+        "YOLO11",
+        "C3k2",
+        "C2PSA",
+        "road",
+        "adverse weather",
+        "real time",
+        "small object"
+      ]
+    },
+    {
+      "id": "classification_accuracy",
+      "description": "通用轻量分类和多标签精度：面向MobileNetV3与属性注意力，关注类别不均衡、缺标、噪声标签和特征表达，不要求天气场景。",
+      "weight": 5,
+      "contexts": [
+        "image classification",
+        "multi label classification",
+        "MobileNet",
+        "lightweight convolutional",
+        "convolutional neural network",
+        "vision transformer",
+        "multi label",
+        "feature fusion"
+      ],
+      "terms": [
+        "class imbalance",
+        "long tailed",
+        "partial label",
+        "noisy label",
+        "attention",
+        "feature fusion",
+        "asymmetric loss",
+        "knowledge distillation",
+        "mixup",
+        "cutmix",
+        "calibration",
+        "metric learning",
+        "transfer learning",
+        "prompt tuning",
+        "single positive",
+        "missing labels",
+        "feature decoupling"
+      ],
+      "boosts": [
+        "MobileNetV3",
+        "weather",
+        "attribute attention",
+        "multi label",
+        "rare class",
+        "domain shift",
+        "lightweight"
+      ]
+    },
+    {
+      "id": "autoencoder_quality",
+      "description": "自编码器与图像质量的通用优化：关注多尺度表征、排序、自监督与任务相关质量；重建误差降低不直接视为门控精度提高。",
+      "weight": 4,
+      "contexts": [
+        "autoencoder",
+        "image quality assessment",
+        "denoising",
+        "representation learning",
+        "reconstruction",
+        "latent space"
+      ],
+      "terms": [
+        "self supervised",
+        "contrastive learning",
+        "ranking",
+        "robustness",
+        "anomaly detection",
+        "information bottleneck",
+        "multi scale",
+        "perceptual loss",
+        "lightweight",
+        "feature reconstruction",
+        "masked image modeling",
+        "distortion manifold",
+        "localized degradation",
+        "task aware quality"
+      ],
+      "boosts": [
+        "no reference",
+        "visibility",
+        "image degradation",
+        "multiscale",
+        "ranking learning",
+        "monocular",
+        "real time"
+      ]
+    },
+    {
+      "id": "model_compression",
+      "description": "视觉模型压缩与精度保持：覆盖CNN、MobileNet、自编码器和可迁移的视觉注意力方法，检索结构化剪枝、蒸馏、量化与重参数化。",
+      "weight": 4,
+      "contexts": [
+        "object detection",
+        "image classification",
+        "MobileNet",
+        "convolutional neural network",
+        "convolutional neural networks",
+        "vision transformer",
+        "autoencoder",
+        "network compression",
+        "model efficiency"
+      ],
+      "terms": [
+        "structural pruning",
+        "structured pruning",
+        "channel pruning",
+        "knowledge distillation",
+        "post training quantization",
+        "quantization aware training",
+        "mixed precision",
+        "low rank",
+        "reparameterization",
+        "network slimming",
+        "lottery ticket",
+        "sparse training"
+      ],
+      "boosts": [
+        "latency",
+        "small object",
+        "YOLO",
+        "MobileNetV3",
+        "PyTorch",
+        "accuracy",
+        "quantization error",
+        "adverse weather"
+      ]
+    },
+    {
+      "id": "inference_acceleration",
+      "description": "视觉推理工程提速：关注与PyTorch/CUDA、ONNX Runtime、TensorRT相关的融合、图优化、批处理、低精度与端到端延迟；检索不代表这些后端已经接入。",
+      "weight": 4,
+      "contexts": [
+        "object detection",
+        "image classification",
+        "convolutional neural network",
+        "vision transformer",
+        "MobileNet",
+        "YOLO",
+        "TensorRT",
+        "ONNX Runtime",
+        "edge device",
+        "real time inference"
+      ],
+      "terms": [
+        "inference optimization",
+        "inference acceleration",
+        "operator fusion",
+        "kernel fusion",
+        "graph optimization",
+        "memory bandwidth",
+        "TensorRT",
+        "ONNX Runtime",
+        "torch compile",
+        "CUDA graph",
+        "quantization",
+        "batching",
+        "mixed precision",
+        "FP16",
+        "INT8",
+        "latency",
+        "throughput",
+        "compiler"
+      ],
+      "boosts": [
+        "end to end latency",
+        "throughput",
+        "GPU",
+        "real time",
+        "edge device",
+        "efficient inference",
+        "YOLO",
+        "MobileNetV3"
+      ]
+    },
+    {
+      "id": "backbone_architecture",
+      "description": "主干与算子设计：面向MobileNetV3/YOLO11n这类轻量网络的模块、注意力、重参数化与多尺度融合，属可直接替换的架构改进。",
+      "weight": 4,
+      "contexts": [
+        "backbone",
+        "neural architecture search",
+        "vision transformer",
+        "convolutional neural network",
+        "efficient network",
+        "attention module",
+        "feature fusion"
+      ],
+      "terms": [
+        "depthwise convolution",
+        "inverted residual",
+        "squeeze and excitation",
+        "reparameterization",
+        "multi scale feature",
+        "attention mechanism",
+        "network design",
+        "lightweight block",
+        "convolutional block",
+        "feature aggregation"
+      ],
+      "boosts": [
+        "MobileNet",
+        "YOLO",
+        "lightweight",
+        "real time",
+        "small object",
+        "detection head"
+      ]
+    },
+    {
+      "id": "training_strategy",
+      "description": "训练与优化策略：适用于当前YOLO/天气/门控训练的增广、采样、损失与自监督手段，不绑定具体任务。",
+      "weight": 3,
+      "contexts": [
+        "object detection",
+        "image classification",
+        "semi supervised",
+        "self supervised",
+        "knowledge distillation",
+        "data augmentation",
+        "long tailed"
+      ],
+      "terms": [
+        "data augmentation",
+        "mixed sample",
+        "label smoothing",
+        "self training",
+        "semi supervised",
+        "knowledge distillation",
+        "curriculum learning",
+        "learning rate schedule",
+        "sharpness aware minimization",
+        "contrastive pretraining",
+        "pseudo labeling",
+        "flat minima",
+        "multi objective optimization"
+      ],
+      "boosts": [
+        "small dataset",
+        "label noise",
+        "long tailed",
+        "few shot",
+        "adverse weather"
+      ]
+    },
+    {
+      "id": "adverse_robustness",
+      "description": "恶劣条件鲁棒性：雨雾雪夜退化本身的研究（去雾/去雨/低照增强）及其对下游检测的影响，对应门控与联合检测的输入侧。",
+      "weight": 5,
+      "contexts": [
+        "adverse weather",
+        "rain",
+        "fog",
+        "snow",
+        "low light",
+        "night",
+        "corruption",
+        "degradation"
+      ],
+      "terms": [
+        "robustness",
+        "domain shift",
+        "image restoration",
+        "dehazing",
+        "deraining",
+        "low light enhancement",
+        "deweathering",
+        "sensor noise",
+        "visibility enhancement",
+        "contrast enhancement"
+      ],
+      "boosts": [
+        "object detection",
+        "driving",
+        "ACDC",
+        "real time",
+        "small object",
+        "semantic segmentation"
+      ]
+    }
+  ],
+  "allowed_pdf_hosts": [
+    "arxiv.org",
+    "www.arxiv.org",
+    "export.arxiv.org",
+    "openaccess.thecvf.com",
+    "proceedings.mlr.press",
+    "papers.neurips.cc",
+    "proceedings.neurips.cc",
+    "openreview.net"
+  ],
+  "open_access_papers": [
+    {
+      "arxiv_id": "oa-asl",
+      "title": "Asymmetric Loss for Multi-Label Classification",
+      "abstract": "Search keywords (not an author abstract): multi label classification asymmetric loss class imbalance partial label",
+      "authors": [],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "weather"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/ICCV2021/papers/Ridnik_Asymmetric_Loss_for_Multi-Label_Classification_ICCV_2021_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/ICCV2021/html/Ridnik_Asymmetric_Loss_for_Multi-Label_Classification_ICCV_2021_paper.html",
+      "arxiv_alias": "2009.14119"
+    },
+    {
+      "arxiv_id": "oa-single-positive",
+      "title": "Multi-Label Learning From Single Positive Labels",
+      "abstract": "Search keywords (not an author abstract): multi label classification partial label missing labels class imbalance",
+      "authors": [],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "weather"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/CVPR2021/papers/Cole_Multi-Label_Learning_From_Single_Positive_Labels_CVPR_2021_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/CVPR2021/html/Cole_Multi-Label_Learning_From_Single_Positive_Labels_CVPR_2021_paper.html",
+      "arxiv_alias": "2106.09708"
+    },
+    {
+      "arxiv_id": "oa-large-loss",
+      "title": "Large Loss Matters in Weakly Supervised Multi-Label Classification",
+      "abstract": "Search keywords (not an author abstract): multi label classification noisy label partial label regularization",
+      "authors": [],
+      "published": "2022",
+      "updated": "2022",
+      "categories": [
+        "weather"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/CVPR2022/papers/Kim_Large_Loss_Matters_in_Weakly_Supervised_Multi-Label_Classification_CVPR_2022_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/CVPR2022/html/Kim_Large_Loss_Matters_in_Weakly_Supervised_Multi-Label_Classification_CVPR_2022_paper.html",
+      "arxiv_alias": ""
+    },
+    {
+      "arxiv_id": "oa-arniqa",
+      "title": "ARNIQA: Learning Distortion Manifold for Image Quality Assessment",
+      "abstract": "Search keywords (not an author abstract): image quality assessment self supervised contrastive learning degradation",
+      "authors": [],
+      "published": "2024",
+      "updated": "2024",
+      "categories": [
+        "visibility"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/WACV2024/papers/Agnolucci_ARNIQA_Learning_Distortion_Manifold_for_Image_Quality_Assessment_WACV_2024_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/WACV2024/html/Agnolucci_ARNIQA_Learning_Distortion_Manifold_for_Image_Quality_Assessment_WACV_2024_paper.html",
+      "arxiv_alias": "2310.14918"
+    },
+    {
+      "arxiv_id": "oa-varifocalnet",
+      "title": "VarifocalNet: An IoU-Aware Dense Object Detector",
+      "abstract": "Search keywords (not an author abstract): object detection localization loss function confidence calibration label assignment",
+      "authors": [],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "detection_accuracy"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/CVPR2021/papers/Zhang_VarifocalNet_An_IoU-Aware_Dense_Object_Detector_CVPR_2021_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/CVPR2021/html/Zhang_VarifocalNet_An_IoU-Aware_Dense_Object_Detector_CVPR_2021_paper.html",
+      "arxiv_alias": ""
+    },
+    {
+      "arxiv_id": "oa-tood",
+      "title": "TOOD: Task-Aligned One-Stage Object Detection",
+      "abstract": "Search keywords (not an author abstract): object detection label assignment localization loss function detection head",
+      "authors": [],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "detection_accuracy"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/ICCV2021/papers/Feng_TOOD_Task-Aligned_One-Stage_Object_Detection_ICCV_2021_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/ICCV2021/html/Feng_TOOD_Task-Aligned_One-Stage_Object_Detection_ICCV_2021_paper.html",
+      "arxiv_alias": "2108.07755"
+    },
+    {
+      "arxiv_id": "oa-fgd",
+      "title": "Focal and Global Knowledge Distillation for Detectors",
+      "abstract": "Search keywords (not an author abstract): object detection knowledge distillation feature fusion foreground background small object",
+      "authors": [],
+      "published": "2022",
+      "updated": "2022",
+      "categories": [
+        "detection_accuracy"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/CVPR2022/papers/Yang_Focal_and_Global_Knowledge_Distillation_for_Detectors_CVPR_2022_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/CVPR2022/html/Yang_Focal_and_Global_Knowledge_Distillation_for_Detectors_CVPR_2022_paper.html",
+      "arxiv_alias": "2111.11837"
+    },
+    {
+      "arxiv_id": "oa-deim",
+      "title": "DEIM: DETR with Improved Matching for Fast Convergence",
+      "abstract": "Search keywords (not an author abstract): object detection label assignment loss function data augmentation query based detection",
+      "authors": [],
+      "published": "2025",
+      "updated": "2025",
+      "categories": [
+        "detection_accuracy"
+      ],
+      "source": "cvf",
+      "source_pdf_url": "https://openaccess.thecvf.com/content/CVPR2025/papers/Huang_DEIM_DETR_with_Improved_Matching_for_Fast_Convergence_CVPR_2025_paper.pdf",
+      "source_page_url": "https://openaccess.thecvf.com/content/CVPR2025/html/Huang_DEIM_DETR_with_Improved_Matching_for_Fast_Convergence_CVPR_2025_paper.html",
+      "arxiv_alias": ""
+    },
+    {
+      "arxiv_id": "oa-musiq",
+      "title": "MUSIQ: Multi-scale Image Quality Transformer",
+      "abstract": "Search keywords (not an author abstract): image quality assessment multi scale perceptual quality vision transformer",
+      "authors": [],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "visibility"
+      ],
+      "source": "arxiv-open-copy",
+      "source_pdf_url": "https://arxiv.org/pdf/2108.05997",
+      "source_page_url": "https://arxiv.org/abs/2108.05997",
+      "arxiv_alias": "2108.05997"
+    },
+    {
+      "arxiv_id": "oa-asam",
+      "title": "ASAM: Adaptive Sharpness-Aware Minimization for Scale-Invariant Learning of Deep Neural Networks",
+      "abstract": "Search keywords (not an author abstract): image classification sharpness aware minimization robustness domain generalization",
+      "authors": [
+        "Jungmin Kwon",
+        "Jeongseop Kim",
+        "Hyunseo Park",
+        "In Kwon Choi"
+      ],
+      "published": "2021",
+      "updated": "2021",
+      "categories": [
+        "training_strategy"
+      ],
+      "source": "pmlr",
+      "source_pdf_url": "https://proceedings.mlr.press/v139/kwon21b/kwon21b.pdf",
+      "source_page_url": "https://proceedings.mlr.press/v139/kwon21b.html",
+      "arxiv_alias": "2102.11600"
+    },
+    {
+      "arxiv_id": "oa-gfl",
+      "title": "Generalized Focal Loss: Learning Qualified and Distributed Bounding Boxes for Dense Object Detection",
+      "abstract": "Search keywords (not an author abstract): object detection localization loss function confidence calibration",
+      "authors": [],
+      "published": "2020",
+      "updated": "2020",
+      "categories": [
+        "detection_accuracy"
+      ],
+      "source": "neurips",
+      "source_pdf_url": "https://papers.neurips.cc/paper_files/paper/2020/file/f0bda020d2470f2e74990a07a607ebd9-Paper.pdf",
+      "source_page_url": "https://papers.neurips.cc/paper_files/paper/2020/hash/f0bda020d2470f2e74990a07a607ebd9-Abstract.html",
+      "arxiv_alias": "2006.04388"
+    }
+  ],
+  "retain_pdf": true,
+  "search_arxiv": false
+}

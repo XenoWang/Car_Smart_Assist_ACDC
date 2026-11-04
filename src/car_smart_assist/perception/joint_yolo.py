@@ -6,6 +6,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from car_smart_assist.perception.yolo_center_loss import CenterAssistedBboxLoss, validate_center_recipe
+
 
 class MaskedClassificationLoss(nn.Module):
     def __init__(self, foreground_exclusive=True):
@@ -33,14 +35,21 @@ class MaskedClassificationLoss(nn.Module):
 
 
 class JointDetectionLoss:
-    def __init__(self, model, obstacle_class, foreground_exclusive=True):
+    def __init__(self, model, obstacle_class, foreground_exclusive=True, *, center_loss=None):
+        recipe = validate_center_recipe({"enabled": False} if center_loss is None else center_loss)
         from ultralytics.utils.loss import v8DetectionLoss
 
         self.base = v8DetectionLoss(model)
         self.base.bce = MaskedClassificationLoss(foreground_exclusive)
         self.obstacle_class = obstacle_class
+        self.center_bbox = None
+        if recipe["enabled"] and recipe["weight"] != 0:
+            self.center_bbox = CenterAssistedBboxLoss(self.base.bbox_loss, recipe)
+            self.base.bbox_loss = self.center_bbox
 
     def __call__(self, predictions, batch):
+        # Legacy serialized criteria predate the optional center component.
+        center_bbox = getattr(self, "center_bbox", None)
         features = predictions[1] if isinstance(predictions, tuple) else predictions
         device = features[0].device
         coverage = batch["class_supervision"].to(device=device, dtype=torch.bool)
@@ -57,9 +66,16 @@ class JointDetectionLoss:
         self.base.bce.valid = valid
         self.base.bce.weights = batch["source_loss_weight"].to(device)[:, None, None]
         try:
+            if center_bbox is not None:
+                center_bbox.anchor_strides = torch.cat([
+                    stride.to(device=device, dtype=torch.float32).reshape(1, 1).expand(feature.shape[-2] * feature.shape[-1], 1)
+                    for stride, feature in zip(self.base.stride, features, strict=True)
+                ])
             return self.base(predictions, batch)
         finally:
             self.base.bce.valid = self.base.bce.weights = None
+            if center_bbox is not None:
+                center_bbox.anchor_strides = None
 
 
 def preserve_classification_outputs(source, target, known_classes, expected_names):

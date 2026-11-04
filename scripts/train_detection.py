@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
 
 from car_smart_assist.config.detection import (  # noqa: E402
+    center_loss_config,
     load_yolo_config,
     resolve_yolo_device,
     validate_joint_dataset_options,
@@ -37,12 +38,16 @@ from car_smart_assist.perception.yolo_training import (  # noqa: E402
     load_training_state,
     require_model_selection_contract,
 )
+from car_smart_assist.perception.yolo_center_loss import require_center_recipe  # noqa: E402
 
 
 def resolve_training_plan(
     root, cfg, manifest, run, *, fresh=False, epochs=None, require_resume=False, continue_only=False
 ):
     train = dict(cfg["train"])
+    center_options = center_loss_config(cfg.get("center_loss", {}))
+    if center_options["enabled"] and not manifest.get("joint_supervision"):
+        raise ValueError("center_loss currently requires the joint nine-class training dataset")
     if manifest.get("joint_supervision"):
         validate_joint_dataset_options(train)
     extra = train.pop("resume_extra_epochs", None)
@@ -83,6 +88,7 @@ def resolve_training_plan(
         require_model_selection_contract(
             json.loads(metadata_path.read_text(encoding="utf-8")), selection_contract
         )
+        require_center_recipe(json.loads(metadata_path.read_text(encoding="utf-8")), center_options)
     if continue_only and not all(path.is_file() for path in local_checkpoints):
         raise ValueError("--continue requires this run's paired last.pt and best.pt")
     candidates = (local_checkpoints[0],) if continue_only else (*local_checkpoints, root / cfg["checkpoint"])
@@ -116,6 +122,9 @@ def resolve_training_plan(
         state = load_training_state(
             state_path, checkpoint, manifest["signature"], selection_contract
         )
+        require_center_recipe(state, center_options)
+        if center_options["enabled"]:
+            require_center_recipe(previous, center_options, resolved=state["center_loss"])
         # 旧metadata在以上检查中拒绝；仅合法同目录恢复需要读取checkpoint的epoch。
         # 反序列化会导入Ultralytics，须先设好项目本地配置。
         configure_yolo_environment(root)
@@ -259,6 +268,8 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     try:
         cfg = load_yolo_config(root / args.config)
+        center_options = center_loss_config(cfg.get("center_loss", {}))
+        center_kwargs = {"center_loss": center_options} if center_options["enabled"] else {}
         name = args.name or cfg["name"]
         if Path(name).name != name or name in (".", ".."):
             raise ValueError("Run name must be a simple directory name")
@@ -327,6 +338,8 @@ def main() -> int:
                     checkpoint_sha256=state["checkpoint_sha256"],
                     training_segment=plan["training_segment"],
                 )
+                if center_options["enabled"]:
+                    summary["center_loss"] = dict(state["center_loss"])
                 controller.accept_resume()
                 print(json.dumps(summary, ensure_ascii=False, indent=2))
                 return STOP_EXIT_CODE if controller.requested else 0
@@ -340,9 +353,14 @@ def main() -> int:
                 selection_contract=plan["model_selection_contract"],
                 training_segment=plan["training_segment"],
                 stop_controller=controller,
+                **center_kwargs,
             )
 
             def save_metadata(_trainer):
+                if center_options["enabled"]:
+                    recipe = (getattr(_trainer, "_project_center_loss", {"enabled": False})
+                              if _trainer is not None else plan["resume_state"]["center_loss"])
+                    metadata["center_loss"] = require_center_recipe({"center_loss": recipe}, center_options)
                 temporary = metadata_path.with_suffix(".tmp")
                 with temporary.open("w", encoding="utf-8") as stream:
                     stream.write(json.dumps(metadata, ensure_ascii=False, indent=2))
@@ -367,6 +385,7 @@ def main() -> int:
                 trainer_class = joint_trainer(
                     plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
                     selection_contract=plan["model_selection_contract"], validated_data=data,
+                    **center_kwargs,
                 )
             if plan["resume_state"] is not None:
                 save_metadata(None)

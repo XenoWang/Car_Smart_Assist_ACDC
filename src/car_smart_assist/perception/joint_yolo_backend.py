@@ -19,7 +19,8 @@ from car_smart_assist.perception.joint_yolo import (
     preserve_classification_outputs,
 )
 from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
-from car_smart_assist.config.detection import YOLO_AP_MODE, validate_joint_dataset_options
+from car_smart_assist.config.detection import YOLO_AP_MODE, center_loss_config, validate_joint_dataset_options
+from car_smart_assist.perception.yolo_center_loss import train_center_recipe
 from car_smart_assist.perception.yolo_postprocess import postprocess_detection
 
 # 导入 Ultralytics 时会初始化 settings，这份初始化要留在项目里。
@@ -29,6 +30,7 @@ from ultralytics.data.base import BaseDataset  # noqa: E402
 from ultralytics.data.dataset import YOLODataset  # noqa: E402
 from ultralytics.models.yolo.detect.val import DetectionValidator  # noqa: E402
 from ultralytics.utils.metrics import DetMetrics  # noqa: E402
+from ultralytics.utils.torch_utils import de_parallel  # noqa: E402
 
 
 def load_joint_index(data):
@@ -268,8 +270,9 @@ class JointValidator(DeploymentValidator):
         return {key: value[keep] for key, value in result.items()}
 
 
-def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None):
+def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None, center_loss=None):
     base = detection_trainer_for_resume(resume_state, selection_contract, validated_data=validated_data)
+    center_options = center_loss_config({} if center_loss is None else center_loss)
 
     class Trainer(base):
         def build_dataset(self, img_path, mode="train", batch=None):
@@ -295,7 +298,7 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
                     if getattr(self.args, name, 0):
                         raise ValueError(f"Joint ROI supervision requires {name}=0")
             args = self.validation_args() if mode == "val" else self.args
-            return JointDataset(
+            dataset = JointDataset(
                 img_path=img_path,
                 imgsz=args.imgsz,
                 batch_size=batch or args.batch,
@@ -307,6 +310,17 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
                 data=self.data,
                 task="detect",
             )
+            if mode == "train" and center_options["enabled"]:
+                self._project_center_loss = train_center_recipe(
+                    dataset.labels, dataset.imgsz, dataset.manifest["signature"], center_options,
+                )
+                model = de_parallel(self.model)
+                model.joint_center_loss = dict(self._project_center_loss)
+                model.criterion = JointDetectionLoss(
+                    model, model.joint_obstacle_class, model.joint_foreground_exclusive,
+                    center_loss=self._project_center_loss,
+                )
+            return dataset
 
         def get_model(self, cfg=None, weights=None, verbose=True):
             model = super().get_model(cfg, weights, verbose)
@@ -323,6 +337,8 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
 
         def set_model_attributes(self):
             super().set_model_attributes()
+            self._project_center_loss = {"enabled": False}
+            self.model.joint_center_loss = {"enabled": False}
             self.model.criterion = JointDetectionLoss(
                 self.model, self.model.joint_obstacle_class, self.model.joint_foreground_exclusive
             )

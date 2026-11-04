@@ -11,8 +11,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from car_smart_assist.config.detection import yolo_selection_validator_args
+from car_smart_assist.config.detection import center_loss_config, yolo_selection_validator_args
 from car_smart_assist.utils.stop import StopController
+from car_smart_assist.perception.yolo_center_loss import require_center_recipe, validate_center_recipe
 
 
 STOPPER_FIELDS = ("best_fitness", "best_epoch", "patience", "possible_stop")
@@ -236,6 +237,8 @@ def require_best_checkpoint(state, checkpoint: Path) -> str:
 
 
 def require_training_history(state):
+    if "center_loss" in state:
+        validate_center_recipe(state["center_loss"])
     stopper = state.get("early_stopper")
     segment = state.get("training_segment")
     if (
@@ -290,10 +293,13 @@ def load_training_state(
 def attach_training_state_callbacks(
     model, dataset_signature: str, resume_state: dict | None, best_fitness: float | None = None,
     *, selection_contract: dict, training_segment: dict, stop_controller: StopController | None = None,
+    center_loss: dict | None = None,
 ) -> None:
+    center_options = center_loss_config({} if center_loss is None else center_loss)
     if resume_state is not None:
         require_model_selection_contract(resume_state, selection_contract)
         require_training_history(resume_state)
+        require_center_recipe(resume_state, center_options)
     elif best_fitness is not None:
         raise ValueError("Historical best fitness requires paired complete training state")
 
@@ -339,6 +345,10 @@ def attach_training_state_callbacks(
             "cuda_device_ids": _cuda_device_ids() if trainer.device.type == "cuda" else [],
             "accumulation": _capture_accumulation(trainer),
         }
+        if center_options["enabled"]:
+            state["center_loss"] = require_center_recipe(
+                {"center_loss": getattr(trainer, "_project_center_loss", {"enabled": False})}, center_options,
+            )
         _require_accumulation_state(state)
         path = trainer.wdir / "last_training_state.pt"
         temporary = path.with_suffix(".tmp")
@@ -355,6 +365,11 @@ def attach_training_state_callbacks(
             stop_controller.require_running()
             # Every epoch must retain the historical best, even with save=False.
             trainer.args.save = True
+        current_center = require_center_recipe(
+            {"center_loss": getattr(trainer, "_project_center_loss", {"enabled": False})}, center_options,
+        )
+        if resume_state is not None:
+            require_center_recipe(resume_state, center_options, resolved=current_center)
         trainer._project_best_checkpoint_sha256 = None
         trainer._project_last_optimizer_attempt = -1
         # This mirrors vendor's per-invocation last_opt_step, which always starts at -1.
