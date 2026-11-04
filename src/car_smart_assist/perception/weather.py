@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -118,14 +121,64 @@ class WeatherPrediction:
     def warning(self) -> str | None:
         return render_weather_warning(self.attributes)
 
+    def snapshot(self) -> WeatherPrediction:
+        """Validate the flat output contract and take ownership of mutable fields.
+
+        Nonfinite numeric diagnostics remain raw for policy checks; only the
+        external JSON representation converts them to null.
+        """
+        if not isinstance(self.attributes, (tuple, list)) or not all(
+            isinstance(name, str) for name in self.attributes
+        ):
+            raise TypeError("WeatherPrediction.attributes must be a sequence of strings")
+        if not isinstance(self.reason, str):
+            raise TypeError("WeatherPrediction.reason must be a string")
+        mappings = {}
+        for field_name in ("decisions", "probabilities", "cues"):
+            value = getattr(self, field_name)
+            if not isinstance(value, Mapping):
+                raise TypeError(f"WeatherPrediction.{field_name} must be a mapping")
+            values = dict(value)
+            if not all(isinstance(key, str) for key in values):
+                raise TypeError(f"WeatherPrediction.{field_name} keys must be strings")
+            if field_name == "decisions":
+                valid = all(isinstance(item, (bool, np.bool_)) for item in values.values())
+            else:
+                valid = all(
+                    isinstance(item, Real) and not isinstance(item, (bool, np.bool_))
+                    for item in values.values()
+                )
+            if not valid:
+                raise TypeError(f"WeatherPrediction.{field_name} has invalid value types")
+            if field_name != "decisions":
+                try:
+                    for item in values.values():
+                        float(item)
+                except (OverflowError, ValueError) as exc:
+                    raise ValueError(
+                        f"WeatherPrediction.{field_name} contains an unrepresentable number"
+                    ) from exc
+            mappings[field_name] = values
+        return WeatherPrediction(
+            tuple(self.attributes), mappings["decisions"], mappings["probabilities"],
+            mappings["cues"], self.reason,
+        )
+
     def to_dict(self) -> dict[str, Any]:
+        snapshot = self.snapshot()
         return {
-            "attributes": list(self.attributes),
-            "decisions": dict(self.decisions),
-            "probabilities": dict(self.probabilities),
-            "cues": dict(self.cues),
-            "warning": self.warning,
-            "reason": self.reason,
+            "attributes": list(snapshot.attributes),
+            "decisions": {name: bool(value) for name, value in snapshot.decisions.items()},
+            "probabilities": {
+                name: float(value) if isfinite(value) else None
+                for name, value in snapshot.probabilities.items()
+            },
+            "cues": {
+                name: float(value) if isfinite(value) else None
+                for name, value in snapshot.cues.items()
+            },
+            "warning": snapshot.warning,
+            "reason": snapshot.reason,
         }
 
 

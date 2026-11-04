@@ -98,6 +98,12 @@ def test_nonempty_legacy_group_split_matches_captured_index_golden():
         groups=groups,
     )
 
+    # Correctness is checked independently of the historical capture: complete,
+    # disjoint whole groups and exact 80/5/5/10 counts for equal groups of five.
+    _assert_partition(parts, groups, seed=0)
+    assert [len(part) for part in parts] == [80, 5, 5, 10]
+    # The recorded indices below check only the separately required legacy
+    # compatibility; they are not a reference algorithm or a model score oracle.
     assert {name: len(part) for name, part in zip(SPLIT_NAMES, parts, strict=True)} == golden[
         "split_counts"
     ]

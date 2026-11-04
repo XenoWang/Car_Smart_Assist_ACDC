@@ -16,20 +16,34 @@ from car_smart_assist.perception.visibility.trainer import VisibilityTrainer
 
 @pytest.mark.parametrize("channels", [1, 3, 4])
 @pytest.mark.parametrize("size", [None, (8, 12)])
-def test_shared_image_reader_matches_original_conversion(tmp_path, channels, size):
-    shape = (17, 23) if channels == 1 else (17, 23, channels)
-    pixels = np.random.default_rng(7).integers(0, 256, shape, dtype=np.uint8)
+def test_shared_image_reader_preserves_known_channel_values(tmp_path, channels, size):
+    # Constant fields remain constant under bilinear resizing. RGBA drops alpha
+    # by contract; it must not composite the RGB values against a background.
+    if channels == 1:
+        pixels = np.full((17, 23), 85, np.uint8)
+        rgb = [85, 85, 85]
+    else:
+        values = [17, 85, 170] + ([0] if channels == 4 else [])
+        pixels = np.broadcast_to(np.array(values, np.uint8), (17, 23, channels)).copy()
+        rgb = [17, 85, 170]
     path = tmp_path / "image.png"
     Image.fromarray(pixels).save(path)
-    with Image.open(path) as image:
-        reference = image.convert("RGB")
-        if size is not None:
-            reference = reference.resize((size[1], size[0]), Image.BILINEAR)
-        expected = np.asarray(reference)
     actual = read_rgb_image(path, size)
-    path.unlink()  # Windows 上文件句柄必须已经关闭。
+    path.unlink()  # Windows file handles must be closed.
+    shape = (17, 23) if size is None else size
+    expected = np.broadcast_to(np.array(rgb, np.uint8), (*shape, 3))
     np.testing.assert_array_equal(actual, expected)
     assert actual.dtype == np.uint8
+
+
+def test_shared_image_reader_bilinear_reduction_has_known_center_average(tmp_path):
+    # Four samples contribute equally at the sole output pixel.
+    pixels = np.array([[[0, 64, 255], [0, 64, 255]],
+                       [[255, 64, 0], [255, 64, 0]]], np.uint8)
+    path = tmp_path / "step.png"
+    Image.fromarray(pixels).save(path)
+    np.testing.assert_array_equal(read_rgb_image(path, (1, 1)),
+                                  np.array([[[128, 64, 128]]], np.uint8))
 
 
 def test_shared_calibration_statistics():
@@ -45,26 +59,32 @@ def test_shared_calibration_rejects_invalid_errors(errors):
         CalibrationStats.from_errors(errors)
 
 
-@pytest.mark.parametrize("augment", [False, True])
-def test_dataset_copy_preserves_pixels_and_cache(tmp_path, augment):
-    pixels = np.random.default_rng(17).integers(0, 256, (2, 16, 32, 3), dtype=np.uint8)
+@pytest.mark.parametrize("augment,contrast,brightness,expected_levels", [
+    (False, 1., 0., [0., 1 / 3, 2 / 3, 1.]),
+    (True, 1.5, -.25, [0., 0., .5, 1.]),
+    (True, .75, .125, [.25, .5, .75, 1.]),
+])
+def test_dataset_copy_preserves_pixels_and_cache(
+    tmp_path, augment, contrast, brightness, expected_levels
+):
+    # Fixed ranges select exact parameters through the public configuration.
+    # RGB ramps have hand-computed outputs, including both clipping boundaries.
+    pixels = np.broadcast_to(
+        np.array([0, 85, 170, 255], np.uint8)[None, None, :, None], (2, 16, 4, 3)
+    ).copy()
     cache = tmp_path / "images.npy"
     np.save(cache, pixels)
     dataset = VisibilityImageDataset(
-        [tmp_path / "0.png", tmp_path / "1.png"], (16, 32),
+        [tmp_path / "0.png", tmp_path / "1.png"], (16, 4),
         cache_path=cache, augment=augment,
+        augmentation_cfg={"contrast_range": (contrast, contrast),
+                          "brightness_range": (brightness, brightness)},
     )
-    # 固定随机状态只在上下文内有效，比较优化前后的光度增强与布局。
     with torch.random.fork_rng(devices=[]):
-        torch.manual_seed(7)
         actual = dataset[1]
-        torch.manual_seed(7)
-        expected = torch.from_numpy(pixels[1].astype(np.float32)).div_(255.0)
-        if augment:
-            expected = (expected - 0.5) * float(torch.empty(1).uniform_(0.9, 1.1)) + 0.5
-            expected = expected + float(torch.empty(1).uniform_(-0.03, 0.03))
-            expected.clamp_(0, 1)
-    torch.testing.assert_close(actual, expected.permute(2, 0, 1), rtol=0, atol=0)
+    expected = torch.tensor(expected_levels).reshape(1, 1, 4).expand(3, 16, 4)
+    # At most a few float32 rounding steps; no fitted execution output.
+    torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
     assert actual.is_contiguous()
     actual.zero_()
     np.testing.assert_array_equal(np.load(cache), pixels)
@@ -78,7 +98,9 @@ def test_opened_dataset_remains_small_when_pickled(tmp_path):
         [tmp_path / f"{i}.png" for i in range(200)], (64, 64), cache_path=cache,
     )
     before = len(pickle.dumps(dataset))
-    expected = dataset[1]
+    # Input is explicitly all black; serialization must preserve that value.
+    expected = torch.zeros(3, 64, 64)
+    torch.testing.assert_close(dataset[1], expected, rtol=0, atol=0)
     blob = pickle.dumps(dataset)
     assert len(blob) == before
     assert len(blob) < pixels.nbytes * 0.05

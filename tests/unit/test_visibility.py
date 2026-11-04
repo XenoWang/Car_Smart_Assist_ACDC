@@ -843,44 +843,45 @@ class TestReconstructionError:
         e = reconstruction_error(Identity(), torch.rand(1, 3, 144, 256))[0]
         assert e.mean == pytest.approx(0.0, abs=1e-9)
 
-    def test_reconstruction_mean_matches_per_image_mse(self):
-        class ScaledIdentity(torch.nn.Module):
+    def test_reconstruction_mean_matches_hand_computed_channel_errors(self):
+        class Zero(torch.nn.Module):
             def forward(self, x):
-                return x * 0.8
+                return torch.zeros_like(x)
 
-        x = torch.rand(4, 3, 31, 47)
-        actual = reconstruction_mean(ScaledIdentity(), x)
-        expected = torch.nn.functional.mse_loss(
-            x * 0.8, x, reduction="none"
-        ).mean(dim=(1, 2, 3))
-        torch.testing.assert_close(actual, expected)
+        # Four RGB constants. Squared channel means: 0, .25/3, 1/3, 1.
+        levels = torch.tensor([[0., 0., 0.], [0., .5, 0.], [0., 0., 1.], [1., 1., 1.]])
+        x = levels[:, :, None, None].expand(4, 3, 3, 5)
+        actual = reconstruction_mean(Zero(), x)
+        expected = torch.tensor([0., 1 / 12, 1 / 3, 1.])
+        torch.testing.assert_close(actual, expected, rtol=0, atol=1e-7)
 
-    def test_vectorized_stats_match_per_sample_reference(self):
-        class ScaledIdentity(torch.nn.Module):
+    def test_block_statistics_match_hand_computed_overlapping_windows(self):
+        class Zero(torch.nn.Module):
             def forward(self, x):
-                return x * 0.8
+                return torch.zeros_like(x)
 
-        x = torch.rand(3, 3, 31, 47)
-        actual = reconstruction_error(ScaledIdentity(), x, block_grid=(2, 3))
-        err = torch.nn.functional.mse_loss(x * 0.8, x, reduction="none").mean(1)
-        expected = []
-        for image_error in err:
-            blocks = torch.nn.functional.adaptive_avg_pool2d(
-                image_error[None, None], (2, 3)
-            ).flatten()
-            expected.append(
-                (
-                    float(image_error.mean()),
-                    float(torch.quantile(blocks, 0.9)),
-                    float(blocks.max()),
-                    float(blocks.std()),
-                )
+        # 3x5 -> 2x3 pooling overlaps row 1 and columns 1/3.
+        # Image 0 block errors: [.125]*3 + [.625]*3.
+        # Image 1 block errors: [.125, .5, .125] repeated twice.
+        # Sample standard deviations use n-1; p90 interpolates sorted blocks.
+        x = torch.zeros(3, 3, 3, 5)
+        x[0, :, 1, :] = .5
+        x[0, :, 2, :] = 1.
+        x[1] = torch.tensor([0., .5, 1., .5, 0.]).expand(3, 3, 5)
+        x[2] = .25
+        expected = [
+            (5 / 12, .625, .625, .075 ** .5),
+            (.3, .5, .5, .0375 ** .5),
+            (.0625, .0625, .0625, 0.),
+        ]
+        actual = reconstruction_error(Zero(), x, block_grid=(2, 3))
+        assert len(actual) == 3
+        for got, (mean, p90, maximum, std) in zip(actual, expected, strict=True):
+            assert got.to_dict() == pytest.approx(
+                {"mean": mean, "p90_block": p90, "max_block": maximum, "std_block": std},
+                rel=0, abs=1e-7,
             )
-        for got, want in zip(actual, expected, strict=True):
-            assert got.mean == pytest.approx(want[0])
-            assert got.p90_block == pytest.approx(want[1])
-            assert got.max_block == pytest.approx(want[2])
-            assert got.std_block == pytest.approx(want[3])
+
 
 
 
@@ -889,39 +890,33 @@ class TestReconstructionError:
 
 
 class TestInformationFeatures:
-    def test_structured_image_scores_high(self):
-        """注意量纲：contrast 是 [0,1] 单位（函数内部会把图归一化），
-        不是 0-255 单位。真实 ACDC 图的典型值在 0.24 左右。
-        """
-        f = compute_information_features(structured_image())
-        assert f.contrast > 0.05, f"contrast={f.contrast} 量纲疑似不对"
-        assert f.entropy > 3
-        assert f.edge_density > 0.0
+    def test_binary_step_has_known_contrast_entropy_and_edge_fraction(self):
+        # Equal black/white populations: sigma=.5, entropy=1 bit.
+        # Central differences find exactly the two columns at the step.
+        image = np.zeros((8, 8, 3), np.uint8)
+        image[:, 4:] = 255
+        features = compute_information_features(image)
+        assert features.contrast == pytest.approx(.5, rel=0, abs=1e-7)
+        assert features.entropy == pytest.approx(1., rel=0, abs=1e-7)
+        assert features.edge_density == .25
 
-    def test_contrast_scale_matches_feature_units(self):
-        """回归测试：归一化尺度必须与特征的实际量纲一致。
+    def test_feature_normalization_matches_explicit_units_and_saturation(self):
+        from car_smart_assist.perception.visibility.scorer import normalize_features
 
-        早期版本 contrast 尺度按 0-255 量纲填了 64.0，而特征实际是 [0,1] 量纲，
-        导致归一化后恒为 ~0.004，几何平均被整体拽到接近 0 ——
-        所有图的信息量分数一起塌陷、阈值全线失效，而且不报任何错。
-        """
-        from car_smart_assist.perception.visibility.scorer import (
-            _FEATURE_SCALES,
-            normalize_features,
-        )
+        features = InformationFeatures(.125, 4., .4, .25)
+        scales = {"contrast": .5, "entropy": 8., "edge_density": .2, "hf_ratio": 1.}
+        assert normalize_features(features, scales) == {
+            "contrast": .25, "entropy": .5, "edge_density": 1., "hf_ratio": .25,
+        }
 
-        # 一张典型清晰图的 contrast 约 0.2~0.3，归一化后应落在合理区间
-        f = compute_information_features(structured_image())
-        n = normalize_features(f)
-        assert 0.3 < n["contrast"] <= 1.0, (
-            f"contrast 归一化后为 {n['contrast']:.4f} —— 尺度 {_FEATURE_SCALES['contrast']} "
-            "与特征量纲不匹配"
-        )
-
-    def test_clear_image_gets_meaningful_information_score(self):
-        """清晰图的信息量分数必须落在可判定区间，不能被尺度问题压到贴地。"""
-        s = information_score(compute_information_features(structured_image()))
-        assert s > 0.3, f"清晰图信息量仅 {s:.4f}，尺度配置有误"
+    @pytest.mark.parametrize("power", [-2., -1., 1., 2.])
+    def test_equal_normalized_features_preserve_generalized_mean(self, power):
+        # Every normalized feature is .5; every weighted power mean is .5.
+        features = InformationFeatures(.25, 4., .1, .5)
+        config = {"feature_scales": {
+            "contrast": .5, "entropy": 8., "edge_density": .2, "hf_ratio": 1.,
+        }}
+        assert information_score(features, p=power, scoring_cfg=config) == pytest.approx(.5)
 
     def test_uniform_image_scores_near_zero(self):
         """纯色图的信息量必须塌陷 —— 这是「看不见」最直接的信号。
@@ -970,24 +965,29 @@ class TestInformationFeatures:
         )
         assert score == pytest.approx(0.9)
 
-    def test_frequency_mask_matches_shifted_reference(self):
-        image = structured_image(31, 47)
-        gray = (image.astype(np.float32) / 255.0) @ np.array(
-            [0.299, 0.587, 0.114], dtype=np.float32
-        )
-        shifted = np.fft.fftshift(np.fft.fft2(gray - gray.mean()))
-        power = np.abs(shifted) ** 2
-        h, w = gray.shape
-        cy, cx = h // 2, w // 2
-        yy, xx = np.ogrid[:h, :w]
-        radius = np.sqrt(
-            ((yy - cy) / max(h / 2, 1)) ** 2
-            + ((xx - cx) / max(w / 2, 1)) ** 2
-        )
-        expected = power[radius > 0.5].sum() / power.sum()
-
+    @pytest.mark.parametrize("height,width,vertical", [
+        (32, 64, False), (31, 64, False), (32, 63, True),
+    ])
+    @pytest.mark.parametrize("low_amplitude,high_amplitude,expected", [
+        (32, 0, 0.), (0, 32, 1.), (32, 16, 1 / 3),
+    ])
+    def test_frequency_energy_matches_orthogonal_wave_oracle(
+        self, height, width, vertical, low_amplitude, high_amplitude, expected
+    ):
+        # Exact uint8 periods avoid quantizing a floating sinusoid at the input.
+        # [1,0,-1,0] has two bins at normalized radius .5 (excluded by >).
+        # [1,-1,1,-1] is Nyquist: one bin at radius 1 (included).
+        # Their energies are A^2/2 and B^2, so A=32,B=16 gives 1/3.
+        period = (128 + low_amplitude * np.array([1, 0, -1, 0])
+                  + high_amplitude * np.array([1, -1, 1, -1])).astype(np.uint8)
+        length = height if vertical else width
+        wave = np.tile(period, length // 4)
+        gray = np.broadcast_to(wave[:, None] if vertical else wave[None, :], (height, width))
+        image = np.repeat(gray[:, :, None], 3, axis=2)
         actual = compute_information_features(image).hf_ratio
-        assert actual == pytest.approx(float(expected), abs=1e-7)
+        # Fixed float32 luminance/energy roundoff allowance, chosen analytically.
+        assert actual == pytest.approx(expected, rel=0, abs=1e-6)
+
 
 
 

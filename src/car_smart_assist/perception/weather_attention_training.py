@@ -230,11 +230,18 @@ def detailed_metrics(dataset, probabilities, cfg, thresholds):
     }
     for index, name in enumerate(cfg.attributes):
         known = dataset.mask[:, index] > 0
-        truth = dataset.targets[known, index]
-        values = np.clip(probabilities[known, index], 1e-7, 1 - 1e-7)
-        result["per_attribute"][name]["brier"] = float(np.mean((values - truth) ** 2))
-        result["per_attribute"][name]["nll"] = float(
-            np.mean(-truth * np.log(values) - (1 - truth) * np.log(1 - values))
+        row = result["per_attribute"][name]
+        if not known.any():
+            # No supervised samples means no defined calibration error.
+            row["brier"] = row["nll"] = None
+            continue
+        truth = dataset.targets[known, index].astype(np.float64, copy=False)
+        values = probabilities[known, index].astype(np.float64, copy=False)
+        row["brier"] = float(np.mean((values - truth) ** 2))
+        # Clipping is only a log-domain safeguard, not a change to Brier inputs.
+        log_values = np.clip(values, 1e-7, 1 - 1e-7)
+        row["nll"] = float(
+            np.mean(-truth * np.log(log_values) - (1 - truth) * np.log(1 - log_values))
         )
     return result
 

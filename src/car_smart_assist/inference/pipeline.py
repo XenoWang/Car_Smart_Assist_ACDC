@@ -395,8 +395,12 @@ class InferencePipeline:
                     weather = self.weather_predictor.predict(array)
                     if not isinstance(weather, WeatherPrediction):
                         raise TypeError("weather_predictor.predict() 必须返回 WeatherPrediction")
+                    # Finish validation and warning generation before publishing
+                    # either field; predictors may reuse their mutable dictionaries.
+                    weather = weather.snapshot()
+                    warning = weather.warning
                     r.weather = weather
-                    r.weather_warning = weather.warning
+                    r.weather_warning = warning
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("天气识别失败")
                     r.skipped["weather"] = f"天气识别异常: {type(exc).__name__}: {exc}"

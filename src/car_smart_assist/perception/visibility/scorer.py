@@ -7,6 +7,7 @@ import pickle
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,31 @@ class InformationFeatures:
         }
 
 
+def _feature_parameters(scoring_cfg: dict[str, Any] | None) -> tuple[float, float]:
+    """Reject invalid feature thresholds before any image or model work."""
+    cfg = {} if scoring_cfg is None else scoring_cfg
+    if not isinstance(cfg, dict):
+        raise ValueError("scoring must be a mapping")
+    features = cfg.get("features", {})
+    if not isinstance(features, dict):
+        raise ValueError("scoring.features must be a mapping")
+    values = []
+    for name in ("edge_gradient_threshold", "hf_cutoff_ratio"):
+        raw = features.get(name, SCORING_DEFAULTS["features"][name])
+        if isinstance(raw, (bool, np.bool_)) or not isinstance(raw, Real):
+            raise ValueError(f"scoring.features.{name} must be a finite non-negative number")
+        try:
+            value = float(raw)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError(
+                f"scoring.features.{name} must be a finite non-negative number"
+            ) from exc
+        if not np.isfinite(value) or value < 0:
+            raise ValueError(f"scoring.features.{name} must be a finite non-negative number")
+        values.append(value)
+    return values[0], values[1]
+
+
 def compute_information_features(
     img: ImageInput, scoring_cfg: dict[str, Any] | None = None
 ) -> InformationFeatures:
@@ -72,6 +98,7 @@ def compute_information_features(
     实现在 numpy 上而不是 torch：这些特征要逐帧单独解释，
     用 numpy 方便直接对着数值排查，也不需要 GPU。
     """
+    edge_threshold, hf_cutoff = _feature_parameters(scoring_cfg)
     img = to_rgb_uint8(img, copy=False)
     a = img.astype(np.float32) / 255.0
     gray = a @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
@@ -92,10 +119,6 @@ def compute_information_features(
     # 0-255量纲阈值10.0近似对应；0.04×255=10.2，并非精确相等）。
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy)
-    feature_cfg = (scoring_cfg or {}).get("features", {})
-    edge_threshold = float(feature_cfg.get(
-        "edge_gradient_threshold", SCORING_DEFAULTS["features"]["edge_gradient_threshold"]
-    ))
     edge_density = float((mag > edge_threshold).mean())
 
     # --- 高频能量占比 ---
@@ -105,7 +128,6 @@ def compute_information_features(
     power = np.abs(f) ** 2
     h, w = gray.shape
     total = power.sum()
-    hf_cutoff = float(feature_cfg.get("hf_cutoff_ratio", SCORING_DEFAULTS["features"]["hf_cutoff_ratio"]))
     if total > 0:
         high_frequency = np.sum(
             power, where=_high_frequency_mask(h, w, hf_cutoff)
@@ -383,6 +405,7 @@ class VisibilityScorer:
         scoring_cfg: dict[str, Any] | None = None,
     ) -> None:
         self.scoring_cfg = scoring_cfg if scoring_cfg is not None else {}
+        _feature_parameters(self.scoring_cfg)
         _validated_feature_scales(self.scoring_cfg.get("feature_scales"))
         _aggregation_parameters(self.scoring_cfg)
         self.model = model.to(device).eval()
