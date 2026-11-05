@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import weakref
+from contextlib import ExitStack
 from numbers import Real
 from pathlib import Path
 
@@ -20,7 +22,9 @@ from car_smart_assist.config.detection import (
     YOLO_POSTPROCESS_VERSION,
     YOLO_PROPOSAL_MODE,
     YOLO_SWEEP_CONFIDENCE,
+    inference_precision,
 )
+from car_smart_assist.perception.yolo_precision import detection_compute_precision, require_fp32_decoded
 
 
 def ordered_class_names(names):
@@ -124,7 +128,10 @@ def calibration_path(root: Path, cfg, output_dir=None):
         raise ValueError("Detection calibration_file must be configured")
     base = root / configured
     parent = root / output_dir if output_dir is not None else base.parent
-    return parent / YOLO_POSTPROCESS_VERSION / base.name
+    directory = parent / YOLO_POSTPROCESS_VERSION
+    if inference_precision(cfg) == "fp16":
+        directory = directory / "fp16"
+    return directory / base.name
 
 
 def calibration_identity(root: Path, cfg, names, checkpoint=None, manifest=None):
@@ -140,6 +147,7 @@ def calibration_identity(root: Path, cfg, names, checkpoint=None, manifest=None)
         raise ValueError("Detection model/data class IDs or names differ")
     args = cfg["inference"]
     return {
+        **({"inference_precision": "fp16", "decode_precision": "fp32"} if inference_precision(cfg) == "fp16" else {}),
         "schema_version": YOLO_CALIBRATION_SCHEMA_VERSION,
         "postprocess_version": YOLO_POSTPROCESS_VERSION,
         "mode": YOLO_LOCKED_MODE,
@@ -163,8 +171,13 @@ def calibration_identity(root: Path, cfg, names, checkpoint=None, manifest=None)
 
 
 def validate_calibration(payload, identity, names):
-    if not isinstance(payload, dict) or any(
-        payload.get(key) != value for key, value in identity.items()
+    precision = identity.get("inference_precision", "fp32")
+    if (
+        not isinstance(payload, dict)
+        or payload.get("inference_precision", "fp32") != precision
+        or payload.get("requested_precision", precision) != precision
+        or payload.get("decode_precision") != identity.get("decode_precision")
+        or any(payload.get(key) != value for key, value in identity.items())
     ):
         raise ValueError(
             "Detection calibration identity/settings changed or format is obsolete; "
@@ -200,6 +213,13 @@ def load_calibration(
     )
 
 
+def read_fp32_reference(path: Path, identity, names):
+    """Validate an offline reference against all non-precision identity fields."""
+    raw = path.read_bytes()
+    fp32_identity = {k: v for k, v in identity.items() if k not in {"inference_precision", "decode_precision"}}
+    return validate_calibration(json.loads(raw), fp32_identity, names), hashlib.sha256(raw).hexdigest()
+
+
 def detection_predictor_class(confidence, class_thresholds):
     from ultralytics.models.yolo.detect import DetectionPredictor
     from ultralytics.nn.autobackend import AutoBackend
@@ -208,8 +228,13 @@ def detection_predictor_class(confidence, class_thresholds):
     class ProjectDetectionPredictor(DetectionPredictor):
         def setup_model(self, model, verbose: bool = True):
             """使用项目已解析设备，避免改写进程的CUDA可见设备。"""
+            cleanup = getattr(self, "_decode_cleanup", None)
+            if cleanup is not None:
+                cleanup()
             device = str(self.args.device)
             device = torch.device(f"cuda:{device}" if device.isdecimal() else device)
+            if self.args.half and device.type != "cuda":
+                raise ValueError("FP16 detection requires CUDA")
             self.model = AutoBackend(
                 weights=model or self.args.model,
                 device=device,
@@ -220,13 +245,24 @@ def detection_predictor_class(confidence, class_thresholds):
                 fuse=True,
                 verbose=verbose,
             )
+            scope = ExitStack()
+            scope.enter_context(detection_compute_precision(self.model, self.args.half))
+            self._decode_cleanup = weakref.finalize(self, scope.close)
             self.device = self.model.device
             self.args.half = self.model.fp16
             if hasattr(self.model, "imgsz") and not getattr(self.model, "dynamic", False):
                 self.args.imgsz = self.model.imgsz
             self.model.eval()
 
+        def inference(self, im, *args, **kwargs):
+            if self.args.half:
+                with torch.autocast(device_type="cuda", enabled=False):
+                    return super().inference(im, *args, **kwargs)
+            return super().inference(im, *args, **kwargs)
+
         def postprocess(self, preds, img, orig_imgs, **kwargs):
+            if getattr(self.args, "half", False):
+                require_fp32_decoded(preds)
             outputs = postprocess_detection(
                 preds,
                 nc=len(self.model.names),

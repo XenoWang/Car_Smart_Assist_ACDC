@@ -289,7 +289,7 @@ def test_predictor_setup_preserves_visible_devices_and_logical_indices(
     def backend(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(
-            device=kwargs["device"], fp16=True, imgsz=640, dynamic=dynamic,
+            device=kwargs["device"], fp16=kwargs["fp16"], imgsz=640, dynamic=dynamic,
             eval=lambda: evaluations.append(True),
         )
 
@@ -309,7 +309,7 @@ def test_predictor_setup_preserves_visible_devices_and_logical_indices(
         "verbose": False,
     }
     assert instance.device == torch.device(expected)
-    assert instance.args.half is True
+    assert instance.args.half is False
     assert instance.args.imgsz == (960 if dynamic else 640)
     assert evaluations == [True]
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "4,5"

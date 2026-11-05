@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+from contextlib import ExitStack
 import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -19,6 +21,8 @@ from car_smart_assist.config.detection import (  # noqa: E402
     YOLO_PROPOSAL_MODE,
     YOLO_SWEEP_CONFIDENCE,
     load_yolo_config,
+    inference_half,
+    inference_precision,
     resolve_yolo_device,
 )
 from car_smart_assist.data.joint_paths import detection_data_scope  # noqa: E402
@@ -28,8 +32,10 @@ from car_smart_assist.perception.yolo_postprocess import (  # noqa: E402
     calibration_path,
     load_calibration,
     ordered_class_names,
+    read_fp32_reference,
     validate_calibration,
 )
+from car_smart_assist.perception.yolo_precision import detection_compute_precision, require_fp32_decoded
 
 
 def atomic_json(path, payload):
@@ -80,7 +86,10 @@ def main() -> int:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--device", default=None, help="Explicit device override for this evaluation only")
     parser.add_argument("--diagnostics", action="store_true", help="Write independent locked-point size/error diagnostics")
-    parser.add_argument("--use-deployment-calibration", action="store_true",
+    thresholds = parser.add_mutually_exclusive_group()
+    thresholds.add_argument("--reference-fp32-calibration", type=Path,
+                            help="Val-only comparison at frozen FP32 thresholds from matching weights/data")
+    thresholds.add_argument("--use-deployment-calibration", action="store_true",
                         help="For val/test, read matching configured calibration without rewriting it")
     parser.add_argument(
         "--imgsz", type=int, default=None, help="Validation-only input size comparison"
@@ -91,9 +100,12 @@ def main() -> int:
         cfg = load_yolo_config(root / args.config)
         if args.device is not None:
             cfg["device"] = args.device
+        if args.reference_fp32_calibration and args.split != "val":
+            raise ValueError("--reference-fp32-calibration requires val")
         if args.use_deployment_calibration and args.split == "calibration":
             raise ValueError("--use-deployment-calibration requires val or test")
-        if args.diagnostics or args.use_deployment_calibration:
+        separate_output = bool(args.diagnostics or args.use_deployment_calibration or args.reference_fp32_calibration)
+        if separate_output:
             if args.output_dir is None:
                 raise ValueError("Baseline diagnostics require a new independent --output-dir")
             requested_output = (root / args.output_dir).resolve()
@@ -116,7 +128,9 @@ def main() -> int:
             raise FileNotFoundError(
                 f"Current detection calibration missing; recalibrate first: {calibration_file}"
             )
-        if args.diagnostics or args.use_deployment_calibration:
+        device = resolve_yolo_device(cfg["device"])
+        half = inference_half({**cfg, "checkpoint": str(checkpoint)}, device)
+        if separate_output:
             requested_output.mkdir(parents=True, exist_ok=False)
         output = calibration_file.parent
         output.mkdir(parents=True, exist_ok=True)
@@ -133,12 +147,18 @@ def main() -> int:
             confidence = float(cfg["inference"]["confidence"])
             thresholds = {name: confidence for name in names}
             threshold_sources = {name: "config" for name in names}
-            if args.split == "test" or args.use_deployment_calibration:
+            calibration = None
+            if args.reference_fp32_calibration:
+                calibration, reference_digest = read_fp32_reference(
+                    root / args.reference_fp32_calibration, identity, model.names
+                )
+            elif args.split == "test" or args.use_deployment_calibration:
                 calibration = load_calibration(
                     root, cfg, model.names,
                     output_dir=None if args.use_deployment_calibration else args.output_dir,
                     checkpoint=checkpoint, manifest=manifest,
                 )
+            if calibration is not None:
                 confidence = float(calibration["confidence_threshold"])
                 thresholds = calibration["class_confidence_thresholds"]
                 threshold_sources = calibration["class_threshold_sources"]
@@ -155,6 +175,8 @@ def main() -> int:
                 diagnostics = DetectionDiagnostics(names)
             output.mkdir(parents=True, exist_ok=True)
 
+            observed_precision = {}
+
             def validate(mode, locked_confidence=None, class_thresholds=None):
                 selected_base = base
                 if diagnostics is not None and mode == YOLO_LOCKED_MODE:
@@ -162,29 +184,31 @@ def main() -> int:
                     selected_base = diagnostic_validator(base, diagnostics)
 
                 class Validator(selected_base):
-                    pass
+                    def init_metrics(self, backend):
+                        precision_scope.enter_context(detection_compute_precision(backend, half))
+                        observed_precision[mode] = {"half": bool(backend.fp16), "device": str(backend.device)}
+                        return super().init_metrics(backend)
+
+                    def postprocess(self, predictions):
+                        if half:
+                            require_fp32_decoded(predictions)
+                        return super().postprocess(predictions)
 
                 Validator.postprocess_mode = mode
                 Validator.locked_confidence = locked_confidence
                 Validator.class_thresholds = class_thresholds
-                return model.val(
-                    data=str(data),
-                    split="val" if args.split == "calibration" else args.split,
-                    validator=Validator,
-                    device=resolve_yolo_device(cfg["device"]),
-                    imgsz=cfg["inference"]["imgsz"],
-                    conf=YOLO_SWEEP_CONFIDENCE,
-                    iou=cfg["inference"]["iou"],
-                    max_det=cfg["inference"]["max_det"],
-                    agnostic_nms=YOLO_AGNOSTIC_NMS,
-                    single_cls=False,
-                    batch=cfg["train"]["batch"],
-                    workers=cfg["train"]["workers"],
-                    project=str(output),
-                    name=f"{args.split}_{mode}_plots",
-                    exist_ok=True,
-                    plots=True,
-                )
+                with ExitStack() as precision_scope:
+                    if half:
+                        precision_scope.enter_context(torch.autocast(device_type="cuda", enabled=False))
+                    return model.val(
+                        data=str(data), split="val" if args.split == "calibration" else args.split,
+                        validator=Validator, device=device, half=half,
+                        imgsz=cfg["inference"]["imgsz"], conf=YOLO_SWEEP_CONFIDENCE,
+                        iou=cfg["inference"]["iou"], max_det=cfg["inference"]["max_det"],
+                        agnostic_nms=YOLO_AGNOSTIC_NMS, single_cls=False,
+                        batch=cfg["train"]["batch"], workers=cfg["train"]["workers"],
+                        project=str(output), name=f"{args.split}_{mode}_plots", exist_ok=True, plots=True,
+                    )
 
             sweep_mode = YOLO_PROPOSAL_MODE if args.split == "calibration" else YOLO_AP_MODE
             sweep = validate(sweep_mode)
@@ -201,11 +225,14 @@ def main() -> int:
             report = {
                 **identity,
                 "split": args.split,
+                "requested_precision": inference_precision(cfg),
+                "observed_precision": observed_precision,
                 "checkpoint": str(checkpoint),
                 "confidence_threshold": confidence,
                 "class_confidence_thresholds": thresholds,
                 "class_threshold_sources": threshold_sources,
                 "threshold_source": (
+                    "fp32_reference" if args.reference_fp32_calibration else
                     "calibration" if args.split in ("calibration", "test") or args.use_deployment_calibration else "config"
                 ),
                 "passes": [sweep_mode, YOLO_LOCKED_MODE],
@@ -229,7 +256,8 @@ def main() -> int:
                 "per_class_operating_iou50": per_class,
                 "image_count": sum(row["split"] == args.split for row in manifest["images"]),
                 "threshold_selection_scope": (
-                    "existing matching deployment calibration" if args.use_deployment_calibration
+                    "fixed FP32 thresholds for paired validation" if args.reference_fp32_calibration
+                    else "existing matching deployment calibration" if args.use_deployment_calibration
                     else "config" if args.split == "val"
                     else "F1 proposal curves; not a global optimum under formal budgets"
                 ),
@@ -266,6 +294,9 @@ def main() -> int:
                                          threshold_source=report["threshold_source"])
                 atomic_json(diagnostic_file, diagnostic_report)
                 report["diagnostics_file"] = str(diagnostic_file)
+            if args.reference_fp32_calibration:
+                report["calibration_source_file"] = str((root / args.reference_fp32_calibration).resolve())
+                report["reference_calibration_sha256"] = reference_digest
             if args.use_deployment_calibration:
                 report["calibration_source_file"] = str(calibration_path(root, cfg))
             if args.split == "calibration":

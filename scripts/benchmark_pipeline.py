@@ -69,6 +69,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Fixed input code range, e.g. 0 4095 for processed 12-bit images")
     parser.add_argument("--config", default="configs/model/visibility.yaml")
     parser.add_argument("--checkpoint", help="Visibility checkpoint; otherwise use the pipeline default")
+    parser.add_argument("--reference-fp32-calibration", help="Use common validated FP32 thresholds for this benchmark")
+    parser.add_argument("--detection-config", help="Explicit YOLO deployment configuration")
     parser.add_argument("--weather-config")
     parser.add_argument("--weather-checkpoint")
     parser.add_argument("--weather-loss", choices=("focal", "asl"), default="focal")
@@ -169,8 +171,11 @@ def _artifact_paths(args: argparse.Namespace, visibility: dict, yaml: Any) -> di
         if legacy_path.is_file():
             raw = yaml.safe_load(legacy_path.read_text(encoding="utf-8"))["weather_classifier"]
             paths["weather_checkpoint"] = _path(weather_checkpoint or raw["checkpoint"])
-    for name in ("yolo_detection", "yolo_acdc_baseline"):
-        path = ROOT / f"configs/model/{name}.yaml"
+    if getattr(args, "detection_config", None):
+        detection_paths = {"selected_detection": _path(args.detection_config)}
+    else:
+        detection_paths = {name: ROOT / f"configs/model/{name}.yaml" for name in ("yolo_detection", "yolo_acdc_baseline")}
+    for name, path in detection_paths.items():
         paths[f"{name}_config_candidate"] = path
         if path.is_file():
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))["yolo_detection"]
@@ -178,6 +183,8 @@ def _artifact_paths(args: argparse.Namespace, visibility: dict, yaml: Any) -> di
                 if raw.get(key):
                     paths[f"{name}_{key}_candidate"] = _path(raw[key])
             paths[f"{name}_calibration"] = calibration_path(ROOT, raw)
+    if getattr(args, "reference_fp32_calibration", None):
+        paths["fp32_threshold_reference"] = _path(args.reference_fp32_calibration)
     if getattr(args, "profile_stages", False):
         paths["profiling_source"] = ROOT / "src/car_smart_assist/inference/profiling.py"
     return {key: path.resolve() for key, path in paths.items()}
@@ -274,6 +281,8 @@ def _components(pipe: Any) -> dict[str, Any]:
             "observed_tensor_devices": observed,
             "configuration": cfg,
         }
+        if name == "detection" and hasattr(getattr(predictor, "model", None), "fp16"):
+            records[name]["effective_precision"] = "fp16" if predictor.model.fp16 else "fp32"
     return records
 
 
@@ -687,9 +696,19 @@ def main(argv: list[str] | None = None) -> int:
             weather_config=_path(args.weather_config) if args.weather_config else None,
             weather_checkpoint=_path(args.weather_checkpoint) if args.weather_checkpoint else None,
             weather_loss=args.weather_loss,
+            **({"detection_config": args.detection_config} if getattr(args, "detection_config", None) else {}),
         )
         _sync(torch, devices)
         construction_ms = (time.perf_counter_ns() - started) / 1_000_000
+        if getattr(args, "reference_fp32_calibration", None):
+            if pipe.predictor is None:
+                raise ValueError("A calibrated detector is required for a fixed-threshold benchmark")
+            reference = _path(args.reference_fp32_calibration)
+            digest = pipe.predictor.use_fp32_reference_for_benchmark(ROOT, reference)
+            metadata["threshold_reference"] = {
+                "path": str(reference), "sha256": digest, "precision": "fp32",
+                "confidence": pipe.predictor.confidence, "class_thresholds": dict(pipe.predictor.class_thresholds),
+            }
         metadata["components_after_construction"] = _components(pipe)
         observed_devices = _cuda_devices(torch, selected, metadata["components_after_construction"])
         if set(observed_devices) - set(devices):

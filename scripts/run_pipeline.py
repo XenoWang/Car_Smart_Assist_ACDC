@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
                    help="指定图片的固定码值范围，例如已处理12位图像为0 4095")
     p.add_argument("--synthetic", action="store_true", help="额外跑合成退化对照")
     p.add_argument("--device", default=None)
+    p.add_argument("--detection-config", help="Explicit YOLO deployment configuration")
     p.add_argument("--weather-config", default=None, help="新天气模型配置；省略时沿用当前默认天气模型")
     p.add_argument("--weather-loss", choices=("focal", "asl"), default="focal", help="用于金字塔天气候选；注意力候选固定使用 ASL")
     p.add_argument("--weather-checkpoint", default=None, help="指定天气权重，默认从所选配置读取")
@@ -81,6 +82,7 @@ def main() -> int:
             cfg, project_root=root, checkpoint=args.checkpoint, device=args.device,
             weather_config=args.weather_config, weather_loss=args.weather_loss,
             weather_checkpoint=args.weather_checkpoint,
+            **({"detection_config": args.detection_config} if getattr(args, "detection_config", None) else {}),
         )
 
         if args.image:

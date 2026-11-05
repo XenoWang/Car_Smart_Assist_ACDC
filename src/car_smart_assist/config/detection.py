@@ -22,6 +22,25 @@ YOLO_MAX_WH = 7680
 YOLO_AGNOSTIC_NMS = False
 
 
+def inference_precision(cfg):
+    inference = cfg.get("inference", {})
+    if not isinstance(inference, dict):
+        raise ValueError("YOLO inference must be a mapping")
+    precision = inference.get("precision", "fp32")
+    if precision not in ("fp32", "fp16"):
+        raise ValueError("YOLO inference.precision must be fp32 or fp16")
+    if precision == "fp16" and Path(cfg["checkpoint"]).suffix.lower() != ".pt":
+        raise ValueError("FP16 inference requires a native PyTorch .pt checkpoint")
+    return precision
+
+
+def inference_half(cfg, resolved_device):
+    half = inference_precision(cfg) == "fp16"
+    if half and not (str(resolved_device).isdecimal() or torch.device(resolved_device).type == "cuda"):
+        raise ValueError("FP16 detection requires CUDA")
+    return half
+
+
 def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
@@ -88,6 +107,7 @@ def load_yolo_config(path: Path) -> dict[str, Any]:
         extra = train.get("resume_extra_epochs")
         if extra is not None and (type(extra) is not int or extra <= 0):
             raise ValueError("YOLO resume_extra_epochs must be null or a positive integer")
+        inference_precision(cfg)
         inference = cfg["inference"]
         for name in ("imgsz", "max_det"):
             if type(inference[name]) is not int or inference[name] <= 0:

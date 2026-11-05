@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any
 
 from car_smart_assist.advisory.schema import PerceptionResult, TargetObject
-from car_smart_assist.config.detection import YOLO_AGNOSTIC_NMS, resolve_yolo_device
+from car_smart_assist.config.detection import YOLO_AGNOSTIC_NMS, inference_half, inference_precision, resolve_yolo_device
 from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
 from car_smart_assist.perception.yolo_postprocess import (
-    calibration_path, detection_predictor_class, load_calibration,
+    calibration_identity, calibration_path, detection_predictor_class, load_calibration, read_fp32_reference,
 )
 
 
@@ -54,15 +54,30 @@ class YoloDetectionPredictor:
         self.model = model
         self.cfg = cfg
         self.device = resolve_yolo_device(cfg["device"])
+        self._half = inference_half(cfg, self.device)
         result = load_calibration(project_root, cfg, model.names)
+        self._bind_thresholds(result)
+
+    def _bind_thresholds(self, result):
         self.confidence = float(result["confidence_threshold"])
         self.class_thresholds = result["class_confidence_thresholds"]
         self.predictor_class = detection_predictor_class(self.confidence, self.class_thresholds)
         # model.names可能已初始化默认predictor；predict(predictor=...)仅在首次创建时生效。
         self.model.predictor = None
 
+    def use_fp32_reference_for_benchmark(self, root: Path, path: Path) -> str:
+        """Bind audited common thresholds to a dedicated, freshly built benchmark detector."""
+        if self.model.predictor is not None:
+            raise ValueError("Set benchmark reference before the first prediction")
+        names = self.model.names
+        reference, digest = read_fp32_reference(path, calibration_identity(root, self.cfg, names), names)
+        self._bind_thresholds(reference)
+        return digest
+
     @classmethod
     def from_config(cls, cfg: dict[str, Any], project_root: Path):
+        if inference_precision(cfg) == "fp16":
+            inference_half(cfg, resolve_yolo_device(cfg["device"]))
         calibration = calibration_path(project_root, cfg)
         if not calibration.is_file():
             raise FileNotFoundError(f"Current detection calibration missing; recalibrate first: {calibration}")
@@ -82,6 +97,7 @@ class YoloDetectionPredictor:
             source=source,
             device=self.device,
             imgsz=args["imgsz"],
+            half=getattr(self, "_half", False),
             conf=self.confidence,
             iou=args["iou"],
             max_det=args["max_det"],

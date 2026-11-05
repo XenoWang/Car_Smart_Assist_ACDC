@@ -183,6 +183,42 @@ def test_diagnostic_capture_must_cover_evaluated_images(tmp_path, monkeypatch, c
     assert not (output / YOLO_POSTPROCESS_VERSION / "val.json").exists()
 
 
+def test_validation_uses_the_exact_reference_file_and_preserves_its_thresholds(tmp_path, monkeypatch):
+    import hashlib
+
+    calls = []
+    _fake_backend(monkeypatch, tmp_path, calls)
+    reference = tmp_path / "archived.json"
+    payload = {
+        "schema_version": 2, "split": "calibration", "passes": ["proposal_sweep", "locked"],
+        "confidence_threshold": 0.42, "class_confidence_thresholds": {"car": 0.375},
+        "class_threshold_sources": {"car": "calibration"},
+    }
+    raw = json.dumps(payload, indent=2).encode()
+    reference.write_bytes(raw)
+    monkeypatch.setattr(evaluate, "select_thresholds", lambda *a, **kw: pytest.fail("Unexpected recalibration"))
+    output = tmp_path / "new"
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--split", "val", "--output-dir", str(output),
+                                     "--reference-fp32-calibration", str(reference)])
+    assert evaluate.main() == 0
+    report = json.loads((output / YOLO_POSTPROCESS_VERSION / "val.json").read_bytes())
+    assert calls == [("val", evaluate.YOLO_AP_MODE, None), ("val", evaluate.YOLO_LOCKED_MODE, 0.42)]
+    assert report["class_confidence_thresholds"] == {"car": 0.375}
+    assert report["threshold_source"] == "fp32_reference"
+    assert report["reference_calibration_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert reference.read_bytes() == raw
+
+
+@pytest.mark.parametrize("split", ["calibration", "test"])
+def test_fixed_reference_is_limited_to_validation(tmp_path, monkeypatch, split):
+    calls = []
+    _fake_backend(monkeypatch, tmp_path, calls)
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--split", split, "--output-dir", str(tmp_path / "out"),
+                                     "--reference-fp32-calibration", str(tmp_path / "absent.json")])
+    assert evaluate.main() == 2
+    assert calls == [] and not (tmp_path / "out").exists()
+
+
 def test_atomic_report_failure_preserves_existing_file(tmp_path, monkeypatch):
     path = tmp_path / "report.json"
     path.write_text('{"old": true}', encoding="utf-8")

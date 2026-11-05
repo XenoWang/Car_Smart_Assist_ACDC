@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: E402
 
 from car_smart_assist.config.detection import (  # noqa: E402
+    inference_precision,
     load_yolo_config,
     resolve_yolo_device,
     validate_joint_dataset_options,
@@ -263,6 +264,8 @@ def main() -> int:
         if Path(name).name != name or name in (".", ".."):
             raise ValueError("Run name must be a simple directory name")
         if not args.stop:
+            if inference_precision(cfg) == "fp16":
+                raise ValueError("FP16 inference configuration is for evaluation and prediction only")
             configure_yolo_environment(root)
             from ultralytics.cfg import DEFAULT_CFG_DICT
 

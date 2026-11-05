@@ -133,6 +133,7 @@ class InferencePipeline:
         weather_checkpoint: str | Path | None = None,
         weather_config: str | Path | None = None,
         weather_loss: str = "focal",
+        detection_config: str | Path | None = None,
     ) -> InferencePipeline:
         """按配置构建管线。
 
@@ -143,6 +144,14 @@ class InferencePipeline:
                 因为「看不见却不出声」正是这套系统最不能接受的失败模式。
         """
         root = Path(project_root)
+        if detection_config is not None:
+            if predictor is not None:
+                raise ValueError("Choose either a detection configuration or an injected predictor")
+            detection_paths = (root / detection_config,)
+            if not detection_paths[0].is_file():
+                raise FileNotFoundError(f"Detection configuration missing: {detection_paths[0]}")
+        else:
+            detection_paths = (root / "configs/model/yolo_detection.yaml", root / "configs/model/yolo_acdc_baseline.yaml")
         if device is not None:
             try:
                 selected_device = select_device(str(device).strip().lower())
@@ -256,10 +265,6 @@ class InferencePipeline:
         elif weather_checkpoint is not None:
             raise FileNotFoundError(f"天气模型配置不存在: {weather_config_path}")
 
-        detection_paths = (
-            root / "configs/model/yolo_detection.yaml",
-            root / "configs/model/yolo_acdc_baseline.yaml",
-        )
         predictor_unavailable_reason = None
         for detection_config_path in detection_paths:
             if predictor is not None or not detection_config_path.is_file():

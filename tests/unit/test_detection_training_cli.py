@@ -121,6 +121,15 @@ def test_matching_completed_model_without_full_state_is_rejected(tmp_path):
     assert {path: path.read_bytes() for path in before} == before
 
 
+def test_half_precision_inference_recipe_is_rejected_before_training_setup(monkeypatch, capsys):
+    import sys
+
+    monkeypatch.setattr(sys, "argv", ["train_detection.py", "--config", "configs/model/yolo_fp16.yaml"])
+    monkeypatch.setattr(cli, "configure_yolo_environment", lambda *a: pytest.fail("Reached training setup"))
+    assert cli.main() == 2
+    assert "for evaluation and prediction only" in capsys.readouterr().err
+
+
 def test_new_directory_finetunes_old_best_without_old_state_or_fitness(tmp_path, monkeypatch):
     cfg, manifest, source_run = setup_run(tmp_path, state_version=3)
     metadata_path = source_run / "run_metadata.json"
