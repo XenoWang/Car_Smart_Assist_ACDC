@@ -6,8 +6,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
 from car_smart_assist.advisory.schema import PerceptionResult, TargetObject
 from car_smart_assist.config.detection import YOLO_AGNOSTIC_NMS, resolve_yolo_device
 from car_smart_assist.data.image_input import ImageInput, to_rgb_uint8
@@ -78,9 +76,10 @@ class YoloDetectionPredictor:
         args = self.cfg["inference"]
         if not isinstance(self.model.predictor, self.predictor_class):
             self.model.predictor = None
-        # PIL 输入是 RGB。Ultralytics 把 numpy 输入当 BGR 处理，所以不要把 RGB 数组直接传进去。
+        # 数组入口按BGR解释；独立连续副本避免往返Pillow并隔离调用方像素。
+        source = image[..., ::-1].copy(order="C")
         result = self.model.predict(
-            source=Image.fromarray(image),
+            source=source,
             device=self.device,
             imgsz=args["imgsz"],
             conf=self.confidence,
@@ -90,11 +89,13 @@ class YoloDetectionPredictor:
             predictor=self.predictor_class,
             verbose=False,
         )[0]
+        # 整组框只搬运一次；随后三个字段都在CPU读取，顺序和数值保持。
+        boxes = result.boxes.cpu()
         objects = []
         for box, score, label in zip(
-            result.boxes.xyxy.cpu().tolist(),
-            result.boxes.conf.cpu().tolist(),
-            result.boxes.cls.cpu().tolist(),
+            boxes.xyxy.tolist(),
+            boxes.conf.tolist(),
+            boxes.cls.tolist(),
             strict=True,
         ):
             category = result.names[int(label)]

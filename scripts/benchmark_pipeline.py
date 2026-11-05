@@ -60,7 +60,11 @@ def _count(text: str, *, allow_zero: bool = False) -> int:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", action="append", required=True, help="Explicit image path; repeat in order")
+    parser.add_argument("--image", action="append", default=[], help="Explicit image path; repeat in order")
+    parser.add_argument("--image-list", help="UTF-8 JSON array of paths, relative to project root")
+    parser.add_argument("--profile-stages", action="store_true", help="Separate synchronized diagnostic passes")
+    parser.add_argument("--profile-repeats", type=_count, default=3)
+    parser.add_argument("--target-fps", type=float, default=30.0)
     parser.add_argument("--image-range", nargs=2, type=float, metavar=("MIN", "MAX"),
                         help="Fixed input code range, e.g. 0 4095 for processed 12-bit images")
     parser.add_argument("--config", default="configs/model/visibility.yaml")
@@ -77,6 +81,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", "--output", dest="output_dir", required=True,
                         help="A new directory; existing directories are refused")
     args = parser.parse_args(argv)
+    if args.image_list:
+        try:
+            listed = json.loads(_path(args.image_list).read_text(encoding="utf-8-sig"))
+            if not isinstance(listed, list) or not listed or not all(isinstance(p, str) and p.strip() for p in listed):
+                raise ValueError("Expected a nonempty JSON list of image paths")
+        except (OSError, ValueError) as exc:
+            parser.error(f"Invalid --image-list: {exc}")
+        args.image.extend(listed)
+    if not args.image:
+        parser.error("Provide --image or --image-list")
+    if not math.isfinite(args.target_fps) or args.target_fps <= 0:
+        parser.error("--target-fps must be finite and positive")
     if args.image_range is not None:
         low, high = args.image_range
         if not all(math.isfinite(value) for value in (low, high, high - low)) or high <= low:
@@ -162,6 +178,8 @@ def _artifact_paths(args: argparse.Namespace, visibility: dict, yaml: Any) -> di
                 if raw.get(key):
                     paths[f"{name}_{key}_candidate"] = _path(raw[key])
             paths[f"{name}_calibration"] = calibration_path(ROOT, raw)
+    if getattr(args, "profile_stages", False):
+        paths["profiling_source"] = ROOT / "src/car_smart_assist/inference/profiling.py"
     return {key: path.resolve() for key, path in paths.items()}
 
 
@@ -553,6 +571,23 @@ def _summary(measurements: list[dict], frames: list[dict], construction_ms: floa
     }
 
 
+def _realtime_target(summary: dict, batch_size: int, target_fps: float) -> dict:
+    full = summary["modes"]["arrays"]["steady"]["batch_observations"]["full_perception_only_excluding_blind"]
+    budget = 1000.0 / target_fps
+    eligible = batch_size == 1 and full["frame_count"] > 0
+    healthy = summary["status"] == "complete"
+    met = eligible and healthy and full["frames_per_second"] >= target_fps and full["wall_ms"]["p95"] <= budget
+    return {
+        "target_fps": target_fps, "p95_budget_ms": budget,
+        "status": ("meets_on_observed_sample" if met else "does_not_meet_on_observed_sample")
+                  if eligible and healthy else "inconclusive",
+        "full_frame_observations": full["frame_count"],
+        "observed_fps": full["frames_per_second"], "observed_p95_ms": full["wall_ms"]["p95"],
+        "scope": "Uninstrumented warmed predecoded batch=1 full routes; BLIND excluded; no camera/queue/display",
+        "limitation": "Sample-specific desktop observation, not vehicle certification or evidence of generalization",
+    }
+
+
 def _write_json(path: Path, payload: Any) -> None:
     text = json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
     with path.open("x", encoding="utf-8", newline="\n") as stream:
@@ -595,7 +630,11 @@ def main(argv: list[str] | None = None) -> int:
     refs = {"benchmark_script": Path(__file__).resolve(), "visibility_config": _path(args.config)}
     refs.update({f"input_{index}": path for index, path in enumerate(images)})
     initial = {role: _stat(path) for role, path in refs.items()}
+    if getattr(args, "image_list", None):
+        refs["image_list"] = _path(args.image_list)
+        initial["image_list"] = _stat(refs["image_list"])
     construction_ms = None
+    stage_profile = None
     fatal = None
     array_error = "Array mode has not run"
     torch = None
@@ -706,6 +745,23 @@ def main(argv: list[str] | None = None) -> int:
                 for iteration in range(passes):
                     _run_pass(pipe, arrays, images, torch, devices, "arrays", phase, iteration,
                               args.batch_size, measurements, frames)
+        if getattr(args, "profile_stages", False) and not array_error:
+            from car_smart_assist.inference.profiling import PipelineStageProfiler
+
+            diagnostic_rows, diagnostic_frames = [], []
+            with PipelineStageProfiler(pipe, lambda: _sync(torch, devices)) as profiler:
+                for iteration in range(args.profile_repeats):
+                    profiler.iteration = iteration
+                    for index, array in enumerate(arrays):
+                        profiler.frame_index = index
+                        before = len(diagnostic_frames)
+                        _run_pass(pipe, [array], [images[index]], torch, devices, "arrays",
+                                  "stage_diagnostic", iteration, 1, diagnostic_rows, diagnostic_frames)
+                        for frame in diagnostic_frames[before:]:
+                            frame["input_index"] = index
+            stage_profile = profiler.report(_distribution)
+            stage_profile["frames"] = diagnostic_frames
+            stage_profile["route_failures"] = sum(not frame["route_success"] for frame in diagnostic_frames)
         metadata["components_after_all_calls"] = _components(pipe)
     except Exception as exc:  # noqa: BLE001
         fatal = f"{type(exc).__name__}: {exc}"
@@ -729,10 +785,21 @@ def main(argv: list[str] | None = None) -> int:
     metadata["finished_utc"] = datetime.now(UTC).isoformat()
     files_changed = any(record["changed_during_run"] for record in metadata["files"].values())
     summary = _summary(measurements, frames, construction_ms, fatal, array_error, files_changed)
+    if getattr(args, "profile_stages", False):
+        summary["stage_profile_file"] = "stage_profile.json" if stage_profile is not None else None
+        summary["stage_profile_status"] = (
+            "complete" if stage_profile is not None and not stage_profile["route_failures"]
+            and not stage_profile["missing_stages"] else "incomplete"
+        )
+        if summary["stage_profile_status"] != "complete":
+            summary["status"] = "incomplete"
+    summary["realtime_target"] = _realtime_target(summary, args.batch_size, getattr(args, "target_fps", 30.0))
     metadata["status"] = summary["status"]
     _write_json(output / "metadata.json", metadata)
     _write_json(output / "summary.json", summary)
     _write_json(output / "frames.json", {"frames": frames})
+    if stage_profile is not None:
+        _write_json(output / "stage_profile.json", stage_profile)
     with (output / "measurements.csv").open("x", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_FIELDS)
         writer.writeheader()

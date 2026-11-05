@@ -207,6 +207,9 @@ class _Column:
 
 
 class _Boxes:
+    def cpu(self):
+        return self
+
     xyxy = _Column([[1.0, 2.0, 3.0, 4.0]])
     conf = _Column([0.75])
     cls = _Column([0.0])
@@ -228,7 +231,7 @@ class _YoloModel:
         return [_YoloResult()]
 
 
-def test_yolo_adapter_receives_rgb_pil_pixels_from_bgr_frame(monkeypatch, tmp_path):
+def test_yolo_adapter_preserves_bgr_frame_pixels_at_numpy_source(monkeypatch, tmp_path):
     from car_smart_assist.config import detection
 
     monkeypatch.setattr(detection, "resolve_yolo_device", lambda value: value)
@@ -249,9 +252,9 @@ def test_yolo_adapter_receives_rgb_pil_pixels_from_bgr_frame(monkeypatch, tmp_pa
     monkeypatch.setattr(yolo_module, "YOLO_AGNOSTIC_NMS", False)
     source = np.array([[[0, 85, 170], [255, 170, 85]]], np.uint8)
     output = predictor.predict(ImageFrame(source[..., ::-1], pixel_format="BGR"))
-    pil_source = model.calls[0]["source"]
-    assert isinstance(pil_source, Image.Image)
-    np.testing.assert_array_equal(np.asarray(pil_source), source)
+    array_source = model.calls[0]["source"]
+    assert isinstance(array_source, np.ndarray) and array_source.flags.c_contiguous
+    np.testing.assert_array_equal(array_source, np.array([[[170, 85, 0], [85, 170, 255]]], np.uint8))
     assert output.object_detection_available and output.objects[0].category == "car"
 
 

@@ -78,6 +78,10 @@ def main() -> int:
     parser.add_argument("--checkpoint", default=None)
     parser.add_argument("--split", choices=("val", "calibration", "test"), default="val")
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--device", default=None, help="Explicit device override for this evaluation only")
+    parser.add_argument("--diagnostics", action="store_true", help="Write independent locked-point size/error diagnostics")
+    parser.add_argument("--use-deployment-calibration", action="store_true",
+                        help="For val/test, read matching configured calibration without rewriting it")
     parser.add_argument(
         "--imgsz", type=int, default=None, help="Validation-only input size comparison"
     )
@@ -85,6 +89,18 @@ def main() -> int:
     root = Path(__file__).resolve().parents[1]
     try:
         cfg = load_yolo_config(root / args.config)
+        if args.device is not None:
+            cfg["device"] = args.device
+        if args.use_deployment_calibration and args.split == "calibration":
+            raise ValueError("--use-deployment-calibration requires val or test")
+        if args.diagnostics or args.use_deployment_calibration:
+            if args.output_dir is None:
+                raise ValueError("Baseline diagnostics require a new independent --output-dir")
+            requested_output = (root / args.output_dir).resolve()
+            if requested_output.exists():
+                raise FileExistsError(f"Baseline output already exists: {requested_output}")
+            if args.split == "calibration":
+                raise ValueError("Diagnostics must not select calibration thresholds")
         if args.imgsz is not None:
             if args.split != "val" or args.imgsz <= 0:
                 raise ValueError("--imgsz is positive and only available for val comparisons")
@@ -96,10 +112,12 @@ def main() -> int:
                 raise ValueError(f"A non-default checkpoint requires an independent --output-dir for {args.split}")
         if not checkpoint.is_file():
             raise FileNotFoundError(f"Trained weights missing: {checkpoint}")
-        if args.split == "test" and not calibration_file.is_file():
+        if args.split == "test" and not args.use_deployment_calibration and not calibration_file.is_file():
             raise FileNotFoundError(
                 f"Current detection calibration missing; recalibrate first: {calibration_file}"
             )
+        if args.diagnostics or args.use_deployment_calibration:
+            requested_output.mkdir(parents=True, exist_ok=False)
         output = calibration_file.parent
         output.mkdir(parents=True, exist_ok=True)
         selected_data = root / cfg["data"]
@@ -115,9 +133,10 @@ def main() -> int:
             confidence = float(cfg["inference"]["confidence"])
             thresholds = {name: confidence for name in names}
             threshold_sources = {name: "config" for name in names}
-            if args.split == "test":
+            if args.split == "test" or args.use_deployment_calibration:
                 calibration = load_calibration(
-                    root, cfg, model.names, output_dir=args.output_dir,
+                    root, cfg, model.names,
+                    output_dir=None if args.use_deployment_calibration else args.output_dir,
                     checkpoint=checkpoint, manifest=manifest,
                 )
                 confidence = float(calibration["confidence_threshold"])
@@ -130,10 +149,19 @@ def main() -> int:
             )
 
             base = JointValidator if manifest.get("joint_supervision") else DeploymentValidator
+            diagnostics = None
+            if args.diagnostics:
+                from car_smart_assist.perception.detection_diagnostics import DetectionDiagnostics
+                diagnostics = DetectionDiagnostics(names)
             output.mkdir(parents=True, exist_ok=True)
 
             def validate(mode, locked_confidence=None, class_thresholds=None):
-                class Validator(base):
+                selected_base = base
+                if diagnostics is not None and mode == YOLO_LOCKED_MODE:
+                    from car_smart_assist.perception.detection_diagnostics import diagnostic_validator
+                    selected_base = diagnostic_validator(base, diagnostics)
+
+                class Validator(selected_base):
                     pass
 
                 Validator.postprocess_mode = mode
@@ -178,7 +206,7 @@ def main() -> int:
                 "class_confidence_thresholds": thresholds,
                 "class_threshold_sources": threshold_sources,
                 "threshold_source": (
-                    "calibration" if args.split in ("calibration", "test") else "config"
+                    "calibration" if args.split in ("calibration", "test") or args.use_deployment_calibration else "config"
                 ),
                 "passes": [sweep_mode, YOLO_LOCKED_MODE],
                 "sweep": {
@@ -201,7 +229,8 @@ def main() -> int:
                 "per_class_operating_iou50": per_class,
                 "image_count": sum(row["split"] == args.split for row in manifest["images"]),
                 "threshold_selection_scope": (
-                    "config" if args.split == "val"
+                    "existing matching deployment calibration" if args.use_deployment_calibration
+                    else "config" if args.split == "val"
                     else "F1 proposal curves; not a global optimum under formal budgets"
                 ),
                 "evaluation_scope": (
@@ -227,6 +256,18 @@ def main() -> int:
             report_file = output / (
                 "calibration_report.json" if args.split == "calibration" else args.split + ".json"
             )
+            if diagnostics is not None:
+                diagnostic_file = output / f"{args.split}_diagnostics.json"
+                if len(diagnostics.frames) != report["image_count"]:
+                    raise ValueError("Diagnostic frame coverage differs from the evaluated split")
+                diagnostic_report = diagnostics.report()
+                diagnostic_report.update(identity=identity, split=args.split,
+                                         class_confidence_thresholds=thresholds,
+                                         threshold_source=report["threshold_source"])
+                atomic_json(diagnostic_file, diagnostic_report)
+                report["diagnostics_file"] = str(diagnostic_file)
+            if args.use_deployment_calibration:
+                report["calibration_source_file"] = str(calibration_path(root, cfg))
             if args.split == "calibration":
                 validate_calibration(report, identity, model.names)
             atomic_json(report_file, report)
