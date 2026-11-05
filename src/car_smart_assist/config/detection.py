@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,39 @@ YOLO_MAX_WH = 7680
 YOLO_AGNOSTIC_NMS = False
 
 
+def normalize_classification_loss(value=None):
+    """Canonical training recipe; the omitted/legacy path remains plain BCE."""
+    if value is None:
+        return {"mode": "bce"}
+    if not isinstance(value, dict):
+        raise ValueError("classification_loss must be a mapping or null")
+    unknown = set(value) - {"mode", "alpha", "gamma"}
+    if unknown:
+        raise ValueError("Unknown classification_loss keys: " + ", ".join(sorted(map(str, unknown))))
+    mode = value.get("mode", "bce")
+    if not isinstance(mode, str) or mode not in {"bce", "vfl"}:
+        raise ValueError("classification_loss.mode must be bce or vfl")
+    if mode == "bce":
+        if set(value) - {"mode"}:
+            raise ValueError("classification_loss alpha/gamma are only supported for vfl")
+        return {"mode": "bce"}
+    recipe = {"mode": "vfl"}
+    for name, default in (("alpha", 0.75), ("gamma", 2.0)):
+        number = value.get(name, default)
+        if isinstance(number, bool) or not isinstance(number, Real) or not math.isfinite(number) or number < 0:
+            raise ValueError(f"classification_loss.{name} must be a finite nonnegative number")
+        recipe[name] = float(number)
+    return recipe
+
+
 def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
     joint = bool(manifest.get("joint_supervision"))
-    return {
+    recipe = normalize_classification_loss(cfg.get("classification_loss"))
+    if recipe["mode"] == "vfl" and not joint:
+        raise ValueError("VFL requires the joint supervised detection route")
+    contract = {
         "schema_version": 1,
         "postprocess_version": YOLO_POSTPROCESS_VERSION,
         "ap_mode": YOLO_AP_MODE,
@@ -48,6 +77,9 @@ def yolo_model_selection_contract(cfg, manifest):
             "foreground_exclusive": cfg.get("joint_foreground_exclusive", True),
         } if joint else None,
     }
+    if recipe["mode"] != "bce":
+        contract["training_classification_loss"] = recipe
+    return contract
 
 
 def yolo_selection_validator_args(contract):
@@ -74,6 +106,8 @@ def validate_joint_dataset_options(options):
 def load_yolo_config(path: Path) -> dict[str, Any]:
     try:
         cfg = yaml.safe_load(path.read_text(encoding="utf-8"))["yolo_detection"]
+        if "classification_loss" in cfg:
+            cfg["classification_loss"] = normalize_classification_loss(cfg["classification_loss"])
         train = cfg["train"]
         for name in ("epochs", "seed", "imgsz", "batch", "workers", "patience"):
             if type(train[name]) is not int or train[name] < 0:

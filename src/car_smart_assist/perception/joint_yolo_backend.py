@@ -19,7 +19,7 @@ from car_smart_assist.perception.joint_yolo import (
     preserve_classification_outputs,
 )
 from car_smart_assist.perception.yolo_training import detection_trainer_for_resume
-from car_smart_assist.config.detection import YOLO_AP_MODE, validate_joint_dataset_options
+from car_smart_assist.config.detection import YOLO_AP_MODE, normalize_classification_loss, validate_joint_dataset_options
 from car_smart_assist.perception.yolo_postprocess import postprocess_detection
 
 # 导入 Ultralytics 时会初始化 settings，这份初始化要留在项目里。
@@ -269,6 +269,9 @@ class JointValidator(DeploymentValidator):
 
 
 def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None):
+    classification_loss = normalize_classification_loss(selection_contract.get("training_classification_loss"))
+    if classification_loss["mode"] == "vfl" and selection_contract.get("joint_selection") is None:
+        raise ValueError("VFL requires a joint model-selection contract")
     base = detection_trainer_for_resume(resume_state, selection_contract, validated_data=validated_data)
 
     class Trainer(base):
@@ -319,12 +322,15 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
             model.joint_detection = True
             model.joint_obstacle_class = manifest["known_class_count"]
             model.joint_foreground_exclusive = foreground_exclusive
+            model.joint_classification_loss = dict(classification_loss)
             return model
 
         def set_model_attributes(self):
             super().set_model_attributes()
+            self.model.joint_classification_loss = dict(classification_loss)
             self.model.criterion = JointDetectionLoss(
-                self.model, self.model.joint_obstacle_class, self.model.joint_foreground_exclusive
+                self.model, self.model.joint_obstacle_class, self.model.joint_foreground_exclusive,
+                classification_loss=classification_loss,
             )
 
         def get_validator(self):

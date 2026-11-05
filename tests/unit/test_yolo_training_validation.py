@@ -216,8 +216,9 @@ def test_joint_selection_contract_includes_source_policy():
     }
 
 
+@pytest.mark.parametrize("loss_mode", ["bce", "vfl"])
 def test_training_main_persists_selection_contract_in_metadata_and_summary(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, loss_mode
 ):
     import importlib.util
 
@@ -256,6 +257,8 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
         "inference": {"imgsz": 960, "confidence": 0.25, "iou": 0.5, "max_det": 100},
         "joint_foreground_exclusive": False,
     }
+    if loss_mode == "vfl":
+        cfg["classification_loss"] = {"mode": "vfl", "alpha": 0.75, "gamma": 2.0}
     monkeypatch.setattr(cli, "load_yolo_config", lambda _path: cfg)
     validation_calls = []
     def validate_export(_root, selected_data, _mapping=None, *, verify_hashes=False):
@@ -306,6 +309,9 @@ def test_training_main_persists_selection_contract_in_metadata_and_summary(
         "joint_selection": {"known_class_count": 8, "source_weights": {"acdc": 0.75, "lost_and_found": 0.25},
                             "valid_roi_ids": [1, 2], "foreground_exclusive": False},
     }
+    if loss_mode == "vfl":
+        expected["training_classification_loss"] = {"mode": "vfl", "alpha": 0.75, "gamma": 2.0}
+    assert "classification_loss" not in captured["train_kwargs"]
     assert validation_calls == [data_dir / "data.yaml"]
     run = Path(cfg["project"]) / cfg["name"]
     metadata = json.loads((run / "run_metadata.json").read_text(encoding="utf-8"))

@@ -6,13 +6,23 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from car_smart_assist.config.detection import normalize_classification_loss
+
+
+def _loss_recipe(value):
+    # Empty mapping is an upper-level config default, not an implicit low-level disable.
+    if value is not None and (not isinstance(value, dict) or "mode" not in value):
+        raise ValueError("Low-level classification_loss requires an explicit mode or None")
+    return normalize_classification_loss(value)
+
 
 class MaskedClassificationLoss(nn.Module):
-    def __init__(self, foreground_exclusive=True):
+    def __init__(self, foreground_exclusive=True, *, classification_loss=None):
         super().__init__()
         self.valid = None
         self.weights = None
         self.foreground_exclusive = foreground_exclusive
+        self.classification_loss = _loss_recipe(classification_loss)
 
     def forward(self, predictions, targets):
         if self.valid is None:
@@ -25,19 +35,39 @@ class MaskedClassificationLoss(nn.Module):
             # 未标注背景位置仍由来源／ROI限制监督；正样本位置可监督其他类别为负。
             positives = positives.any(dim=-1, keepdim=True)
         allowed = self.valid | positives
-        return (
-            F.binary_cross_entropy_with_logits(predictions, targets, reduction="none")
-            * allowed
-            * self.weights
-        )
+        # Old serialized loss objects have no recipe field; their BCE arithmetic stays exact.
+        recipe = getattr(self, "classification_loss", None)
+        if recipe is None or recipe["mode"] == "bce":
+            return (
+                F.binary_cross_entropy_with_logits(predictions, targets, reduction="none")
+                * allowed
+                * self.weights
+            )
+        # q is the existing TAL quality target, not a newly assigned pure-IoU target.
+        # Keep this unreduced: the owning criterion applies its original sum/normalizer.
+        with torch.autocast(device_type=predictions.device.type, enabled=False):
+            logits = predictions.float() if predictions.dtype in (torch.float16, torch.bfloat16) else predictions
+            quality = targets.to(dtype=logits.dtype)
+            focal_weight = torch.where(
+                quality > 0,
+                quality,
+                recipe["alpha"] * logits.sigmoid().pow(recipe["gamma"]),
+            )
+            return (
+                F.binary_cross_entropy_with_logits(logits, quality, reduction="none")
+                * focal_weight
+                * allowed
+                * self.weights
+            )
 
 
 class JointDetectionLoss:
-    def __init__(self, model, obstacle_class, foreground_exclusive=True):
+    def __init__(self, model, obstacle_class, foreground_exclusive=True, *, classification_loss=None):
+        recipe = _loss_recipe(classification_loss)
         from ultralytics.utils.loss import v8DetectionLoss
 
         self.base = v8DetectionLoss(model)
-        self.base.bce = MaskedClassificationLoss(foreground_exclusive)
+        self.base.bce = MaskedClassificationLoss(foreground_exclusive, classification_loss=recipe)
         self.obstacle_class = obstacle_class
 
     def __call__(self, predictions, batch):
