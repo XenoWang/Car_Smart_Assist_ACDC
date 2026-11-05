@@ -285,6 +285,10 @@ def main() -> int:
                 root, cfg["data"],
                 joint_data_config=args.joint_data_config or cfg.get("joint_data_config"), directory=run,
             ))
+            view_options = {}
+            if cfg.get("training_view") is not None:
+                from car_smart_assist.perception.detection_crops import load_windows
+                view_options["training_windows"] = load_windows(root, cfg, manifest)
             metadata_path = run / "run_metadata.json"
             plan = resolve_training_plan(
                 root,
@@ -367,6 +371,7 @@ def main() -> int:
                 trainer_class = joint_trainer(
                     plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
                     selection_contract=plan["model_selection_contract"], validated_data=data,
+                    **view_options,
                 )
             if plan["resume_state"] is not None:
                 save_metadata(None)
@@ -400,12 +405,21 @@ def main() -> int:
                     ).items()
                 },
             }
+            if cfg.get("training_view") and not final_state.get("manual_stop", False):
+                summary["paired_budget"] = model.trainer.paired_budget()
             (run / "validation_summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return STOP_EXIT_CODE if final_state.get("manual_stop") or controller.requested else 0
     except (ImportError, OSError, ValueError, KeyError, TypeError, RuntimeError, Timeout) as exc:
+        if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+            import traceback
+
+            traceback.print_exc()
+            if torch.cuda.is_initialized():
+                print(f"CUDA allocator peak bytes: allocated={torch.cuda.max_memory_allocated()}, "
+                      f"reserved={torch.cuda.max_memory_reserved()}", file=sys.stderr)
         print(f"YOLO training failed: {exc}", file=sys.stderr)
         return 2
 

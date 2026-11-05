@@ -26,7 +26,14 @@ def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
     joint = bool(manifest.get("joint_supervision"))
+    view = {}
+    if cfg.get("training_view") is not None:
+        from car_smart_assist.perception.detection_crops import recipe_identity
+        if not joint:
+            raise ValueError("Training views require joint ROI supervision")
+        view["training_view"] = recipe_identity(cfg)
     return {
+        **view,
         "schema_version": 1,
         "postprocess_version": YOLO_POSTPROCESS_VERSION,
         "ap_mode": YOLO_AP_MODE,

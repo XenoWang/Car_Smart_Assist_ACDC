@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from inspect import signature
 import json
 import os
@@ -14,6 +15,7 @@ from PIL import Image
 
 from car_smart_assist.data.joint_paths import resolve_joint_manifest
 from car_smart_assist.perception.detection_yolo import configure_yolo_environment
+from car_smart_assist.perception.detection_crops import cropped_sample
 from car_smart_assist.perception.joint_yolo import (
     JointDetectionLoss,
     preserve_classification_outputs,
@@ -53,7 +55,10 @@ def native_roi(row, manifest):
 
 
 class JointDataset(YOLODataset):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, training_windows=None, **kwargs):
+        self.training_windows = training_windows or {}
+        if self.training_windows and not kwargs.get("augment"):
+            raise ValueError("Crop views are restricted to training")
         options = signature(BaseDataset.__init__).bind_partial(
             self, *args, **{key: value for key, value in kwargs.items() if key not in ("data", "task")}
         ).arguments
@@ -64,12 +69,27 @@ class JointDataset(YOLODataset):
         self.manifest, self.index = load_joint_index(kwargs["data"])
         super().__init__(*args, **kwargs)
 
+    def get_image_and_label(self, index):
+        if getattr(self, "training_windows", None):
+            row = self.index[str(Path(self.im_files[index]).resolve())]
+            view = self.training_windows.get(row["image"])
+            if view is not None:
+                return cropped_sample(self, index, view)
+        return super().get_image_and_label(index)
+
     def __getitem__(self, item):
         labels = self.get_image_and_label(item)
         row = self.index[str(Path(labels["im_file"]).resolve())]
         roi = None
         if row["roi_mask"]:
             raw = native_roi(row, self.manifest).astype(np.uint8)
+            windows = getattr(self, "training_windows", None)
+            if windows and row["image"] in windows:
+                view = windows[row["image"]]
+                if list(raw.shape[::-1]) != view["size"]:
+                    raise ValueError("Native ROI and source frame dimensions differ")
+                x1, y1, x2, y2 = view["xyxy"]
+                raw = raw[y1:y2, x1:x2]
             # BaseDataset.load_image已按长边/ceil缩放，保留这一实际中间尺寸。
             resized_height, resized_width = labels["img"].shape[:2]
             resized = cv2.resize(
@@ -95,6 +115,8 @@ class JointDataset(YOLODataset):
             roi = np.zeros((target_height, target_width), dtype=np.uint8)
             roi[top : top + unpad_height, left : left + unpad_width] = resized
         sample = self.transforms(labels)
+        if getattr(self, "training_windows", None):
+            sample["paired_crop_applied"] = row["image"] in self.training_windows
         height, width = sample["img"].shape[-2:]
         if roi is None:
             roi = np.ones((height, width), dtype=np.uint8)
@@ -268,7 +290,8 @@ class JointValidator(DeploymentValidator):
         return {key: value[keep] for key, value in result.items()}
 
 
-def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None):
+def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract, validated_data=None,
+                  training_windows=None):
     base = detection_trainer_for_resume(resume_state, selection_contract, validated_data=validated_data)
 
     class Trainer(base):
@@ -306,6 +329,7 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
                 pad=0.0 if mode == "train" else 0.5,
                 data=self.data,
                 task="detect",
+                **({"training_windows": training_windows} if mode == "train" and training_windows else {}),
             )
 
         def get_model(self, cfg=None, weights=None, verbose=True):
@@ -336,4 +360,27 @@ def joint_trainer(resume_state, foreground_exclusive=True, *, selection_contract
                 _callbacks=self.callbacks,
             )
 
-    return Trainer
+    if training_windows is None:
+        return Trainer
+
+    class PairedTrainer(Trainer):
+        def preprocess_batch(self, batch):
+            if not hasattr(self, "_paired_order"):
+                self._paired_order = hashlib.sha256()
+                self._paired_counts = {"images": 0, "batches": 0, "optimizer_updates": 0, "crop_views": 0}
+                self.optimizer.register_step_post_hook(self._count_update)
+            paths = batch["im_file"]
+            self._paired_order.update(json.dumps(list(paths), ensure_ascii=False).encode("utf-8") + b"\n")
+            self._paired_counts["crop_views"] += sum(batch.get("paired_crop_applied", ()))
+            self._paired_counts["images"] += len(paths)
+            self._paired_counts["batches"] += 1
+            return super().preprocess_batch(batch)
+
+        def _count_update(self, optimizer, args, kwargs):
+            self._paired_counts["optimizer_updates"] += 1
+
+        def paired_budget(self):
+            return {**self._paired_counts, "order_sha256": self._paired_order.hexdigest(),
+                    "scope": "batches processed in this invocation"}
+
+    return PairedTrainer
