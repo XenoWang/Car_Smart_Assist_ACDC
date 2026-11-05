@@ -21,6 +21,11 @@ class ArrayResult:
         return self.values
 
 
+class BoxesResult(SimpleNamespace):
+    def cpu(self):
+        return self
+
+
 def config():
     return {
         "device": "cpu",
@@ -66,7 +71,7 @@ def test_rgb_boxes_and_unimplemented_obstacle_capability(tmp_path, empty):
         return [
             SimpleNamespace(
                 names={0: "car", 1: "truck"},
-                boxes=SimpleNamespace(
+                boxes=BoxesResult(
                     xyxy=ArrayResult([] if empty else [[10, 20, 70, 45]]),
                     conf=ArrayResult([] if empty else [0.8]),
                     cls=ArrayResult([] if empty else [1]),
@@ -82,8 +87,8 @@ def test_rgb_boxes_and_unimplemented_obstacle_capability(tmp_path, empty):
     rgb = np.zeros((60, 90, 3), dtype=np.uint8)
     rgb[..., 0] = 255
     result = adapter.predict(rgb)
-    assert received["source"].getpixel((0, 0)) == (255, 0, 0)
-    assert received["source"].size == (90, 60)
+    np.testing.assert_array_equal(received["source"][0, 0], [0, 0, 255])
+    assert received["source"].shape == (60, 90, 3)
     assert result.object_detection_available
     assert result.to_dict()["object_detection_classes"] == ["car", "truck"]
     assert not result.road_obstacle_detection_available
@@ -118,7 +123,7 @@ def test_shared_image_contract_accepts_gray_and_unit_float_and_rejects_bad_input
 
     def predict(**kwargs):
         sources.append(np.asarray(kwargs["source"]).copy())
-        boxes = SimpleNamespace(
+        boxes = BoxesResult(
             xyxy=ArrayResult([]), conf=ArrayResult([]), cls=ArrayResult([]),
         )
         return [SimpleNamespace(boxes=boxes, names={0: "car", 1: "truck"})]
