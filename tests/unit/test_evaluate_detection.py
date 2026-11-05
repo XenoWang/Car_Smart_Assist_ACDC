@@ -128,6 +128,61 @@ def test_test_split_uses_locked_calibration_without_selecting_thresholds(tmp_pat
     assert report["operating_macro_f1_iou50"] == pytest.approx(2 / 3)
 
 
+
+
+@pytest.mark.parametrize("split", ["val", "test"])
+def test_baseline_reads_deployment_calibration_into_new_output_without_recalibrating(tmp_path, monkeypatch, split):
+    calls = []
+    _fake_backend(monkeypatch, tmp_path, calls)
+    loaded = []
+    def load(*args, **kwargs):
+        loaded.append(kwargs["output_dir"])
+        return {"confidence_threshold": 0.42, "class_confidence_thresholds": {"car": 0.42},
+                "class_threshold_sources": {"car": "calibration"}}
+    monkeypatch.setattr(evaluate, "load_calibration", load)
+    monkeypatch.setattr(evaluate, "select_thresholds", lambda *a, **k: pytest.fail("Must not recalibrate"))
+    output = tmp_path / "fresh"
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--split", split, "--output-dir", str(output),
+                                      "--use-deployment-calibration"])
+    assert evaluate.main() == 0
+    assert loaded == [None]  # Read configured source; new output is not the calibration source.
+    assert calls == [(split, evaluate.YOLO_AP_MODE, None), (split, evaluate.YOLO_LOCKED_MODE, 0.42)]
+    report = json.loads((output / YOLO_POSTPROCESS_VERSION / (split + ".json")).read_text(encoding="utf-8"))
+    assert report["threshold_source"] == "calibration"
+    assert report["threshold_selection_scope"] == "existing matching deployment calibration"
+    assert not (output / YOLO_POSTPROCESS_VERSION / "calibration.json").exists()
+
+
+def test_baseline_existing_report_is_refused_before_model_or_calibration(tmp_path, monkeypatch, capsys):
+    calls = []
+    _fake_backend(monkeypatch, tmp_path, calls)
+    marker = tmp_path / "old.json"
+    marker.write_bytes(b"old report")
+    monkeypatch.setattr(evaluate, "load_yolo_model", lambda *a: pytest.fail("Must reject before model loading"))
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--split", "val", "--diagnostics",
+                                      "--output-dir", str(tmp_path)])
+    assert evaluate.main() == 2
+    assert "Baseline output already exists" in capsys.readouterr().err
+    assert marker.read_bytes() == b"old report"
+    assert calls == []
+
+
+def test_diagnostic_capture_must_cover_evaluated_images(tmp_path, monkeypatch, capsys):
+    from contextlib import contextmanager
+    calls = []
+    _fake_backend(monkeypatch, tmp_path, calls)
+    @contextmanager
+    def scope(*args, **kwargs):
+        yield Path("unused.yaml"), {"images": [{"split": "val"}]}, None
+    monkeypatch.setattr(evaluate, "detection_data_scope", scope)
+    output = tmp_path / "fresh"
+    monkeypatch.setattr(sys, "argv", [str(SCRIPT), "--split", "val", "--diagnostics", "--output-dir", str(output)])
+    # This mock backend deliberately does not traverse any image. It must not publish a successful diagnostic.
+    assert evaluate.main() == 2
+    assert "Diagnostic frame coverage" in capsys.readouterr().err
+    assert not (output / YOLO_POSTPROCESS_VERSION / "val.json").exists()
+
+
 def test_atomic_report_failure_preserves_existing_file(tmp_path, monkeypatch):
     path = tmp_path / "report.json"
     path.write_text('{"old": true}', encoding="utf-8")
