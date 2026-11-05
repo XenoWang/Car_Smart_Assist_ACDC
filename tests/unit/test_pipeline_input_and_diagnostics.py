@@ -147,7 +147,8 @@ def test_candidate_val_requires_independent_output_before_models_or_report_write
     before = snapshot(protected)
     monkeypatch.setattr(cli, "__file__", str(tmp_path / "scripts/evaluate_detection.py"))
     monkeypatch.setattr(cli, "load_yolo_config", lambda _p: {
-        "checkpoint": "default.pt", "calibration_file": "reports/calibration.json", "data": "data/data.yaml"})
+        "checkpoint": "default.pt", "device": "cpu",
+        "calibration_file": "reports/calibration.json", "data": "data/data.yaml"})
     args = ["evaluate_detection.py", "--config", "unused.yaml", "--checkpoint", "candidate.pt", "--split", "val"]
     if independent:
         args += ["--output-dir", "candidate-results"]
