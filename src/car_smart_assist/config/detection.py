@@ -26,7 +26,14 @@ def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
     joint = bool(manifest.get("joint_supervision"))
+    extra = {}
+    if cfg.get("training_lowlight") is not None:
+        from car_smart_assist.perception.lowlight_training import recipe_identity
+        if not joint:
+            raise ValueError("Low-light training requires joint supervision")
+        extra["training_lowlight"] = recipe_identity(cfg)
     return {
+        **extra,
         "schema_version": 1,
         "postprocess_version": YOLO_POSTPROCESS_VERSION,
         "ap_mode": YOLO_AP_MODE,

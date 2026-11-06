@@ -285,6 +285,10 @@ def main() -> int:
                 root, cfg["data"],
                 joint_data_config=args.joint_data_config or cfg.get("joint_data_config"), directory=run,
             ))
+            lowlight_plan = None
+            if cfg.get("training_lowlight") is not None:
+                from car_smart_assist.perception.lowlight_training import load_plan
+                lowlight_plan = load_plan(root, cfg, manifest)
             metadata_path = run / "run_metadata.json"
             plan = resolve_training_plan(
                 root,
@@ -368,6 +372,9 @@ def main() -> int:
                     plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
                     selection_contract=plan["model_selection_contract"], validated_data=data,
                 )
+            if lowlight_plan is not None:
+                from car_smart_assist.perception.lowlight_training import training_class
+                trainer_class = training_class(trainer_class, lowlight_plan)
             if plan["resume_state"] is not None:
                 save_metadata(None)
             controller.require_running()
@@ -400,6 +407,8 @@ def main() -> int:
                     ).items()
                 },
             }
+            if lowlight_plan is not None and not final_state.get("manual_stop", False):
+                summary["lowlight_budget"] = model.trainer.lowlight_budget()
             (run / "validation_summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )
