@@ -21,6 +21,7 @@ from car_smart_assist.utils.stop import STOP_EXIT_CODE, StopController  # noqa: 
 
 from car_smart_assist.config.detection import (  # noqa: E402
     load_yolo_config,
+    frisa_settings,
     resolve_yolo_device,
     validate_joint_dataset_options,
     yolo_model_selection_contract,
@@ -332,6 +333,9 @@ def main() -> int:
                 return STOP_EXIT_CODE if controller.requested else 0
             run.mkdir(parents=True, exist_ok=True)
             model = load_yolo_model(root, plan["checkpoint"])
+            recipe = frisa_settings(cfg)
+            from car_smart_assist.perception.frisa import validate_source
+            validate_source(model.model, recipe)
             controller.require_running()
             if args.fresh or plan["mode"] == "finetune" or plan["completed"]:
                 archive_checkpoints(run, clear=args.fresh or plan["mode"] == "finetune")
@@ -368,6 +372,9 @@ def main() -> int:
                     plan["resume_state"], cfg.get("joint_foreground_exclusive", True),
                     selection_contract=plan["model_selection_contract"], validated_data=data,
                 )
+            if recipe is not None:
+                from car_smart_assist.perception.frisa import training_class
+                trainer_class = training_class(trainer_class, recipe)
             if plan["resume_state"] is not None:
                 save_metadata(None)
             controller.require_running()
@@ -400,6 +407,8 @@ def main() -> int:
                     ).items()
                 },
             }
+            if recipe is not None and not final_state.get("manual_stop", False):
+                summary["frisa_budget"] = model.trainer.frisa_receipt()
             (run / "validation_summary.json").write_text(
                 json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
             )

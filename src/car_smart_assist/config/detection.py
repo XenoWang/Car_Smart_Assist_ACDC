@@ -20,13 +20,28 @@ YOLO_SWEEP_CONFIDENCE = 0.001
 YOLO_MAX_NMS = 30000
 YOLO_MAX_WH = 7680
 YOLO_AGNOSTIC_NMS = False
+FRISA_VERSION = "eq16_34_k1_d3_v1"
+
+
+def frisa_settings(cfg):
+    entry = cfg.get("frisa")
+    if entry is None:
+        return None
+    if not isinstance(entry, dict) or set(entry) != {"mode"} or entry["mode"] not in ("control", "frisa"):
+        raise ValueError("frisa requires exactly mode=control or mode=frisa")
+    return {"mode": entry["mode"], "version": FRISA_VERSION, "p4_index": 19,
+            "depthwise_kernel": 3, "spatial_kernel": 1, "initialization_seed": 42}
 
 
 def yolo_model_selection_contract(cfg, manifest):
     """选best的AP口径；部署操作点阈值不参与扫分。"""
     inference = cfg["inference"]
     joint = bool(manifest.get("joint_supervision"))
+    recipe = frisa_settings(cfg)
+    if recipe is not None and not joint:
+        raise ValueError("This FRISA experiment requires the joint nine-class detector")
     return {
+        **({"neck_attention": recipe} if recipe is not None else {}),
         "schema_version": 1,
         "postprocess_version": YOLO_POSTPROCESS_VERSION,
         "ap_mode": YOLO_AP_MODE,
@@ -88,6 +103,7 @@ def load_yolo_config(path: Path) -> dict[str, Any]:
         extra = train.get("resume_extra_epochs")
         if extra is not None and (type(extra) is not int or extra <= 0):
             raise ValueError("YOLO resume_extra_epochs must be null or a positive integer")
+        frisa_settings(cfg)
         inference = cfg["inference"]
         for name in ("imgsz", "max_det"):
             if type(inference[name]) is not int or inference[name] <= 0:
