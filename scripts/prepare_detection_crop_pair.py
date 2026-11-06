@@ -26,7 +26,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--coverage-run", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--epochs", type=int, default=80, help="Training epochs per arm")
     opts = parser.parse_args()
+    if opts.epochs < 1:
+        parser.error("--epochs must be positive")
     run, output = opts.coverage_run.resolve(), opts.output_dir.resolve()
     cfg = load_yolo_config(ROOT / "configs/model/yolo_detection.yaml")
     base = (ROOT / cfg["data"]).parent
@@ -80,10 +83,10 @@ def main():
                    calibration_file=str(output / "calibration" / mode / "calibration.json"),
                    training_view={"mode": mode, "plan": str(plan), "sha256": identity})
         # Avoid unequal AMP overflow skips; both new runs use the same FP32 recipe.
-        arm["train"].update(epochs=80, patience=0, amp=False)
+        arm["train"].update(epochs=opts.epochs, patience=0, amp=False)
         with (output / (mode + ".yaml")).open("x", encoding="utf-8") as stream:
             yaml.safe_dump({"yolo_detection": arm}, stream, allow_unicode=True, sort_keys=False)
-    summary = {"train_images": len(seen), "planned_crops": len(windows), "full_views_in_crop_arm": len(seen)-len(windows),
+    summary = {"epochs_per_arm": opts.epochs, "train_images": len(seen), "planned_crops": len(windows), "full_views_in_crop_arm": len(seen)-len(windows),
                "candidate_frames_by_condition": eligible, "planned_by_condition": selected,
                "targeted_geometry_misses_in_selected_frames": removed, "magnification": scales,
                "plan_sha256": identity, "initial_weight": weight, "initial_sha256": initial}
